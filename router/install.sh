@@ -1,0 +1,519 @@
+#!/bin/sh
+# Sets up a fresh OpenWrt router from ../private/config.env (see setup.sh).
+# Runs on the router. Hardware-specific values (WAN device, radios) and the
+# internet type (IPv4 with NAT, IPv6) are detected here, not assumed.
+
+set -u
+umask 022
+ROUTER=$(cd "$(dirname "$0")" && pwd)
+PRIV=$ROUTER/../private
+. "$PRIV/config.env"
+
+REPORT=/tmp/setup-report.txt
+: > "$REPORT"
+pass() { echo "PASS  $1" | tee -a "$REPORT"; }
+fail() { echo "FAIL  $1" | tee -a "$REPORT"; }
+info() { echo "INFO  $1" | tee -a "$REPORT"; }
+step() { echo; echo "==> $1"; }
+die()  { fail "$1"; echo; cat "$REPORT"; exit 1; }
+on()   { [ "${1:-0}" = 1 ]; }
+
+VPN=${VPN_IFACE:-vpn}
+case $VPN in *[!a-z0-9_]*|'') echo "VPN_IFACE must be lowercase letters, digits or _"; exit 1 ;; esac
+on "${ENABLE_VPN:-0}" || VPN=
+LAN_IP=$(uci get network.lan.ipaddr | cut -d/ -f1)
+
+PACKAGES="luci luci-ssl luci-app-attendedsysupgrade owut luci-app-banip luci-app-sqm
+	dnsmasq-full dnsproxy curl bind-dig gawk sed coreutils-sort openssl-util"
+[ -n "$VPN" ] && PACKAGES="$PACKAGES luci-proto-wireguard luci-app-pbr"
+[ "${WAN_PROTO:-dhcp}" = pppoe ] && PACKAGES="$PACKAGES ppp-mod-pppoe luci-proto-ppp"
+
+# Copy files only: never apply directory modes to system directories like /etc.
+put_tree() { # SRC-DIR
+	(cd "$1" && find . -type f) | while read -r f; do
+		f=${f#./}
+		mkdir -p "/${f%/*}"
+		cp -p "$1/$f" "/$f"
+		chown root:root "/$f"
+	done
+}
+
+# ---------------------------------------------------------------- internet
+step "Internet"
+[ -f /etc/openwrt_release ] || die "not an OpenWrt system"
+. /etc/openwrt_release
+info "OpenWrt $DISTRIB_RELEASE on $(ubus call system board | jsonfilter -e '@.model')"
+if command -v apk >/dev/null; then PKG=apk; elif command -v opkg >/dev/null; then PKG=opkg; else die "no package manager"; fi
+
+if [ "${WAN_PROTO:-dhcp}" = pppoe ]; then
+	uci set network.wan.proto=pppoe
+	uci set "network.wan.username=$PPPOE_USER"
+	uci set "network.wan.password=$PPPOE_PASS"
+	uci commit network
+	ifup wan
+fi
+
+online4() { ping -4 -c1 -W3 1.1.1.1 >/dev/null 2>&1; }
+online6() { ping -6 -c1 -W3 2606:4700:4700::1111 >/dev/null 2>&1; }
+i=0
+until online4 || online6; do
+	i=$((i + 1)); [ $i -ge 30 ] && die "no internet after 90 s (WAN cable in the internet box? PPPoE details right?)"
+	sleep 3
+done
+wan_dev() { ubus call network.interface."$1" status 2>/dev/null | jsonfilter -e '@.l3_device'; }
+WAN_DEV=$(wan_dev wan); [ -n "$WAN_DEV" ] || WAN_DEV=$(wan_dev wan6)
+
+# IPv4 behind this router's NAT? Usable IPv6 (global address + default route + reachability)?
+HAS_V4=; online4 && [ -n "$(ubus call network.interface.wan status | jsonfilter -e '@["ipv4-address"][0].address')" ] && HAS_V4=1
+HAS_V6=; online6 && ip -6 route show default | grep -q . && ip -6 addr show scope global | grep -q inet6 && HAS_V6=1
+pass "online via $WAN_DEV: IPv4 ${HAS_V4:+yes (NAT)}${HAS_V4:-no}, IPv6 ${HAS_V6:+yes}${HAS_V6:-no}"
+
+i=0
+until [ "$(date +%Y)" -ge 2026 ]; do   # TLS needs a sane clock
+	i=$((i + 1)); [ $i -ge 20 ] && die "clock not synced (NTP), downloads would fail"
+	/etc/init.d/sysntpd restart >/dev/null 2>&1; sleep 3
+done
+
+# ---------------------------------------------------------------- packages
+step "Packages"
+if [ $PKG = apk ]; then
+	apk update >/dev/null 2>&1 || die "apk update failed"
+	# shellcheck disable=SC2086
+	apk add $PACKAGES >/tmp/setup-pkg.log 2>&1 || { tail -5 /tmp/setup-pkg.log; die "package install failed (/tmp/setup-pkg.log)"; }
+else
+	opkg update >/dev/null 2>&1 || die "opkg update failed"
+	opkg remove dnsmasq >/dev/null 2>&1
+	# shellcheck disable=SC2086
+	opkg install $PACKAGES >/tmp/setup-pkg.log 2>&1 || die "package install failed (/tmp/setup-pkg.log)"
+fi
+# dnsmasq-full replaces dnsmasq but isn't started; keep the router's own DNS working.
+/etc/init.d/dnsmasq enable; /etc/init.d/dnsmasq restart >/dev/null 2>&1
+pass "installed: $(echo $PACKAGES | tr -s ' \t\n' ' ')"
+
+# ---------------------------------------------------------------- files
+step "Files"
+put_tree "$ROUTER/files"
+put_tree "$ROUTER/vendor/adblock-lean"
+if on "${ENABLE_MANGADEX:-0}"; then put_tree "$ROUTER/vendor/safe-otaku"; chmod 755 /www/cgi-bin/md; fi
+chmod 755 /etc/init.d/adblock-lean /usr/sbin/safesearch-hosts /usr/sbin/redlib-block
+
+# adblock-lean: lists from the settings; local lists = own entries + project sections
+case ${ADBLOCK_LISTS:-hagezi:pro} in *[!A-Za-z0-9:._/\ -]*) die "ADBLOCK_LISTS has unexpected characters" ;; esac
+sed -i "s|^raw_block_lists=.*|raw_block_lists=\"${ADBLOCK_LISTS:-hagezi:pro}\"|" /etc/adblock-lean/config
+section() { # NAME FILE -> marked section, if the file has entries
+	[ -s "$2" ] || return 0
+	echo "# >>> $1"; grep -vE '^[[:space:]]*(#|$)' "$2"; echo "# <<< $1"
+}
+{
+	[ -f "$PRIV/blocklist.txt" ] && grep -vE '^[[:space:]]*(#|$)' "$PRIV/blocklist.txt"
+	on "${FAMILY_FILTER:-0}" && section safe-otaku "$ROUTER/lists/safe-otaku-block.txt"
+} > /etc/adblock-lean/blocklist
+{
+	[ -f "$PRIV/allowlist.txt" ] && grep -vE '^[[:space:]]*(#|$)' "$PRIV/allowlist.txt"
+	on "${FAMILY_FILTER:-0}" && section safe-otaku "$ROUTER/lists/safe-otaku-allow.txt"
+} > /etc/adblock-lean/allowlist
+printf '%s\n' ${REDLIB_ALLOW-} > /etc/redlib-block.allow
+
+# banIP: hardware-specific device, IPv6 only where usable, feeds from the settings
+uci -q delete banip.global.ban_dev; uci add_list banip.global.ban_dev="$WAN_DEV"
+uci -q delete banip.global.ban_ifv4; uci add_list banip.global.ban_ifv4=wan
+uci -q delete banip.global.ban_ifv6
+uci -q delete banip.global.ban_feed
+for f in ${BANIP_FEEDS-}; do uci add_list banip.global.ban_feed="$f"; done
+if [ -n "$HAS_V6" ]; then uci set banip.global.ban_protov6=1; uci add_list banip.global.ban_ifv6=wan6; else uci set banip.global.ban_protov6=0; fi
+uci commit banip
+pass "copied adblock-lean, banIP, dnsproxy and safe-search files${ENABLE_MANGADEX:+$(on "$ENABLE_MANGADEX" && echo ', MangaDex app')}"
+
+# ---------------------------------------------------------------- access
+step "Access"
+sed -i "s|^root:[^:]*:|root:${ROOT_PASSWORD_HASH}:|" /etc/shadow
+printf '%s\n' "$SSH_PUBKEYS" > /etc/dropbear/authorized_keys
+chmod 600 /etc/dropbear/authorized_keys
+if [ -f "$PRIV/host_keys/dropbear_ed25519_host_key" ]; then
+	for k in "$PRIV"/host_keys/dropbear_*_host_key; do cp "$k" /etc/dropbear/; done
+	chmod 600 /etc/dropbear/dropbear_*_host_key
+	HOSTKEYS="restored saved SSH host keys"
+else
+	HOSTKEYS="new SSH host keys"
+fi
+pass "root password, SSH key login, $HOSTKEYS"
+
+# ---------------------------------------------------------------- system
+step "System"
+uci batch >/dev/null <<-EOF
+	set system.@system[0].log_size='128'
+	delete system.ntp.server
+	add_list system.ntp.server='216.239.35.0'
+	add_list system.ntp.server='216.239.35.4'
+	add_list system.ntp.server='162.159.200.123'
+	add_list system.ntp.server='162.159.200.1'
+	add_list system.ntp.server='2001:4860:4806::'
+	add_list system.ntp.server='2606:4700:f1::1'
+	set network.globals.packet_steering='2'
+EOF
+uci set "system.@system[0].zonename=${TZ_NAME:-UTC}"
+uci set "system.@system[0].timezone=${TZ_POSIX:-UTC0}"
+uci commit system
+[ -n "${ULA_PREFIX-}" ] && uci set network.globals.ula_prefix="$ULA_PREFIX"
+uci commit network
+pass "time zone ${TZ_NAME:-UTC}, NTP by IP (no DNS needed), packet steering on all CPUs"
+
+# ---------------------------------------------------------------- VPN
+if [ -n "$VPN" ]; then
+	step "VPN ($VPN)"
+	uci -q delete "network.$VPN"
+	for s in $(uci -q show network | sed -n "s/^network\.\(@wireguard_$VPN\[[0-9]*\]\)=.*/\1/p" | sort -r); do uci delete "network.$s"; done
+	uci set "network.$VPN=interface"
+	uci set "network.$VPN.proto=wireguard"
+	uci set "network.$VPN.private_key=$WG_PRIVATE_KEY"
+	uci set "network.$VPN.multipath=off"
+	uci add network "wireguard_$VPN" >/dev/null
+	uci set "network.@wireguard_$VPN[-1].description=VPN peer"
+	uci set "network.@wireguard_$VPN[-1].public_key=$WG_PEER_PUBLIC_KEY"
+	uci set "network.@wireguard_$VPN[-1].endpoint_host=$WG_ENDPOINT_HOST"
+	uci set "network.@wireguard_$VPN[-1].endpoint_port=$WG_ENDPOINT_PORT"
+	uci set "network.@wireguard_$VPN[-1].persistent_keepalive=${WG_KEEPALIVE:-25}"
+	for a in ${WG_ADDRESSES-}; do uci add_list "network.$VPN.addresses=$a"; done
+	for a in ${WG_DNS-}; do uci add_list "network.$VPN.dns=$a"; done
+	for a in ${WG_ALLOWED_IPS:-0.0.0.0/0 ::/0}; do uci add_list "network.@wireguard_$VPN[-1].allowed_ips=$a"; done
+	[ -n "${WG_PRESHARED_KEY-}" ] && uci set "network.@wireguard_$VPN[-1].preshared_key=$WG_PRESHARED_KEY"
+	uci commit network
+
+	# PBR: only the chosen domains and ranges go through the VPN
+	for s in $(uci -q show pbr | sed -n "s/^pbr\.\([^.]*\)\.setup='1'$/\1/p" | sort -r); do uci delete "pbr.$s"; done
+	policy() { # name dest
+		uci add pbr policy >/dev/null
+		uci set pbr.@policy[-1].setup=1
+		uci set "pbr.@policy[-1].name=$1"
+		uci set "pbr.@policy[-1].dest_addr=$2"
+		uci set "pbr.@policy[-1].interface=$VPN"
+	}
+	[ -n "${VPN_ROUTE_DOMAINS-}" ] && policy 'domains through VPN' "$VPN_ROUTE_DOMAINS"
+	[ -n "${VPN_ROUTE_SUBNETS-}" ] && policy 'IP ranges through VPN' "$VPN_ROUTE_SUBNETS"
+	uci commit pbr
+	[ -z "${VPN_ROUTE_DOMAINS-}${VPN_ROUTE_SUBNETS-}" ] && info "VPN set up, but no domains or ranges are routed through it"
+	if [ -n "$HAS_V6" ] && ! echo "${WG_ADDRESSES-}" | grep -q ':'; then
+		info "the VPN has no IPv6 address: IPv6 traffic to the VPN domains goes direct"
+	fi
+	pass "WireGuard $VPN to $WG_ENDPOINT_HOST; PBR: ${VPN_ROUTE_DOMAINS:-no domains}${VPN_ROUTE_SUBNETS:+ + IP ranges}"
+fi
+
+# ---------------------------------------------------------------- firewall
+step "Firewall"
+# Remove what this script added before, so re-runs don't duplicate.
+for s in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.setup='1'$/\1/p" | sort -r); do uci delete "firewall.$s"; done
+uci -q delete firewall.dns_int
+uci -q delete firewall.dot_fwd
+uci batch >/dev/null <<-EOF
+	set firewall.@defaults[0].flow_offloading='1'
+	set firewall.dns_int=redirect
+	set firewall.dns_int.name='Intercept-DNS'
+	set firewall.dns_int.family='any'
+	set firewall.dns_int.proto='tcp udp'
+	set firewall.dns_int.src='lan'
+	set firewall.dns_int.src_dport='53'
+	set firewall.dns_int.target='DNAT'
+EOF
+if on "${FAMILY_FILTER:-0}"; then
+	rule() { # name proto port
+		uci batch >/dev/null <<-EOF
+			add firewall rule
+			set firewall.@rule[-1].setup='1'
+			set firewall.@rule[-1].name='$1'
+			set firewall.@rule[-1].src='lan'
+			set firewall.@rule[-1].dest='wan'
+			set firewall.@rule[-1].proto='$2'
+			set firewall.@rule[-1].target='REJECT'
+		EOF
+		[ -n "$3" ] && uci set firewall.@rule[-1].dest_port="$3"
+	}
+	uci batch >/dev/null <<-EOF
+		set firewall.dot_fwd=rule
+		set firewall.dot_fwd.name='Deny-DoT'
+		set firewall.dot_fwd.proto='tcp udp'
+		set firewall.dot_fwd.src='lan'
+		set firewall.dot_fwd.dest='wan'
+		set firewall.dot_fwd.dest_port='853'
+		set firewall.dot_fwd.target='REJECT'
+	EOF
+	rule 'Block-WireGuard-LAN'   udp 51820
+	rule 'Block-OpenVPN-LAN'     'tcp udp' 1194
+	rule 'Block-IKEv2-IPsec-LAN' udp '500 4500'
+	rule 'Block-L2TP-LAN'        udp 1701
+	rule 'Block-PPTP-LAN'        tcp 1723
+	rule 'Block-GRE-LAN'         gre ''
+fi
+if [ -n "$VPN" ]; then
+	uci batch >/dev/null <<-EOF
+		add firewall zone
+		set firewall.@zone[-1].setup='1'
+		set firewall.@zone[-1].name='$VPN'
+		set firewall.@zone[-1].input='REJECT'
+		set firewall.@zone[-1].output='ACCEPT'
+		set firewall.@zone[-1].forward='REJECT'
+		set firewall.@zone[-1].masq='1'
+		add_list firewall.@zone[-1].network='$VPN'
+		add firewall forwarding
+		set firewall.@forwarding[-1].setup='1'
+		set firewall.@forwarding[-1].src='lan'
+		set firewall.@forwarding[-1].dest='$VPN'
+	EOF
+fi
+uci commit firewall
+pass "DNS hijack${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo ', DoT and VPN-protocol blocks')}${VPN:+, $VPN zone}"
+
+# ---------------------------------------------------------------- DNS
+step "Encrypted DNS"
+/etc/init.d/dnsproxy enable
+/etc/init.d/dnsproxy restart >/dev/null 2>&1
+i=0
+until nslookup openwrt.org 127.0.0.1:5354 >/dev/null 2>&1; do
+	i=$((i + 1)); [ $i -ge 15 ] && die "dnsproxy does not answer on 127.0.0.1:5354; dnsmasq left unchanged"
+	sleep 2
+done
+pass "dnsproxy answers on 127.0.0.1:5354 (Cloudflare h3, NextDNS, Quad9)"
+
+step "dnsmasq"
+for s in $(uci -q show dhcp | sed -n "s/^dhcp\.\([^.]*\)\.setup='1'$/\1/p" | sort -r); do uci delete "dhcp.$s"; done
+uci batch >/dev/null <<-EOF
+	set dhcp.@dnsmasq[0].cachesize='10000'
+	set dhcp.@dnsmasq[0].noresolv='1'
+	set dhcp.@dnsmasq[0].min_cache_ttl='3600'
+	set dhcp.@dnsmasq[0].max_cache_ttl='86400'
+	delete dhcp.@dnsmasq[0].server
+	add_list dhcp.@dnsmasq[0].server='127.0.0.1#5354'
+	add_list dhcp.@dnsmasq[0].server='::1#5354'
+	delete dhcp.@dnsmasq[0].addnmount
+	add_list dhcp.@dnsmasq[0].addnmount='/bin/busybox'
+	add_list dhcp.@dnsmasq[0].addnmount='/var/run/adblock-lean/abl-blocklist.gz'
+	add_list dhcp.@dnsmasq[0].addnmount='/var/run/pbr.dnsmasq'
+EOF
+domain() { # name ip
+	uci batch >/dev/null <<-EOF
+		add dhcp domain
+		set dhcp.@domain[-1].setup='1'
+		set dhcp.@domain[-1].name='$1'
+		set dhcp.@domain[-1].ip='$2'
+	EOF
+}
+if on "${FAMILY_FILTER:-0}"; then
+	for d in yandex.com yandex.ru yandex.by yandex.kz yandex.ua; do domain "$d" 213.180.193.56; done
+fi
+on "${ENABLE_MANGADEX:-0}" && domain manga.lan "$LAN_IP"
+uci commit dhcp
+/etc/init.d/dnsmasq restart >/dev/null 2>&1
+if on "${FAMILY_FILTER:-0}"; then
+	/usr/sbin/safesearch-hosts
+	pass "dnsmasq forwards to dnsproxy; safe search pinned (Google, Bing, DuckDuckGo, Startpage, Brave, Yandex)"
+else
+	rm -f /tmp/hosts/safesearch
+	pass "dnsmasq forwards to dnsproxy"
+fi
+
+# ---------------------------------------------------------------- MangaDex app
+if on "${ENABLE_MANGADEX:-0}"; then
+	step "MangaDex app"
+	uci set uhttpd.main.max_requests='6'; uci commit uhttpd
+	grep -q 'safe-otaku: manga.lan' /www/index.html || sed -i 's|<head>|<head>\n\t\t<script>/* safe-otaku: manga.lan opens the MangaDex safe app */ if (location.hostname === "manga.lan") location.replace("/mangadex-safe/");</script>|' /www/index.html
+	pass "MangaDex reader at http://manga.lan (uhttpd max_requests 6)"
+fi
+
+# ---------------------------------------------------------------- Wi-Fi
+step "Wi-Fi"
+APS=$(uci -q show wireless | sed -n "s/^wireless\.\([^.]*\)=wifi-iface$/\1/p")
+if [ -z "$APS" ]; then
+	info "no Wi-Fi radios on this device, skipped"
+else
+	for ap in $APS; do
+		radio=$(uci get "wireless.$ap.device")
+		uci set "wireless.$ap.ssid=$WIFI_SSID"
+		uci set "wireless.$ap.key=$WIFI_KEY"
+		uci set "wireless.$ap.encryption=${WIFI_ENCRYPTION:-sae-mixed}"
+		uci set "wireless.$ap.ocv=0"
+		uci set "wireless.$radio.disabled=0"
+		uci set "wireless.$radio.cell_density=0"
+		case "$(uci get "wireless.$radio.band")" in
+			2g) uci set "wireless.$radio.channel=auto"; uci set "wireless.$radio.htmode=HT20" ;;
+			5g) iwinfo "$(uci -q get "wireless.$radio.phy" || echo "$radio")" htmodelist 2>/dev/null | grep -qw HE80 \
+					&& uci set "wireless.$radio.htmode=HE80" ;;
+		esac
+	done
+	uci commit wireless
+	pass "Wi-Fi '$WIFI_SSID' on: $(echo $APS)"
+fi
+
+# ---------------------------------------------------------------- jobs, upgrade persistence
+step "Scheduled jobs"
+touch /etc/crontabs/root
+sed -i '/safesearch-hosts\|redlib-block/d' /etc/crontabs/root
+sed -i '/safesearch-hosts/d' /etc/rc.local
+if on "${FAMILY_FILTER:-0}"; then
+	echo "*/30 * * * * /usr/sbin/safesearch-hosts" >> /etc/crontabs/root
+	# Before adblock-lean's 05:00 update, which loads the refreshed Redlib section.
+	echo "50 4 * * * /usr/sbin/redlib-block" >> /etc/crontabs/root
+	sed -i 's|^exit 0$|(sleep 30; /usr/sbin/safesearch-hosts) \&\nexit 0|' /etc/rc.local
+fi
+for f in /usr/sbin/safesearch-hosts /usr/sbin/redlib-block /etc/redlib-block.allow /etc/init.d/adblock-lean /usr/lib/adblock-lean/ /www/mangadex-safe/ /www/cgi-bin/md; do
+	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
+done
+pass "custom files kept across firmware upgrades${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo '; safe search every 30 min, Redlib list daily 04:50')}"
+
+# ---------------------------------------------------------------- SQM (OpenWrt wiki method)
+# https://openwrt.org/docs/guide-user/network/traffic-shaping/sqm
+# Measured on an idle line, 90% of it, cake + piece_of_cake, link-layer values
+# for the chosen link type, plus per-host fairness. cake's "nat" keyword (find
+# the real LAN host behind NAT) is only used when there is IPv4 NAT.
+step "SQM: measuring line speed (about 20 s)"
+/etc/init.d/sqm stop >/dev/null 2>&1
+measure() { # down|up -> kbit/s over 10 s, 4 parallel streams
+	out=/tmp/setup-speed.$$; : > $out
+	end=$(( $(date +%s) + 10 ))
+	for w in 1 2 3 4; do (
+		while [ "$(date +%s)" -lt $end ]; do
+			left=$(( end - $(date +%s) )); [ $left -lt 1 ] && break
+			if [ "$1" = down ]; then
+				curl -s -o /dev/null --max-time $left -w '%{size_download} %{http_code}\n' 'https://speed.cloudflare.com/__down?bytes=25000000'
+			else
+				head -c 25000000 /dev/zero | curl -s -o /dev/null --max-time $left -X POST -H 'Expect:' -T - -w '%{size_upload} %{http_code}\n' 'https://speed.cloudflare.com/__up'
+			fi
+		done >> $out ) &
+	done
+	wait
+	awk '$2 !~ /^(2|000)/ {print $2 >> "/tmp/setup-speed.codes"} {s += $1} END {printf "%d", s * 8 / 10 / 1000}' $out; rm -f $out
+}
+rm -f /tmp/setup-speed.codes
+DOWN=$(measure down); UP=$(measure up)
+# Link-layer values for LINK_TYPE, computed by setup.sh from lib/laptop.sh.
+LL=${LINK_LL:-ethernet} OVH=${LINK_OVERHEAD:-44} MPU=${LINK_MPU:-96}
+NAT=; [ -n "$HAS_V4" ] && NAT="nat "
+if [ "${DOWN:-0}" -gt 1000 ] && [ "${UP:-0}" -gt 1000 ]; then
+	RATE_DOWN=$((DOWN * 90 / 100)) RATE_UP=$((UP * 90 / 100)) SQM_OK=1
+	SQM_MSG="SQM measured ${DOWN} down / ${UP} up kbit/s, shaping at 90%: $RATE_DOWN / $RATE_UP kbit/s"
+elif [ -n "${SQM_FALLBACK_DOWN-}" ] && [ -n "${SQM_FALLBACK_UP-}" ]; then
+	RATE_DOWN=$SQM_FALLBACK_DOWN RATE_UP=$SQM_FALLBACK_UP SQM_OK=
+	codes=$(sort -u /tmp/setup-speed.codes 2>/dev/null | tr '\n' ' '); codes=${codes:-none}
+	SQM_MSG="SQM speed test failed (down=${DOWN:-0} up=${UP:-0} kbit/s, Cloudflare HTTP codes: $codes); using saved rates $RATE_DOWN / $RATE_UP kbit/s"
+else
+	RATE_DOWN= SQM_OK=
+	codes=$(sort -u /tmp/setup-speed.codes 2>/dev/null | tr '\n' ' '); codes=${codes:-none}
+	SQM_MSG="SQM speed test failed (down=${DOWN:-0} up=${UP:-0} kbit/s, Cloudflare HTTP codes: $codes) and no saved rates; SQM left off, re-run setup later"
+fi
+if [ -n "$RATE_DOWN" ]; then
+	for s in $(uci -q show sqm | sed -n "s/^sqm\.\([^.]*\)=queue$/\1/p"); do uci delete "sqm.$s"; done
+	uci batch >/dev/null <<-EOF
+		set sqm.wan=queue
+		set sqm.wan.enabled='1'
+		set sqm.wan.interface='$WAN_DEV'
+		set sqm.wan.download='$RATE_DOWN'
+		set sqm.wan.upload='$RATE_UP'
+		set sqm.wan.qdisc='cake'
+		set sqm.wan.script='piece_of_cake.qos'
+		set sqm.wan.linklayer='$LL'
+		set sqm.wan.overhead='$OVH'
+		set sqm.wan.linklayer_advanced='1'
+		set sqm.wan.tcMPU='$MPU'
+		set sqm.wan.qdisc_advanced='1'
+		set sqm.wan.squash_dscp='1'
+		set sqm.wan.squash_ingress='1'
+		set sqm.wan.ingress_ecn='ECN'
+		set sqm.wan.egress_ecn='NOECN'
+		set sqm.wan.qdisc_really_really_advanced='1'
+		set sqm.wan.iqdisc_opts='${NAT}dual-dsthost'
+		set sqm.wan.eqdisc_opts='${NAT}dual-srchost'
+		commit sqm
+	EOF
+	/etc/init.d/sqm enable; /etc/init.d/sqm restart >/dev/null 2>&1
+	SQM_MSG="$SQM_MSG on $WAN_DEV; $LINK_TYPE: $LL overhead $OVH mpu $MPU; per-host fairness${NAT:+ behind NAT}"
+fi
+if [ -n "$SQM_OK" ]; then pass "$SQM_MSG"; else fail "$SQM_MSG"; fi
+
+# ---------------------------------------------------------------- start everything
+step "Starting services"
+/etc/init.d/sysntpd restart >/dev/null 2>&1
+# restart, not reload: netifd only picks up newly installed protocol handlers
+# (WireGuard, PPPoE) when it starts.
+/etc/init.d/network restart
+if [ -n "$VPN" ]; then
+	i=0; until [ "$(ifstatus "$VPN" | jsonfilter -e '@.up')" = true ] || [ $i -ge 20 ]; do sleep 1; i=$((i + 1)); done
+fi
+i=0; until online4 || online6 || [ $i -ge 30 ]; do sleep 1; i=$((i + 1)); done
+/etc/init.d/firewall restart >/dev/null 2>&1
+/etc/init.d/uhttpd restart
+/etc/init.d/cron enable; /etc/init.d/cron restart
+/etc/init.d/banip enable; /etc/init.d/banip restart >/dev/null 2>&1
+if [ -n "$VPN" ]; then
+	/etc/init.d/pbr enable; /etc/init.d/pbr restart >/dev/null 2>&1
+elif [ -x /etc/init.d/pbr ]; then
+	/etc/init.d/pbr stop >/dev/null 2>&1; /etc/init.d/pbr disable
+fi
+[ -n "$APS" ] && wifi reload
+if on "${FAMILY_FILTER:-0}"; then
+	/usr/sbin/redlib-block && pass "Redlib instance list fetched (allowed: ${REDLIB_ALLOW:-none})" \
+		|| fail "Redlib instance list download failed"
+fi
+/etc/init.d/adblock-lean enable
+echo "    adblock-lean: downloading and testing block lists (1-3 min)..."
+/etc/init.d/adblock-lean start >/tmp/setup-adblock.log 2>&1
+/etc/init.d/adblock-lean upd_cron_job >/dev/null 2>&1
+
+# ---------------------------------------------------------------- verify
+step "Verifying"
+check() { if eval "$2" >/dev/null 2>&1; then pass "$1"; else fail "$1"; fi; }
+resolve() { nslookup "$1" 127.0.0.1 2>/dev/null | awk '/^Name:/{n=1} n && /^Address/{print $2}' | head -1; }
+# Blocked by this router's own list (not just unresolvable upstream).
+blocked() {
+	{ gzip -dc /var/run/adblock-lean/abl-blocklist.gz; cat /tmp/dnsmasq.*.d/abl-blocklist; } 2>/dev/null \
+		| tr '/' '\n' | grep -qxF "$1" && [ -z "$(resolve "$1")" ]
+}
+pbr_ok() {
+	d=$(ubus call service list '{"name":"pbr"}')
+	[ -z "$(echo "$d" | jsonfilter -e '@.pbr.instances.main.data.errors[*]')" ] \
+		&& echo "$d" | jsonfilter -e '@.pbr.instances.main.data.gateways[*].name' | grep -qx "$VPN"
+}
+for svc in dnsmasq dnsproxy uhttpd dropbear cron banip sqm adblock-lean; do
+	check "service $svc enabled" "/etc/init.d/$svc enabled"
+done
+check "dnsproxy (encrypted upstream) resolves" "nslookup example.org 127.0.0.1:5354"
+check "router DNS resolves example.org" "[ -n \"\$(resolve example.org)\" ]"
+check "adblock-lean blocklist loaded" "/etc/init.d/adblock-lean status"
+check "adblock-lean list compressed in RAM" "[ -s /var/run/adblock-lean/abl-blocklist.gz ]"
+check "DNS hijack rule active" "nft list chain inet fw4 dstnat_lan | grep -q 'dport 53.*redirect'"
+if [ -f "$PRIV/blocklist.txt" ]; then
+	d=$(grep -vE '^[[:space:]]*(#|$)' "$PRIV/blocklist.txt" | head -1)
+	[ -n "$d" ] && check "own blocklist: $d blocked" "blocked $d"
+fi
+if on "${FAMILY_FILTER:-0}"; then
+	check "family list: mangadex.org blocked" "blocked mangadex.org"
+	check "family allowlist: api.mangadex.org resolves" "[ -n \"\$(resolve api.mangadex.org)\" ]"
+	check "Redlib: listed instance redlib.catsarch.com blocked" "blocked redlib.catsarch.com"
+	for h in ${REDLIB_ALLOW-}; do check "Redlib: $h allowed" "[ -n \"\$(resolve $h)\" ]"; done
+	check "safe search: www.google.com -> forcesafesearch" "[ \"\$(resolve www.google.com)\" = 216.239.38.120 ]"
+	check "safe search: duckduckgo.com pinned" "grep -q ' duckduckgo.com' /tmp/hosts/safesearch"
+	check "safe search: yandex.com -> 213.180.193.56" "[ \"\$(resolve yandex.com)\" = 213.180.193.56 ]"
+	check "DoT (853) blocked" "nft list ruleset | grep -q 'Deny-DoT'"
+	check "VPN protocol blocks active" "nft list ruleset | grep -q 'Block-WireGuard-LAN'"
+fi
+if on "${ENABLE_MANGADEX:-0}"; then
+	check "manga.lan -> router" "[ \"\$(resolve manga.lan)\" = \"$LAN_IP\" ]"
+	check "MangaDex app served" "wget -qO- http://127.0.0.1/mangadex-safe/ | grep -qi '<html'"
+	check "MangaDex CGI returns data" "wget -qO- 'http://127.0.0.1/cgi-bin/md/api/manga?limit=1' | grep -q '\"data\"'"
+	check "MangaDex CGI refuses /manga/random" "! wget -qO- http://127.0.0.1/cgi-bin/md/api/manga/random"
+fi
+if [ -n "$VPN" ]; then
+	i=0; while [ $i -lt 10 ] && [ "$(wg show "$VPN" latest-handshakes 2>/dev/null | awk '{print $2}')" = 0 ]; do sleep 3; i=$((i + 1)); done
+	check "VPN WireGuard handshake" "[ \"\$(wg show $VPN latest-handshakes | awk '{print \$2}')\" -gt 0 ]"
+	check "PBR active (no errors, $VPN gateway)" "pbr_ok"
+fi
+check "banIP running" "/etc/init.d/banip status 2>&1 | grep -qi 'status.*active'"
+[ -n "$RATE_DOWN" ] && check "SQM cake active on $WAN_DEV" "tc qdisc show dev $WAN_DEV | grep -q cake"
+check "root password set" "! grep -q '^root::' /etc/shadow"
+[ -n "$APS" ] && check "Wi-Fi up" "iwinfo | grep -q \"ESSID: \\\"$WIFI_SSID\\\"\""
+
+# Host keys last, so the running session isn't disturbed earlier.
+/etc/init.d/dropbear restart
+
+echo; echo "================ REPORT ================"
+cat "$REPORT"
+echo "========================================"
+grep -q '^FAIL' "$REPORT" && exit 2
+exit 0

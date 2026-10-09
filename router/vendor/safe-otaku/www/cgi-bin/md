@@ -1,0 +1,136 @@
+#!/bin/sh
+# MangaDex safe proxy for OpenWrt uhttpd CGI.
+#
+# Routes. Anything else is 403.
+#   /cgi-bin/md/api/manga                   -> manga list/search, ratings and tag exclusions injected
+#   /cgi-bin/md/api/manga/<uuid>/feed       -> chapter list, ratings injected
+#   /cgi-bin/md/api/at-home/server/<uuid>   -> page list, only if the chapter passes the rating and tag check
+#   /cgi-bin/md/img/covers/<uuid>/<file>    -> https://uploads.mangadex.org/covers/...
+#   /cgi-bin/md/img/data/<hash>/<file>      -> https://uploads.mangadex.org/data/...
+#
+# The filter is an allowlist. MangaDex ignores contentRating[] on by-ID endpoints
+# (/manga/<id>, /at-home/server/<id>) and accepts it in several encodings
+# (%5b%5d, %5B0%5D, [0]), so stripping it from the query is not enough. Only
+# the endpoints and query keys the frontend uses are forwarded, and the ratings
+# are appended by this script.
+#
+# No caching on the router. Browser caches via Cache-Control headers.
+# Requires uclient-fetch (installed by default on OpenWrt).
+
+UA="MangaDexSafeView/1.0 (self-hosted home safe-mode proxy)"
+API="https://api.mangadex.org"
+IMG="https://uploads.mangadex.org"
+RATINGS="contentRating%5B%5D=safe&contentRating%5B%5D=suggestive"
+
+# Excluded MangaDex tags: Boys' Love, Girls' Love. Ids from GET /manga/tag.
+TAG_BL="5920b825-4181-4a17-beeb-9918b0ff7a30"
+TAG_GL="a3c67850-4684-404e-9b7f-c69850ee5da6"
+EXCLUDED="excludedTags%5B%5D=${TAG_BL}&excludedTags%5B%5D=${TAG_GL}&excludedTagsMode=OR"
+
+H='[0-9a-f]'
+H4="$H$H$H$H"
+UUID="$H4$H4-$H4-$H4-$H4-$H4$H4$H4"
+HASH="$H4$H4$H4$H4$H4$H4$H4$H4"
+
+deny() {
+  printf 'Status: 403 Forbidden\r\n'
+  printf 'Content-Type: text/plain\r\n'
+  printf '\r\n'
+  printf 'Forbidden\n'
+  exit 0
+}
+
+[ "$REQUEST_METHOD" = GET ] || deny
+
+# Keep only the query keys the frontend sends, in the encoding URLSearchParams produces.
+filter_query() {
+  clean=""
+  old_ifs="$IFS"
+  IFS='&'
+  for pair in $QUERY_STRING; do
+    case "$pair" in
+      limit=*|offset=*|title=*|ids%5B%5D=*|includes%5B%5D=*|translatedLanguage%5B%5D=*|\
+      order%5Brelevance%5D=*|order%5Bchapter%5D=*|includeExternalUrl=*)
+        clean="$clean$pair&" ;;
+    esac
+  done
+  IFS="$old_ifs"
+}
+
+api() {
+  printf 'Content-Type: application/json\r\n'
+  printf 'Cache-Control: no-store\r\n'
+  printf '\r\n'
+  exec uclient-fetch -q -O - --user-agent "$UA" -T 30 "$1"
+}
+
+# Rejects anything but <id>/<file> with a plain file name.
+split_image_path() {
+  id="${1%%/*}"
+  file="${1#*/}"
+  case "$file" in
+    ''|*/*|*..*|*[!A-Za-z0-9._-]*) deny ;;
+  esac
+}
+
+case "$PATH_INFO" in
+  /api/manga)
+    filter_query
+    api "${API}/manga?${clean}${RATINGS}&${EXCLUDED}"
+    ;;
+
+  /api/manga/*/feed)
+    id="${PATH_INFO#/api/manga/}"
+    id="${id%/feed}"
+    case "$id" in $UUID) ;; *) deny ;; esac
+    filter_query
+    api "${API}/manga/${id}/feed?${clean}${RATINGS}"
+    ;;
+
+  /api/at-home/server/*)
+    id="${PATH_INFO#/api/at-home/server/}"
+    case "$id" in $UUID) ;; *) deny ;; esac
+    # at-home ignores contentRating. Ask the chapter list, which applies it,
+    # whether this chapter belongs to an allowed manga, and include the manga
+    # so its tags can be checked too. One extra fetch per chapter opened, not
+    # per page.
+    check="$(uclient-fetch -q -O - --user-agent "$UA" -T 30 "${API}/chapter?ids%5B%5D=${id}&limit=1&includes%5B%5D=manga&${RATINGS}")"
+    case "$check" in
+      *"$TAG_BL"*|*"$TAG_GL"*) deny ;;
+      *'"total":1'*) ;;
+      *) deny ;;
+    esac
+    api "${API}/at-home/server/${id}"
+    ;;
+
+  /img/covers/*|/img/data/*)
+    path="${PATH_INFO#/img}"
+    case "$path" in
+      /covers/*)
+        split_image_path "${path#/covers/}"
+        case "$id" in $UUID) ;; *) deny ;; esac
+        ;;
+      /data/*)
+        split_image_path "${path#/data/}"
+        case "$id" in $HASH) ;; *) deny ;; esac
+        ;;
+    esac
+
+    case "$file" in
+      *.png) ct=image/png ;;
+      *.webp) ct=image/webp ;;
+      *.gif) ct=image/gif ;;
+      *) ct=image/jpeg ;;
+    esac
+
+    # File names are content-addressed (cover UUIDs, page SHA-256), so a URL never changes content.
+    printf 'Content-Type: %s\r\n' "$ct"
+    printf 'Cache-Control: public, max-age=31536000, immutable\r\n'
+    printf '\r\n'
+    exec uclient-fetch -q -O - --user-agent "$UA" -T 30 "${IMG}${path}"
+    ;;
+
+  *)
+    deny
+    ;;
+esac

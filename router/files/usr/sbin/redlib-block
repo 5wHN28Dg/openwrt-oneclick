@@ -1,0 +1,45 @@
+#!/bin/sh
+# Blocks every listed Redlib (Reddit front end) instance except the allowed ones
+# (/etc/redlib-block.allow),
+# by keeping a marked section in adblock-lean's local block and allow lists.
+# Runs daily from cron before adblock-lean's update, which loads the lists.
+# Files are rewritten only when the list changes (flash wear), and a failed
+# download keeps the previous section.
+
+LIST_URL=https://raw.githubusercontent.com/redlib-org/redlib-instances/main/instances.json
+# Instances to keep reachable, one host per line (written by install.sh).
+ALLOW_FILE=/etc/redlib-block.allow
+BL=/etc/adblock-lean/blocklist
+AL=/etc/adblock-lean/allowlist
+TMP=/tmp/redlib-block.$$
+
+cleanup() { rm -f "$TMP".*; }
+trap cleanup EXIT
+
+# section FILE ENTRIES-FILE: replace the "# >>> redlib" section; 0 if file changed
+section() {
+	touch "$1"
+	{
+		awk '/^# >>> redlib$/{s=1} !s{print} /^# <<< redlib$/{s=0}' "$1"
+		echo "# >>> redlib"
+		cat "$2"
+		echo "# <<< redlib"
+	} > "$TMP.new"
+	cmp -s "$TMP.new" "$1" && return 1
+	cat "$TMP.new" > "$1"
+}
+
+uclient-fetch -q -T 20 -O "$TMP.json" "$LIST_URL" 2>/dev/null \
+	|| { logger -t redlib-block "download failed, keeping previous list"; exit 1; }
+jsonfilter -i "$TMP.json" -e '@.instances[*].url' 2>/dev/null \
+	| sed -n 's|^https\?://\([^/:]*\).*|\1|p' | tr 'A-Z' 'a-z' | sort -u > "$TMP.hosts"
+[ -s "$TMP.hosts" ] || { logger -t redlib-block "list empty or unreadable, keeping previous list"; exit 1; }
+
+grep -vE '^[[:space:]]*(#|$)' "$ALLOW_FILE" 2>/dev/null | tr 'A-Z' 'a-z' | sort -u > "$TMP.allow"
+grep -vxF -f "$TMP.allow" "$TMP.hosts" > "$TMP.block"
+
+changed=
+section "$BL" "$TMP.block" && changed=1
+section "$AL" "$TMP.allow" && changed=1
+[ -n "$changed" ] && logger -t redlib-block "updated: $(wc -l < "$TMP.block") instances blocked"
+exit 0

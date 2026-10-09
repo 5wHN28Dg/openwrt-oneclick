@@ -1,0 +1,210 @@
+#!/bin/sh
+# One-click OpenWrt setup. Run on a computer plugged into a freshly installed
+# OpenWrt router (router's WAN port in the internet box):
+#
+#   ./setup.sh                      # router at 192.168.1.1
+#   ./setup.sh HOST [PORT]          # another address
+#   ./setup.sh --reconfigure [...]  # change the saved answers first
+#   ./setup.sh --settings-only      # only create/change the saved answers
+#
+# First run: asks for your settings and offers to save them in
+# private/config.env (gitignored). Then it copies router/ plus your private
+# files to the router's RAM, runs router/install.sh there, prints its report
+# and deletes the copy (it holds secrets).
+
+set -eu
+HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/lib/laptop.sh"
+
+RECONF= ONLY=
+case ${1-} in
+	--reconfigure) RECONF=1; shift ;;
+	--settings-only) RECONF=1 ONLY=1; shift ;;
+esac
+HOST=${1:-192.168.1.1}
+PORT=${2:-22}
+PRIV=${ONECLICK_PRIVATE:-$HERE/private}   # override for tests
+CONF=$PRIV/config.env
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT INT TERM
+
+# ------------------------------------------------------------------ settings
+wizard() {
+	say ""
+	say "Router settings. Press Enter to accept the value in [brackets]."
+	ask WIFI_SSID "Wi-Fi name" "${WIFI_SSID:-OpenWrt}"
+	if [ -z "${WIFI_KEY-}" ] || ask_yn "Change the Wi-Fi password?" n; then
+		while ask_secret WIFI_KEY "Wi-Fi password (8+ characters)"; do
+			[ ${#WIFI_KEY} -ge 8 ] && break; say "  Too short."
+		done
+	fi
+	WIFI_ENCRYPTION=${WIFI_ENCRYPTION:-sae-mixed}
+	if [ -z "${ROOT_PASSWORD_HASH-}" ] || ask_yn "Change the router admin (root) password?" n; then
+		ask_secret _pw "Router admin password"
+		ROOT_PASSWORD_HASH=$(printf '%s' "$_pw" | openssl passwd -5 -stdin); unset _pw
+	fi
+
+	d=${SSH_KEY:-$HOME/.ssh/id_ed25519}
+	ask SSH_KEY "SSH key this computer logs in with" "$d"
+	if [ ! -f "$SSH_KEY" ]; then
+		ask_yn "$SSH_KEY doesn't exist. Create it?" y || { say "Need an SSH key."; exit 1; }
+		ssh-keygen -q -t ed25519 -N '' -C openwrt-oneclick -f "$SSH_KEY"
+	fi
+	SSH_PUBKEYS=$(cat "$SSH_KEY.pub")
+
+	ask TZ_NAME "Time zone" "${TZ_NAME:-$(laptop_tz)}"
+	TZ_POSIX=$(posix_tz "$TZ_NAME") || { say "Unknown time zone $TZ_NAME, using UTC."; TZ_NAME=UTC TZ_POSIX=UTC0; }
+
+	if ask_yn "Does your provider need a PPPoE username and password?" "$( [ "${WAN_PROTO-}" = pppoe ] && echo y || echo n)"; then
+		WAN_PROTO=pppoe
+		ask PPPOE_USER "PPPoE username" "${PPPOE_USER-}"
+		ask_secret PPPOE_PASS "PPPoE password"
+	else
+		WAN_PROTO=dhcp PPPOE_USER= PPPOE_PASS=
+	fi
+	ask_link_type LINK_TYPE "${LINK_TYPE-}"
+
+	say ""
+	say "Family filtering: safe search on Google/Bing/DuckDuckGo/Brave/Startpage/Yandex,"
+	say "adult and anime-NSFW block lists, and blocking of DNS/VPN tricks that get around them."
+	if ask_yn "Turn on family filtering?" "$(yn "${FAMILY_FILTER:-1}")"; then
+		FAMILY_FILTER=1
+		ADBLOCK_LISTS=${ADBLOCK_LISTS:-hagezi:pro hagezi:tif.mini hagezi:nsfw hagezi:nosafesearch hagezi:doh-vpn-proxy-bypass}
+		BANIP_FEEDS=${BANIP_FEEDS:-doh vpn}
+		ask REDLIB_ALLOW "Redlib (Reddit viewer) instances to keep reachable, space separated (Enter = block all)" "${REDLIB_ALLOW-}"
+	else
+		FAMILY_FILTER=0 ADBLOCK_LISTS=${ADBLOCK_LISTS:-hagezi:pro hagezi:tif.mini} BANIP_FEEDS=${BANIP_FEEDS-} REDLIB_ALLOW=
+	fi
+
+	say ""
+	if ask_yn "Send chosen sites through a WireGuard VPN (Proton VPN or any provider)?" "$(yn "${ENABLE_VPN:-0}")"; then
+		ENABLE_VPN=1
+		if [ -z "${WG_PRIVATE_KEY-}" ] || ask_yn "Load a new WireGuard config file?" n; then
+			while :; do
+				ask _wg "Path to the provider's WireGuard .conf file"
+				case $_wg in "~/"*) _wg=$HOME/${_wg#"~/"} ;; esac
+				if [ -f "$_wg" ] && _p=$(parse_wg_conf "$_wg"); then eval "$_p"; break; fi
+				say "  Can't read a WireGuard config from that file."
+				[ -t 0 ] || exit 1
+			done
+		fi
+		ask VPN_IFACE "Name for the VPN interface" "${VPN_IFACE:-vpn}"
+		ask VPN_ROUTE_DOMAINS "Domains to send through the VPN, space separated" "${VPN_ROUTE_DOMAINS-}"
+		ask VPN_ROUTE_SUBNETS "IP ranges to send through the VPN, space separated (optional)" "${VPN_ROUTE_SUBNETS-}"
+	else
+		ENABLE_VPN=0
+	fi
+	if ask_yn "Install the MangaDex safe-mode reader (opens at http://manga.lan)?" "$(yn "${ENABLE_MANGADEX:-0}")"; then
+		ENABLE_MANGADEX=1
+	else
+		ENABLE_MANGADEX=0
+	fi
+}
+
+if [ -f "$CONF" ]; then
+	. "$CONF"
+	[ -n "$RECONF" ] && wizard
+	if [ -z "${LINK_TYPE-}" ]; then   # older settings files: ask, then save
+		ask_link_type LINK_TYPE || exit 1
+		write_config "$CONF"; say "Saved the link type in $CONF"
+	fi
+	missing=
+	for k in WIFI_SSID WIFI_KEY ROOT_PASSWORD_HASH SSH_KEY TZ_POSIX LINK_TYPE; do
+		eval "[ -n \"\${$k-}\" ]" || missing="$missing $k"
+	done
+	[ -z "$missing" ] || { say "private/config.env lacks:$missing. Run ./setup.sh --reconfigure"; exit 1; }
+	[ -n "$RECONF" ] && { mkdir -p "$PRIV"; write_config "$CONF"; say "Saved $CONF"; }
+	USED=$CONF
+else
+	say "No private settings yet ($CONF)."
+	ask_yn "Answer a few questions to create them now?" y || exit 1
+	wizard
+	if ask_yn "Save these settings in $CONF for next time (kept off git)?" y; then
+		mkdir -p "$PRIV"; chmod 700 "$PRIV"
+		write_config "$CONF"; USED=$CONF; say "Saved $CONF"
+	else
+		USED=$STAGE/config.env; write_config "$USED"
+	fi
+fi
+link_params "$LINK_TYPE" >/dev/null || { say "Unknown LINK_TYPE '$LINK_TYPE'. Run ./setup.sh --reconfigure"; exit 1; }
+[ -n "$ONLY" ] && exit 0
+
+# ------------------------------------------------------------------ connect
+KEY=$SSH_KEY
+# A fresh router has a new host key; a router this tool set up before has the
+# saved one (private/host_keys). Trust the saved key strictly and a fresh one
+# on first use, without touching ~/.ssh/known_hosts.
+KNOWN_OLD=$STAGE/known_hosts.saved
+KNOWN_NEW=$STAGE/known_hosts.fresh
+target=$HOST; [ "$PORT" = 22 ] || target="[$HOST]:$PORT"
+: > "$KNOWN_OLD"
+[ -f "$PRIV/host_keys/host_keys.pub" ] && sed "s|^|$target |" "$PRIV/host_keys/host_keys.pub" > "$KNOWN_OLD"
+
+ssh_with() { # known_hosts-file strictness command...
+	f=$1 strict=$2; shift 2
+	ssh -p "$PORT" -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
+		-o UserKnownHostsFile="$f" -o StrictHostKeyChecking="$strict" "root@$HOST" "$@"
+}
+ssh_r() { # 255 = could not connect/authenticate (e.g. other host key); the command never ran
+	s_rc=0; ssh_with "$KNOWN_OLD" yes "$@" 2>/dev/null || s_rc=$?
+	[ $s_rc -eq 255 ] || return $s_rc
+	ssh_with "$KNOWN_NEW" accept-new "$@"
+}
+
+say "Connecting to $HOST:$PORT ..."
+i=0
+until ssh_r true 2>/dev/null; do
+	i=$((i + 1))
+	[ $i -ge 20 ] && { say "Cannot log in to root@$HOST:$PORT. Is it a fresh OpenWrt (no root password) or one set up with this tool and key?"; exit 1; }
+	sleep 3
+done
+
+# ------------------------------------------------------------------ bundle
+mkdir -p "$STAGE/b/private"
+cp -R "$HERE/router" "$STAGE/b/router"
+cp "$USED" "$STAGE/b/private/config.env"
+set -- $(link_params "$LINK_TYPE")
+printf 'LINK_LL=%s\nLINK_OVERHEAD=%s\nLINK_MPU=%s\n' "$1" "$2" "$3" >> "$STAGE/b/private/config.env"
+for f in blocklist.txt allowlist.txt; do [ -f "$PRIV/$f" ] && cp "$PRIV/$f" "$STAGE/b/private/"; done
+[ -d "$PRIV/host_keys" ] && cp -R "$PRIV/host_keys" "$STAGE/b/private/host_keys"
+
+say "Copying settings to the router's RAM ..."
+tar -C "$STAGE/b" -czf - router private \
+	| ssh_r 'rm -rf /tmp/setup && mkdir -m 700 /tmp/setup && tar -C /tmp/setup -xzf -'
+
+say "Running the installer on the router (5-10 minutes) ..."
+ssh_r 'rm -f /tmp/setup.log /tmp/setup.rc
+	( setsid sh -c "sh /tmp/setup/router/install.sh > /tmp/setup.log 2>&1; echo \$? > /tmp/setup.rc; rm -rf /tmp/setup" </dev/null >/dev/null 2>&1 & )'
+
+# Follow the log. The installer restarts the network and SSH, so reconnect as needed.
+shown=0
+while :; do
+	sleep 5
+	chunk=$(ssh_r "awk -v s=$shown 'NR > s' /tmp/setup.log 2>/dev/null; echo \"@@RC=\$(cat /tmp/setup.rc 2>/dev/null)\"" 2>/dev/null) || continue
+	rc=${chunk##*@@RC=}
+	body=$(printf '%s\n' "$chunk" | sed '/^@@RC=/d')
+	if [ -n "$body" ]; then
+		printf '%s\n' "$body"
+		shown=$((shown + $(printf '%s\n' "$body" | wc -l)))
+	fi
+	[ -n "$rc" ] && break
+done
+ssh_r 'rm -rf /tmp/setup' 2>/dev/null || true
+
+# Keep this router's SSH identity for future re-installs (only if settings are saved).
+if [ "$USED" = "$CONF" ] && [ ! -f "$PRIV/host_keys/host_keys.pub" ] && [ "$rc" != 1 ]; then
+	mkdir -p "$PRIV/host_keys"; chmod 700 "$PRIV/host_keys"
+	if ssh_r 'tar -C /etc/dropbear -cf - dropbear_ed25519_host_key dropbear_rsa_host_key' | (umask 077; tar -C "$PRIV/host_keys" -xf -) \
+		&& ssh_r 'for k in /etc/dropbear/dropbear_*_host_key; do dropbearkey -y -f $k | grep "^ssh-" | cut -d" " -f1,2; done' > "$PRIV/host_keys/host_keys.pub"; then
+		say "Saved the router's SSH host keys in private/host_keys (reused on re-install)."
+	else
+		rm -rf "$PRIV/host_keys"
+	fi
+fi
+
+case $rc in
+	0) say ""; say "Done: everything passed." ;;
+	2) say ""; say "Done, but some checks FAILED (see the report above). Full log: /tmp/setup.log on the router." ;;
+	*) say ""; say "Setup stopped early (exit $rc). Full log: /tmp/setup.log on the router." ;;
+esac
+exit "$rc"

@@ -1,0 +1,51 @@
+#!/bin/sh
+# Pin search engines to their safe-search IPs via a dnsmasq hosts file.
+# Replaces dnsmasq cname= entries, which return no IP when the target isn't cached.
+# Run from cron and rc.local; keeps the previous file if any lookup fails.
+
+OUT=/tmp/hosts/safesearch
+TMP=/tmp/safesearch.hosts.$$
+UPSTREAM=127.0.0.1
+PORT=5354
+
+# target|names that should resolve to it
+MAP='forcesafesearch.google.com|www.google.com google.com www.google.co.uk
+strict.bing.com|www.bing.com bing.com cn.bing.com
+safe.duckduckgo.com|duckduckgo.com www.duckduckgo.com start.duckduckgo.com
+safe.startpage.com|startpage.com www.startpage.com eu.startpage.com www.eu.startpage.com search.startpage.com
+forcesafe.search.brave.com|search.brave.com'
+
+lookup() {
+	dig +short +time=3 +tries=2 -p "$PORT" @"$UPSTREAM" "$1" "$2" |
+		grep -E '^[0-9a-fA-F:.]+$' | grep -E '\.|:'
+}
+
+: > "$TMP"
+echo "$MAP" | while IFS='|' read -r target names; do
+	ips="$(lookup "$target" A)"
+	if [ -z "$ips" ]; then
+		logger -t safesearch-hosts "no A record for $target, keeping old file"
+		echo FAIL >> "$TMP.fail"
+		continue
+	fi
+	ips="$ips
+$(lookup "$target" AAAA)"
+	for ip in $ips; do
+		echo "$ip $names" >> "$TMP"
+	done
+done
+
+if [ -e "$TMP.fail" ] && [ -s "$OUT" ]; then
+	rm -f "$TMP" "$TMP.fail"
+	exit 1
+fi
+rm -f "$TMP.fail"
+
+if ! cmp -s "$TMP" "$OUT"; then
+	mv "$TMP" "$OUT"
+	chmod 644 "$OUT"
+	killall -HUP dnsmasq
+	logger -t safesearch-hosts "updated $OUT"
+else
+	rm -f "$TMP"
+fi
