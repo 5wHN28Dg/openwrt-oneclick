@@ -20,18 +20,21 @@ on()   { [ "${1:-0}" = 1 ]; }
 
 VPN=${VPN_IFACE:-vpn}
 case $VPN in *[!a-z0-9_]*|'') echo "VPN_IFACE must be lowercase letters, digits or _"; exit 1 ;; esac
-case " lan wan wan6 wan_6 loopback " in *" $VPN "*) echo "VPN_IFACE '$VPN' is reserved"; exit 1 ;; esac
+RESERVED=' lan wan wan6 wan_6 loopback remote '
+case $RESERVED in *" $VPN "*) echo "VPN_IFACE '$VPN' is reserved"; exit 1 ;; esac
 if [ -n "$VPN" ] && uci -q get "network.$VPN" >/dev/null && [ "$(uci -q get "network.$VPN.setup")" != 1 ]; then
 	echo "VPN_IFACE '$VPN' is an existing interface not made by this tool; pick another name"; exit 1
 fi
 on "${ENABLE_VPN:-0}" || VPN=
 LAN_IP=$(uci get network.lan.ipaddr | cut -d/ -f1)
+REMOTE=; on "${ENABLE_REMOTE:-0}" && REMOTE=1
 
 # curl: SQM speed test (streamed upload); gawk, sed, coreutils-sort: adblock-lean's
 # fast list processing; dnsmasq-full: nftset support for pbr and adblock-lean.
 PACKAGES="luci luci-ssl luci-app-attendedsysupgrade owut luci-app-banip luci-app-sqm
 	dnsmasq-full dnsproxy curl gawk sed coreutils-sort"
-[ -n "$VPN" ] && PACKAGES="$PACKAGES luci-proto-wireguard luci-app-pbr"
+[ -n "$VPN$REMOTE" ] && PACKAGES="$PACKAGES luci-proto-wireguard"
+[ -n "$VPN" ] && PACKAGES="$PACKAGES luci-app-pbr"
 [ "${WAN_PROTO:-dhcp}" = pppoe ] && PACKAGES="$PACKAGES ppp-mod-pppoe luci-proto-ppp"
 
 # Copy files only: never apply directory modes to system directories like /etc.
@@ -79,7 +82,8 @@ WAN_DEV=$(wan_dev wan); [ -n "$WAN_DEV" ] || WAN_DEV=$(wan_dev wan6)
 HAS_V4=; online4 && [ -n "$(ubus call network.interface.wan status | jsonfilter -e '@["ipv4-address"][0].address')" ] && HAS_V4=1
 has_v6() { online6 && ip -6 route show default | grep -q . && ip -6 addr show scope global | grep -q inet6; }
 HAS_V6=; has_v6 && HAS_V6=1
-pass "online via $WAN_DEV: IPv4 ${HAS_V4:+yes (NAT)}${HAS_V4:-no}, IPv6 ${HAS_V6:+yes}${HAS_V6:-no}"
+yes_no() { if [ -n "$1" ]; then echo "$2"; else echo "$3"; fi; }
+pass "online via $WAN_DEV: IPv4 $(yes_no "$HAS_V4" 'yes (NAT)' no), IPv6 $(yes_no "$HAS_V6" yes no)"
 
 i=0
 until [ "$(date +%Y)" -ge 2026 ]; do   # TLS needs a sane clock
@@ -97,8 +101,9 @@ else
 	opkg update >/dev/null 2>&1 || die "opkg update failed"
 	# Download dnsmasq-full while the old dnsmasq still answers DNS, then swap.
 	(cd /tmp && opkg download dnsmasq-full >/dev/null 2>&1) || die "opkg download dnsmasq-full failed"
+	OPKG_PACKAGES=$(echo $PACKAGES | sed 's/dnsmasq-full//')
 	# shellcheck disable=SC2086
-	opkg install $(echo $PACKAGES | sed 's/dnsmasq-full//') >/tmp/setup-pkg.log 2>&1 || die "package install failed (/tmp/setup-pkg.log)"
+	opkg install $OPKG_PACKAGES >/tmp/setup-pkg.log 2>&1 || die "package install failed (/tmp/setup-pkg.log)"
 	opkg remove dnsmasq >/dev/null 2>&1
 	opkg install /tmp/dnsmasq-full_*.ipk >>/tmp/setup-pkg.log 2>&1 || die "dnsmasq-full install failed (/tmp/setup-pkg.log)"
 fi
@@ -106,16 +111,44 @@ fi
 /etc/init.d/dnsmasq enable; /etc/init.d/dnsmasq restart >/dev/null 2>&1
 pass "installed: $(echo $PACKAGES | tr -s ' \t\n' ' ')"
 
+# ---------------------------------------------------------------- adblock-lean
+# Fetched from its project on every run, so it starts out current. Its default
+# config is generated the way its own setup does it without questions (the
+# path LuCI uses): the preset, and with it the base lists and size limits,
+# follows the router's memory. Our extra lists are added on top.
+step "adblock-lean"
+ABL_INSTALLER=https://raw.githubusercontent.com/lynxthecat/adblock-lean/master/abl-install.sh
+uclient-fetch -q -O /tmp/abl-install.sh "$ABL_INSTALLER" || die "could not download $ABL_INSTALLER"
+DO_DIALOGS=0 sh /tmp/abl-install.sh -v release >/tmp/setup-abl.log 2>&1 \
+	|| { tail -5 /tmp/setup-abl.log; die "adblock-lean install failed (/tmp/setup-abl.log)"; }
+rm -f /tmp/abl-install.sh
+rm -f /etc/adblock-lean/config   # a fresh default config each run
+DO_DIALOGS=0 luci_preset=auto luci_upd_cron_job=1 luci_cron_schedule='0 5 * * *' \
+	/etc/init.d/adblock-lean gen_config >>/tmp/setup-abl.log 2>&1 && [ -s /etc/adblock-lean/config ] \
+	|| { tail -5 /tmp/setup-abl.log; die "adblock-lean gen_config failed (/tmp/setup-abl.log)"; }
+ABL_VER=$(sed -n 's/^ABL_VERSION="\(.*\)"$/\1/p' /etc/init.d/adblock-lean)
+abl_get() { sed -n "s/^$1=\"\(.*\)\"\$/\1/p" /etc/adblock-lean/config; }
+abl_set() { sed -i "s|^$1=.*|$1=\"$2\"|" /etc/adblock-lean/config; }
+ABL_BASE=$(abl_get raw_block_lists)
+case ${ADBLOCK_EXTRA_LISTS-} in *[!A-Za-z0-9:._/\ -]*) die "ADBLOCK_EXTRA_LISTS has unexpected characters" ;; esac
+ABL_LISTS=$ABL_BASE
+for l in ${ADBLOCK_EXTRA_LISTS-}; do case " $ABL_LISTS " in *" $l "*) ;; *) ABL_LISTS="$ABL_LISTS $l" ;; esac; done
+abl_set raw_block_lists "$ABL_LISTS"
+# The preset's size limit is sized for its own lists; the family lists add
+# about 100,000 entries (1.6 MB), so make room for them at adblock-lean's
+# own 25 bytes per entry. Other extra lists have to fit in what is left.
+if on "${FAMILY_FILTER:-0}"; then
+	abl_set max_blocklist_file_size_KB $(( $(abl_get max_blocklist_file_size_KB) + 2500 ))
+fi
+pass "adblock-lean $ABL_VER from github.com/lynxthecat/adblock-lean; lists for this router: $ABL_BASE${ADBLOCK_EXTRA_LISTS:+; added: $ADBLOCK_EXTRA_LISTS}"
+
 # ---------------------------------------------------------------- files
 step "Files"
 put_tree "$ROUTER/files"
-put_tree "$ROUTER/vendor/adblock-lean"
 if on "${ENABLE_MANGADEX:-0}"; then put_tree "$ROUTER/vendor/safe-otaku"; chmod 755 /www/cgi-bin/md; fi
-chmod 755 /etc/init.d/adblock-lean /usr/sbin/safesearch-hosts /usr/sbin/redlib-block
+chmod 755 /usr/sbin/safesearch-hosts /usr/sbin/redlib-block
 
-# adblock-lean: lists from the settings; local lists = own entries + project sections
-case ${ADBLOCK_LISTS:-hagezi:pro} in *[!A-Za-z0-9:._/\ -]*) die "ADBLOCK_LISTS has unexpected characters" ;; esac
-sed -i "s|^raw_block_lists=.*|raw_block_lists=\"${ADBLOCK_LISTS:-hagezi:pro}\"|" /etc/adblock-lean/config
+# adblock-lean local lists: own entries + project sections
 section() { # NAME FILE -> marked section, if the file has entries
 	[ -s "$2" ] || return 0
 	echo "# >>> $1"; grep -vE '^[[:space:]]*(#|$)' "$2"; echo "# <<< $1"
@@ -147,7 +180,7 @@ if [ "${MEM_KB:-0}" -lt 200000 ]; then   # 128 MB class: small caches, the block
 else
 	DNS_CACHE=10000
 fi
-pass "copied adblock-lean, banIP, dnsproxy and safe-search files${ENABLE_MANGADEX:+$(on "$ENABLE_MANGADEX" && echo ', MangaDex app')}"
+pass "copied adblock-lean lists, banIP, dnsproxy and safe-search files${ENABLE_MANGADEX:+$(on "$ENABLE_MANGADEX" && echo ', MangaDex app')}"
 
 # ---------------------------------------------------------------- access
 step "Access"
@@ -206,15 +239,15 @@ if [ -n "$VPN" ]; then
 	uci set "network.$VPN.private_key=$WG_PRIVATE_KEY"
 	uci set "network.$VPN.multipath=off"
 	uci add network "wireguard_$VPN" >/dev/null
-	uci set "network.@wireguard_$VPN[-1].description=VPN peer"
-	uci set "network.@wireguard_$VPN[-1].public_key=$WG_PEER_PUBLIC_KEY"
-	uci set "network.@wireguard_$VPN[-1].endpoint_host=$WG_ENDPOINT_HOST"
-	uci set "network.@wireguard_$VPN[-1].endpoint_port=$WG_ENDPOINT_PORT"
-	uci set "network.@wireguard_$VPN[-1].persistent_keepalive=${WG_KEEPALIVE:-25}"
+	uci set "network.@wireguard_${VPN}[-1].description=VPN peer"
+	uci set "network.@wireguard_${VPN}[-1].public_key=$WG_PEER_PUBLIC_KEY"
+	uci set "network.@wireguard_${VPN}[-1].endpoint_host=$WG_ENDPOINT_HOST"
+	uci set "network.@wireguard_${VPN}[-1].endpoint_port=$WG_ENDPOINT_PORT"
+	uci set "network.@wireguard_${VPN}[-1].persistent_keepalive=${WG_KEEPALIVE:-25}"
 	for a in ${WG_ADDRESSES-}; do uci add_list "network.$VPN.addresses=$a"; done
 	for a in ${WG_DNS-}; do uci add_list "network.$VPN.dns=$a"; done
-	for a in ${WG_ALLOWED_IPS:-0.0.0.0/0 ::/0}; do uci add_list "network.@wireguard_$VPN[-1].allowed_ips=$a"; done
-	[ -n "${WG_PRESHARED_KEY-}" ] && uci set "network.@wireguard_$VPN[-1].preshared_key=$WG_PRESHARED_KEY"
+	for a in ${WG_ALLOWED_IPS:-0.0.0.0/0 ::/0}; do uci add_list "network.@wireguard_${VPN}[-1].allowed_ips=$a"; done
+	[ -n "${WG_PRESHARED_KEY-}" ] && uci set "network.@wireguard_${VPN}[-1].preshared_key=$WG_PRESHARED_KEY"
 	uci commit network
 
 	# PBR: only the chosen domains and ranges go through the VPN
@@ -243,12 +276,61 @@ if [ -n "$VPN" ]; then
 	pass "WireGuard $VPN to $WG_ENDPOINT_HOST; PBR: ${VPN_ROUTE_DOMAINS:-no domains}${VPN_ROUTE_SUBNETS:+ + IP ranges}"
 fi
 
+# ---------------------------------------------------------------- remote access
+# WireGuard server: devices outside reach the home network and the router's
+# DNS (so manga.lan) through it. The interface joins the lan zone below.
+# Earlier runs' interface and peers (tagged setup_remote=1) go first.
+if [ "$(uci -q get network.remote.setup_remote)" = 1 ]; then
+	for s in $(uci -q show network | sed -n "s/^network\.\(@wireguard_remote\[[0-9]*\]\)=.*/\1/p" | sort -r); do uci delete "network.$s"; done
+	uci delete network.remote
+	uci commit network
+fi
+ip2int() { # a.b.c.d -> integer
+	echo "$1" | { IFS=. read -r a b c d; echo $(( (a << 24) + (b << 16) + (c << 8) + d )); }
+}
+if [ -n "$REMOTE" ]; then
+	step "Remote access"
+	uci -q get network.remote >/dev/null && die "an interface 'remote' exists that this tool did not make; rename it first"
+	lan_st=$(ubus call network.interface.lan status)
+	lan_sub=$(echo "$lan_st" | jsonfilter -e '@["ipv4-address"][0].address')/$(echo "$lan_st" | jsonfilter -e '@["ipv4-address"][0].mask')
+	case $lan_sub in /*|*/) lan_sub=$LAN_IP/24 ;; esac
+	# The tunnel range must not overlap the LAN (compare at the shorter prefix).
+	p=${lan_sub#*/}; [ "$p" -gt 24 ] && p=24
+	m=$(( (0xffffffff << (32 - p)) & 0xffffffff ))
+	[ $(( $(ip2int "${lan_sub%/*}") & m )) -eq $(( $(ip2int "${REMOTE_NET%/*}") & m )) ] \
+		&& die "REMOTE_NET $REMOTE_NET overlaps the LAN $lan_sub; pick another range"
+	RNET=${REMOTE_NET%.0/24}
+	uci batch >/dev/null <<-EOF
+		set network.remote=interface
+		set network.remote.proto='wireguard'
+		set network.remote.setup_remote='1'
+		set network.remote.private_key='$REMOTE_SERVER_KEY'
+		set network.remote.listen_port='$REMOTE_PORT'
+		add_list network.remote.addresses='$RNET.1/24'
+	EOF
+	printf '%s\n' "$REMOTE_PEERS" | while IFS='|' read -r name n key psk; do
+		[ -n "$name" ] || continue
+		uci batch >/dev/null <<-EOF
+			add network wireguard_remote
+			set network.@wireguard_remote[-1].description='$name'
+			set network.@wireguard_remote[-1].public_key='$(printf '%s' "$key" | wg pubkey)'
+			set network.@wireguard_remote[-1].preshared_key='$psk'
+			add_list network.@wireguard_remote[-1].allowed_ips='$RNET.$n/32'
+		EOF
+	done
+	uci commit network
+	REMOTE_N=$(printf '%s\n' "$REMOTE_PEERS" | grep -c .)
+	pass "WireGuard server on UDP $REMOTE_PORT, $REMOTE_N devices in $REMOTE_NET, reaching $lan_sub"
+fi
+
 # ---------------------------------------------------------------- firewall
 step "Firewall"
 # Remove what this script added before, so re-runs don't duplicate.
 for s in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.setup='1'$/\1/p" | sort -r); do uci delete "firewall.$s"; done
 uci -q delete firewall.dns_int
 uci -q delete firewall.dot_fwd
+LAN_ZONE=$(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='lan'$/\1/p" | head -1)
+[ -n "$LAN_ZONE" ] && uci -q del_list "firewall.$LAN_ZONE.network=remote"
 uci batch >/dev/null <<-EOF
 	set firewall.@defaults[0].flow_offloading='1'
 	set firewall.dns_int=redirect
@@ -305,8 +387,21 @@ if [ -n "$VPN" ]; then
 		set firewall.@forwarding[-1].dest='$VPN'
 	EOF
 fi
+if [ -n "$REMOTE" ]; then
+	[ -n "$LAN_ZONE" ] || die "no firewall zone named lan"
+	uci add_list "firewall.$LAN_ZONE.network=remote"
+	uci batch >/dev/null <<-EOF
+		add firewall rule
+		set firewall.@rule[-1].setup='1'
+		set firewall.@rule[-1].name='Allow-Remote-WireGuard'
+		set firewall.@rule[-1].src='wan'
+		set firewall.@rule[-1].proto='udp'
+		set firewall.@rule[-1].dest_port='$REMOTE_PORT'
+		set firewall.@rule[-1].target='ACCEPT'
+	EOF
+fi
 uci commit firewall
-pass "DNS hijack${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo ', DoT and VPN-protocol blocks')}${VPN:+, $VPN zone}"
+pass "DNS hijack${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo ', DoT and VPN-protocol blocks')}${VPN:+, $VPN zone}${REMOTE:+, remote access in the lan zone}"
 
 # ---------------------------------------------------------------- DNS
 step "Encrypted DNS"
@@ -418,7 +513,7 @@ if on "${FAMILY_FILTER:-0}"; then
 	echo "50 4 * * * /usr/sbin/redlib-block" >> /etc/crontabs/root
 	sed -i 's|^exit 0$|(sleep 30; /usr/sbin/safesearch-hosts) \&\nexit 0|' /etc/rc.local
 fi
-for f in /usr/sbin/safesearch-hosts /usr/sbin/redlib-block /etc/redlib-block.allow /etc/init.d/adblock-lean /usr/lib/adblock-lean/ /www/mangadex-safe/ /www/cgi-bin/md; do
+for f in /usr/sbin/safesearch-hosts /usr/sbin/redlib-block /etc/redlib-block.allow /etc/init.d/adblock-lean /usr/lib/adblock-lean/ /etc/adblock-lean/ /www/mangadex-safe/ /www/cgi-bin/md; do
 	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 done
 pass "custom files kept across firmware upgrades${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo '; safe search every 30 min, Redlib list daily 04:50')}"
@@ -433,7 +528,7 @@ step "SQM: measuring line speed (about 20 s)"
 measure() { # down|up -> kbit/s over 10 s, 4 parallel streams
 	out=/tmp/setup-speed.$$; : > $out
 	end=$(( $(date +%s) + 10 ))
-	for w in 1 2 3 4; do (
+	for _ in 1 2 3 4; do (
 		while [ "$(date +%s)" -lt $end ]; do
 			left=$(( end - $(date +%s) )); [ $left -lt 1 ] && break
 			if [ "$1" = down ]; then
@@ -460,7 +555,7 @@ elif [ -n "${SQM_FALLBACK_DOWN-}" ] && [ -n "${SQM_FALLBACK_UP-}" ] \
 	codes=$(sort -u /tmp/setup-speed.codes 2>/dev/null | tr '\n' ' '); codes=${codes:-none}
 	SQM_MSG="SQM speed test failed (down=${DOWN:-0} up=${UP:-0} kbit/s, Cloudflare HTTP codes: $codes); using saved rates $RATE_DOWN / $RATE_UP kbit/s"
 else
-	RATE_DOWN= SQM_OK=
+	RATE_DOWN='' SQM_OK=''
 	codes=$(sort -u /tmp/setup-speed.codes 2>/dev/null | tr '\n' ' '); codes=${codes:-none}
 	SQM_MSG="SQM speed test failed (down=${DOWN:-0} up=${UP:-0} kbit/s, Cloudflare HTTP codes: $codes) and no saved rates; SQM left off, re-run setup later"
 fi
@@ -518,7 +613,7 @@ else
 	uci set banip.global.ban_protov6=0
 fi
 uci commit banip
-info "after restart: IPv6 ${HAS_V6:+usable (banIP covers IPv6)}${HAS_V6:-not usable}"
+info "after restart: IPv6 $(yes_no "$HAS_V6" 'usable (banIP covers IPv6)' 'not usable')"
 /etc/init.d/firewall restart >/dev/null 2>&1
 /etc/init.d/uhttpd restart
 /etc/init.d/cron enable; /etc/init.d/cron restart
@@ -585,6 +680,11 @@ if [ -n "$VPN" ]; then
 	i=0; while [ $i -lt 10 ] && [ "$(wg show "$VPN" latest-handshakes 2>/dev/null | awk '{print $2}')" = 0 ]; do sleep 3; i=$((i + 1)); done
 	check "VPN WireGuard handshake" "[ \"\$(wg show $VPN latest-handshakes | awk '{print \$2}')\" -gt 0 ]"
 	check "PBR active (no errors, $VPN gateway)" "pbr_ok"
+fi
+if [ -n "$REMOTE" ]; then
+	check "remote access: WireGuard listens on UDP $REMOTE_PORT" "[ \"\$(wg show remote listen-port)\" = $REMOTE_PORT ]"
+	check "remote access: $REMOTE_N devices" "[ \"\$(wg show remote peers | wc -l)\" = $REMOTE_N ]"
+	check "remote access: port open on the WAN" "nft list ruleset | grep -q 'Allow-Remote-WireGuard'"
 fi
 check "banIP running" "/etc/init.d/banip status 2>&1 | grep -qi 'status.*active'"
 [ -n "$RATE_DOWN" ] && check "SQM cake active on $WAN_DEV" "tc qdisc show dev $WAN_DEV | grep -q cake"

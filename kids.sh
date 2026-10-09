@@ -27,7 +27,7 @@ valid_name() { printf '%s' "$1" | grep -qE '^[A-Za-z0-9._-]{1,32}$'; }
 valid_hm()  { printf '%s' "$1" | grep -qE '^([01][0-9]|2[0-3]):[0-5][0-9]$'; }
 
 if [ -n "$REMOVE" ]; then
-	DEVICES= CUTOFF_START= CUTOFF_STOP=
+	DEVICES='' CUTOFF_START='' CUTOFF_STOP=''
 elif [ ! -f "$KIDS" ]; then
 	say "No kids' devices saved yet ($KIDS)."
 	ask_yn "Enter them now?" y || exit 1
@@ -56,6 +56,7 @@ elif [ ! -f "$KIDS" ]; then
 		say "Saved $KIDS"
 	fi
 else
+	# shellcheck source=/dev/null
 	. "$KIDS"
 fi
 

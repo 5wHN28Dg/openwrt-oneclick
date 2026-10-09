@@ -17,7 +17,7 @@ exec 3>&2   # the terminal, for questions asked while stderr is redirected
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib/laptop.sh"
 
-RECONF= ONLY=
+RECONF='' ONLY=''
 case ${1-} in
 	--reconfigure) RECONF=1; shift ;;
 	--settings-only) RECONF=1 ONLY=1; shift ;;
@@ -45,7 +45,7 @@ wizard() {
 	WIFI_ENCRYPTION=${WIFI_ENCRYPTION:-sae-mixed}
 	if [ -z "${ROOT_PASSWORD_HASH-}" ] || ask_yn "Change the router admin (root) password?" n; then
 		OPENSSL=$(find_openssl) || { say "Need OpenSSL 1.1.1+ for 'openssl passwd -5' (macOS: brew install openssl@3)."; exit 1; }
-		ask_secret _pw "Router admin password"
+		_pw=''; ask_secret _pw "Router admin password"
 		ROOT_PASSWORD_HASH=$(printf '%s' "$_pw" | "$OPENSSL" passwd -5 -stdin); unset _pw
 	fi
 
@@ -59,6 +59,7 @@ wizard() {
 	SSH_PUBKEYS=$(cat "$SSH_KEY.pub")
 	# A changed key: log in with the old one until the router has the new one.
 	if [ -n "$_prev_key" ] && [ "$_prev_pub" != "$SSH_PUBKEYS" ]; then
+		# shellcheck disable=SC2034  # saved by write_config
 		SSH_KEY_OLD=$_prev_key SSH_PUBKEYS_OLD=$_prev_pub
 	fi
 
@@ -72,22 +73,22 @@ wizard() {
 		ask PPPOE_USER "PPPoE username" "${PPPOE_USER-}"
 		ask_secret PPPOE_PASS "PPPoE password"
 	else
-		WAN_PROTO=dhcp PPPOE_USER= PPPOE_PASS=
+		# shellcheck disable=SC2034  # saved by write_config
+		WAN_PROTO=dhcp PPPOE_USER='' PPPOE_PASS=''
 	fi
 	ask_link_type LINK_TYPE "${LINK_TYPE-}"
 
 	say ""
 	say "Family filtering: safe search on Google/Bing/DuckDuckGo/Brave/Startpage/Yandex,"
 	say "adult and anime-NSFW block lists, and blocking of DNS/VPN tricks that get around them."
-	ADBLOCK_LISTS=${ADBLOCK_LISTS:-hagezi:pro hagezi:tif.mini}
 	if ask_yn "Turn on family filtering?" "$(yn "${FAMILY_FILTER:-1}")"; then
 		FAMILY_FILTER=1
-		ADBLOCK_LISTS=$(words_with "$ADBLOCK_LISTS" "$FAMILY_LISTS")
+		ADBLOCK_EXTRA_LISTS=$(words_with "${ADBLOCK_EXTRA_LISTS-}" "$FAMILY_LISTS")
 		BANIP_FEEDS=$(words_with "${BANIP_FEEDS-}" "$FAMILY_FEEDS")
 		ask REDLIB_ALLOW "Redlib (Reddit viewer) instances to keep reachable, space separated (Enter = block all)" "${REDLIB_ALLOW-}"
 	else
 		FAMILY_FILTER=0 REDLIB_ALLOW=
-		ADBLOCK_LISTS=$(words_without "$ADBLOCK_LISTS" "$FAMILY_LISTS")
+		ADBLOCK_EXTRA_LISTS=$(words_without "${ADBLOCK_EXTRA_LISTS-}" "$FAMILY_LISTS")
 		BANIP_FEEDS=$(words_without "${BANIP_FEEDS-}" "$FAMILY_FEEDS")
 	fi
 
@@ -97,7 +98,7 @@ wizard() {
 		if [ -z "${WG_PRIVATE_KEY-}" ] || ask_yn "Load a new WireGuard config file?" n; then
 			while :; do
 				ask _wg "Path to the provider's WireGuard .conf file"
-				case $_wg in "~/"*) _wg=$HOME/${_wg#"~/"} ;; esac
+				case $_wg in \~/*) _wg=$HOME/${_wg#\~/} ;; esac
 				if [ -f "$_wg" ] && _p=$(parse_wg_conf "$_wg"); then eval "$_p"; break; fi
 				say "  Can't read a WireGuard config from that file."
 				[ -t 0 ] || exit 1
@@ -114,6 +115,25 @@ wizard() {
 	else
 		ENABLE_MANGADEX=0
 	fi
+
+	say ""
+	say "Remote access: reach your home network (and manga.lan) from anywhere through"
+	say "a WireGuard tunnel to the router. Each device gets its own key."
+	if ask_yn "Turn on remote access?" "$(yn "${ENABLE_REMOTE:-0}")"; then
+		ENABLE_REMOTE=1
+		say "  A dynamic-DNS name (e.g. myhome.duckdns.org) keeps working when your provider"
+		say "  changes your address; without one, the router's current address is used."
+		ask REMOTE_HOST "Public name or address of your home (Enter = the router's current one)" "${REMOTE_HOST-}"
+		ask REMOTE_PORT "UDP port for the tunnel" "${REMOTE_PORT:-51820}"
+		_d=$(remote_devices)
+		ask _d "Devices that may connect, space separated" "${_d:-phone laptop}"
+		OPENSSL=$(find_openssl) || { say "Need OpenSSL 1.1.1+ to make WireGuard keys (macOS: brew install openssl@3)."; exit 1; }
+		REMOTE_NET=${REMOTE_NET:-10.77.0.0/24}
+		[ -n "${REMOTE_SERVER_KEY-}" ] || REMOTE_SERVER_KEY=$(wg_genkey)
+		REMOTE_PEERS=$(remote_peers_for "$_d") || { say "Too many devices (at most 253)."; exit 1; }
+	else
+		ENABLE_REMOTE=0
+	fi
 }
 
 validate() { # stop before saving or using broken settings
@@ -125,7 +145,11 @@ validate() { # stop before saving or using broken settings
 }
 
 if [ -f "$CONF" ]; then
+	# shellcheck source=/dev/null
 	. "$CONF"
+	if migrate_adblock_lists; then   # older settings: base lists now come from adblock-lean
+		write_config "$CONF"; say "Moved the block lists in $CONF to ADBLOCK_EXTRA_LISTS (base lists now fit the router)"
+	fi
 	[ -n "$RECONF" ] && wizard
 	if [ -z "${LINK_TYPE-}" ]; then   # older settings files: ask, then save
 		ask_link_type LINK_TYPE || exit 1
@@ -197,8 +221,7 @@ done
 mkdir -p "$STAGE/b/private"
 cp -R "$HERE/router" "$STAGE/b/router"
 cp "$USED" "$STAGE/b/private/config.env"
-set -- $(link_params "$LINK_TYPE")
-printf 'LINK_LL=%s\nLINK_OVERHEAD=%s\nLINK_MPU=%s\n' "$1" "$2" "$3" >> "$STAGE/b/private/config.env"
+link_params "$LINK_TYPE" | awk '{ printf "LINK_LL=%s\nLINK_OVERHEAD=%s\nLINK_MPU=%s\n", $1, $2, $3 }' >> "$STAGE/b/private/config.env"
 for f in blocklist.txt allowlist.txt; do [ -f "$PRIV/$f" ] && cp "$PRIV/$f" "$STAGE/b/private/"; done
 [ -d "$PRIV/host_keys" ] && cp -R "$PRIV/host_keys" "$STAGE/b/private/host_keys"
 
@@ -240,8 +263,37 @@ if [ "$USED" = "$CONF" ] && [ ! -f "$PRIV/host_keys/host_keys.pub" ] && [ "$rc" 
 fi
 
 if [ -n "${SSH_KEY_OLD-}" ] && [ "$USED" = "$CONF" ] && [ "$rc" != 1 ]; then
-	SSH_KEY_OLD= SSH_PUBKEYS_OLD=; unset SSH_KEY_OLD SSH_PUBKEYS_OLD
+	unset SSH_KEY_OLD SSH_PUBKEYS_OLD
 	write_config "$CONF"
+fi
+
+# Remote access: one WireGuard config per device, for the home network the
+# router actually has and its current address unless a name was given.
+if [ "${ENABLE_REMOTE-}" = 1 ] && [ "$rc" != 1 ]; then
+	info=$(ssh_r '. /lib/functions/network.sh; network_get_subnet s lan; eval "$(ipcalc.sh "$s")"; echo "$NETWORK/$PREFIX"
+		network_get_ipaddr a wan; [ -n "$a" ] || network_get_ipaddr6 a wan6; echo "$a"' 2>/dev/null) || info=
+	lan_net=$(printf '%s\n' "$info" | sed -n 1p) wan_ip=$(printf '%s\n' "$info" | sed -n 2p)
+	endpoint=${REMOTE_HOST:-$wan_ip}
+	if [ -z "$lan_net" ] || [ -z "$endpoint" ]; then
+		say "Could not read the router's network or address; remote-access configs not written."
+	else
+		mkdir -p "$PRIV/remote"; chmod 700 "$PRIV/remote"
+		for d in $(remote_devices); do
+			(umask 077; remote_client_conf "$d" "$lan_net" "$endpoint" > "$PRIV/remote/$d.conf")
+		done
+		say ""
+		say "Remote access: WireGuard configs for $(remote_devices) are in $PRIV/remote/."
+		say "  Import one into the WireGuard app on that device (phones: qrencode -t ansiutf8 < FILE shows a QR code)."
+		if [ -z "${REMOTE_HOST-}" ]; then
+			say "  They point at the router's current address $endpoint; set a dynamic-DNS name"
+			say "  (./setup.sh --reconfigure) if your provider changes it."
+		fi
+		if [ -z "${REMOTE_HOST-}" ] && behind_nat_v4 "$wan_ip"; then
+			say "  Warning: $wan_ip is a private or carrier-grade NAT address, so the router can't be"
+			say "  reached from outside. Forward UDP port $REMOTE_PORT to it on your modem, or ask your"
+			say "  provider for a public IPv4 address."
+		fi
+	fi
 fi
 
 case $rc in

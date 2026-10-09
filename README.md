@@ -28,7 +28,7 @@ Always:
 |---|---|
 | Encrypted DNS | `dnsproxy` on 127.0.0.1:5354 using Cloudflare (HTTP/3), NextDNS and Quad9, with Quad9 DoT as fallback. `dnsmasq` only forwards there. |
 | DNS hijack | Devices that use their own DNS server on port 53 are redirected to the router. |
-| Ad and tracker blocking | [adblock-lean](https://github.com/lynxthecat/adblock-lean) 0.8.1 (bundled) with Hagezi Pro and Threat Intelligence (mini), plus your own list. |
+| Ad and tracker blocking | [adblock-lean](https://github.com/lynxthecat/adblock-lean), installed from its project on every run with its own installer (`abl-install.sh -v release`), so it is always the current release. The Hagezi lists come from adblock-lean's preset for the router's memory, chosen the way its own setup does it (Hagezi Pro mini on the smallest routers, Pro, then Threat Intelligence added as memory allows), plus your own list. |
 | banIP | Blocks incoming scans and brute force on the WAN; extra feeds from your settings. |
 | SQM (bufferbloat) | Measures your line (Cloudflare, 4 streams, 10 s each way) and shapes at 90% with cake, following the [OpenWrt SQM guide](https://openwrt.org/docs/guide-user/network/traffic-shaping/sqm). Link-layer values come from the link type you pick. Per-device fairness (`dual-srchost`/`dual-dsthost`), plus cake's `nat` lookup only when the router does IPv4 NAT. |
 | System | Your admin password, SSH key login (keys you added yourself are kept), time zone, NTP servers by IP address (works before DNS does), packet steering on all CPUs, Wi-Fi name, password and country on every radio (WPA3-only on 6 GHz). On routers with less than about 200 MB of RAM the DNS caches are kept small. |
@@ -40,6 +40,7 @@ Optional (asked on the first run):
 | Family filtering | Safe search forced on Google (all its country domains, from Google's own list), Bing, DuckDuckGo, Brave, Startpage and Yandex (refreshed every 30 minutes); Hagezi NSFW, "no safe search" and DoH/VPN/proxy bypass lists; anime/manga NSFW sites from [safe-otaku](https://github.com/5wHN28Dg/safe-otaku); every [listed Redlib instance](https://github.com/redlib-org/redlib-instances) except the ones you allow (refreshed daily); DoT and common VPN protocols blocked from the LAN; banIP `doh` and `vpn` feeds. |
 | VPN for chosen sites | Any WireGuard provider (Proton VPN, Mullvad, ...): give it the provider's `.conf` file. Only the domains and IP ranges you list go through the VPN (policy-based routing with `pbr`). IPv6 to those domains never goes around the VPN: it is routed through the VPN when the provider's config has an IPv6 address, otherwise their IPv6 answers are suppressed so devices use IPv4 through the VPN. |
 | MangaDex safe-mode reader | The [safe-otaku](https://github.com/5wHN28Dg/safe-otaku) reader at `http://manga.lan`. |
+| Remote access | Reach your home network and `manga.lan` from anywhere through a WireGuard tunnel to the router. Each device you name (e.g. `phone laptop`) gets its own key; its config file lands in `private/remote/` for the WireGuard app (`qrencode -t ansiutf8 < private/remote/phone.conf` shows it as a QR code for phones). Only the tunnel and your home network go through it, and the device uses the router's DNS, so blocking and family filtering apply. See [Remote access](#remote-access) for what your line needs. |
 
 Separately, `./kids.sh` gives chosen devices fixed addresses and turns their
 internet off at night, matched by MAC address so IPv6 and self-chosen
@@ -70,6 +71,24 @@ router's NAT, cake looks up the real device behind NAT so fairness works per
 device. Without IPv4 (IPv6-only lines) that lookup is skipped. With usable
 IPv6, banIP also covers IPv6.
 
+## Remote access
+
+The router listens for WireGuard on UDP 51820 (changeable) and puts tunnel
+devices (10.77.0.0/24 unless you set `REMOTE_NET`) in the LAN zone. The keys
+are made on your computer with OpenSSL and kept in `private/config.env`, so a
+re-install keeps every device working; removing a name from the device list
+revokes it.
+
+Devices outside need to find your home:
+
+- Give a dynamic-DNS name (e.g. from DuckDNS) when asked, if your provider
+  changes your address. Without one, the configs point at the router's current
+  address and need re-running `./setup.sh` when it changes.
+- If the router's internet address is private or carrier-grade NAT (100.64.x.x;
+  common on mobile and some fibre lines, or with a modem that routes), it
+  can't be reached from outside: forward UDP 51820 to the router on the modem,
+  or ask your provider for a public IPv4 address. The setup warns about this.
+
 ## Packet steering
 
 When a packet arrives, the CPU core that gets the network card's interrupt
@@ -87,6 +106,7 @@ Everything personal lives in `private/` (gitignored, mode 700):
 | `config.env` | All answers, including passwords (the admin password is stored hashed), Wi-Fi key and WireGuard keys. |
 | `host_keys/` | The router's SSH host keys, saved after the first successful run and restored on re-install, so `ssh` keeps trusting it. |
 | `blocklist.txt`, `allowlist.txt` | Your own domains to block or always allow, one per line (optional). |
+| `remote/` | WireGuard configs for your remote-access devices (written after each run). |
 | `kids.conf` | Devices and times for `kids.sh`. |
 
 `./setup.sh --reconfigure` changes the saved answers before running;
@@ -106,10 +126,15 @@ rules instead of adding new ones, and removes parts you switched off (VPN,
 MangaDex reader, PPPoE, family filtering). It also resets the files it manages
 (`/etc/config/dnsproxy`, `pbr`, `banip`, adblock-lean's config, dnsmasq's
 upstream servers) to its own settings, so change those through
-`private/config.env`, not by hand.
+`private/config.env`, not by hand. Block lists beyond adblock-lean's preset
+go in `ADBLOCK_EXTRA_LISTS` (family filtering adds its lists there).
+adblock-lean is downloaded from GitHub and run as root on the router, like its
+own install instructions do; the setup trusts that project.
 
 ## Tests
 
+- `tests/lint.sh`: [ShellCheck](https://www.shellcheck.net) on every script
+  (errors and warnings).
 - `tests/unit.sh`: the laptop-side helpers and the question flow, no router
   needed.
 - `tests/vm.sh`: the whole setup on a throwaway OpenWrt virtual machine
@@ -128,6 +153,10 @@ upstream servers) to its own settings, so change those through
 - IPv6 routing through the VPN (provider config with an IPv6 address) is not
   covered by the automated tests, which have no IPv6 internet.
 - Redlib blocking covers the instances in the public list, not unlisted ones.
+- Remote access is IPv4 inside the tunnel, and dynamic DNS is not set up on
+  the router (give a name you keep updated elsewhere, or use the router's address).
+- adblock-lean's preset sizes its limits for its own lists. Family filtering
+  raises the size limit for its lists; other extra lists must fit in what's left.
 - Cloudflare rate-limits repeated speed tests from one address for about an
   hour; the setup then uses the rates saved in `SQM_FALLBACK_DOWN/UP`, or
   leaves SQM off and says so.
@@ -135,6 +164,7 @@ upstream servers) to its own settings, so change those through
 ## Licences
 
 The scripts are under the GNU AGPL v3 (`LICENSE`). Bundled third-party code
-keeps its own licence: adblock-lean (GPL-2.0, `router/vendor/adblock-lean/LICENCE.md`)
-and the safe-otaku reader (AGPL-3.0, `router/vendor/safe-otaku/LICENSE`).
+keeps its own licence: the safe-otaku reader (AGPL-3.0,
+`router/vendor/safe-otaku/LICENSE`). adblock-lean (GPL-2.0) is not bundled; it
+is fetched from its project.
 Versions are in `router/vendor/VERSIONS`.
