@@ -1,0 +1,59 @@
+#!/bin/sh
+# Pin search engines to their safe-search IPs via a dnsmasq hosts file.
+# Replaces dnsmasq cname= entries, which return no IP when the target isn't cached.
+# Run from cron and rc.local; keeps the previous file if any lookup fails.
+
+OUT=/tmp/hosts/safesearch
+TMP=/tmp/safesearch.hosts.$$
+UPSTREAM=127.0.0.1
+PORT=5354
+
+# Google search domains (www.google.com/supported_domains), each as bare and www.
+GOOGLE_LIST=/etc/safesearch/google.domains
+google_names() {
+	sed -n 's/^\.\(google\.[a-z.]*\)$/\1 www.\1/p' "$GOOGLE_LIST" 2>/dev/null | tr '\n' ' '
+}
+
+# target|names that should resolve to it
+MAP='forcesafesearch.google.com|www.google.com google.com
+strict.bing.com|www.bing.com bing.com cn.bing.com
+safe.duckduckgo.com|duckduckgo.com www.duckduckgo.com start.duckduckgo.com
+safe.startpage.com|startpage.com www.startpage.com eu.startpage.com www.eu.startpage.com search.startpage.com
+forcesafe.search.brave.com|search.brave.com'
+
+lookup() { # name A|AAAA -> addresses (BusyBox nslookup; answers follow "Non-authoritative answer:")
+	nslookup -type="$2" "$1" "$UPSTREAM:$PORT" 2>/dev/null |
+		awk '/^Non-authoritative answer:/ { f = 1 } f && /^Address: / { print $2 }' |
+		grep -E '^[0-9a-fA-F:.]+$'
+}
+
+: > "$TMP"
+echo "$MAP" | while IFS='|' read -r target names; do
+	[ "$target" = forcesafesearch.google.com ] && names="$names $(google_names)"
+	ips="$(lookup "$target" A)"
+	if [ -z "$ips" ]; then
+		logger -t safesearch-hosts "no A record for $target, keeping old file"
+		echo FAIL >> "$TMP.fail"
+		continue
+	fi
+	ips="$ips
+$(lookup "$target" AAAA)"
+	for ip in $ips; do   # one hosts line per 16 names keeps lines short
+		printf '%s\n' $names | sort -u | xargs -n 16 | sed "s/^/$ip /" >> "$TMP"
+	done
+done
+
+if [ -e "$TMP.fail" ] && [ -s "$OUT" ]; then
+	rm -f "$TMP" "$TMP.fail"
+	exit 1
+fi
+rm -f "$TMP.fail"
+
+if ! cmp -s "$TMP" "$OUT"; then
+	mv "$TMP" "$OUT"
+	chmod 644 "$OUT"
+	killall -HUP dnsmasq
+	logger -t safesearch-hosts "updated $OUT"
+else
+	rm -f "$TMP"
+fi

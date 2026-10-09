@@ -1,0 +1,52 @@
+
+config dnsproxy 'global'
+	option enabled '1'
+	list listen_addr '127.0.0.1'
+	list listen_addr '::1'
+	option http3 '0'
+	option insecure '0'
+	option ipv6_disabled '0'
+	option refuse_any '0'
+	option verbose '0'
+	list listen_port '5354'
+
+config dnsproxy 'bogus_nxdomain'
+	list ip_addr ''
+
+config dnsproxy 'cache'
+	option enabled '1'
+	option cache_optimistic '0'
+	option size '33554432'
+	option min_ttl '3600'
+	option max_ttl '86400'
+
+config dnsproxy 'dns64'
+	option enabled '0'
+	option dns64_prefix '64:ff9b::'
+
+config dnsproxy 'edns'
+	option enabled '0'
+
+config dnsproxy 'hosts'
+	option enabled '0'
+	list hosts_files ''
+
+config dnsproxy 'private_rdns'
+	option enabled '0'
+	list upstream '127.0.0.1:53'
+
+config dnsproxy 'servers'
+	list fallback 'tls://9.9.9.9'
+	list bootstrap '8.8.8.8'
+	list bootstrap 'tcp://8.8.8.8'
+	list bootstrap '2001:4860:4860::8888'
+	list upstream 'h3://cloudflare-dns.com/dns-query'
+	list upstream 'https://dns.nextdns.io'
+	list upstream 'h3://dns.quad9.net/dns-query'
+
+config dnsproxy 'tls'
+	option enabled '0'
+	option https_port '8443'
+	option tls_port '853'
+	option quic_port '853'
+

@@ -1,0 +1,3 @@
+api.mangadex.org
+uploads.mangadex.org
+forums.mangadex.org
