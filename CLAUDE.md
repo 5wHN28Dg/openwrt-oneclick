@@ -12,5 +12,6 @@ for anything it doesn't know yet, copies `router/` to the router and runs
 - Router resources are scarce: no new packages or persistent processes without
   a reason that is written down. Prefer what OpenWrt ships (BusyBox, ucode,
   uclient-fetch, jsonfilter).
+- Lint: `tests/lint.sh` (ShellCheck, errors and warnings).
 - Test on the throwaway VM (`tests/vm.sh`), never on a live router. Unit tests:
   `tests/unit.sh`.

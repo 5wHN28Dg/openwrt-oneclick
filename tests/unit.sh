@@ -80,10 +80,11 @@ P1=$T/priv1
 # Wi-Fi name, Wi-Fi password x2, admin password x2, SSH key path, create key?,
 # time zone, PPPoE?, PPPoE user, PPPoE password x2, link type number,
 # family filtering?, Redlib allow, VPN?, wg path, VPN iface, domains, subnets,
-# MangaDex?, create settings? (first) / save? (last)
+# MangaDex?, remote access?, public name, port, devices,
+# create settings? (first) / save? (last)
 printf '%s\n' y "Home Net" "pa'ss word1" "pa'ss word1" adminpw adminpw "$HOME/.ssh/test_key" y \
 	Europe/Berlin "" y "user@isp" ppppass ppppass 7 y "safereddit.com" y "$T/proton.conf" protonvpn \
-	"archive.org newegg.com" "91.108.4.0/22" y y \
+	"archive.org newegg.com" "91.108.4.0/22" y y home.example.org "" "phone tablet" y \
 	| ONECLICK_PRIVATE=$P1 "$HERE/setup.sh" --settings-only >"$T/w1.out" 2>&1
 eq "wizard (all on) exit" "$?" 0
 eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config.env")" 600
@@ -100,18 +101,22 @@ eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config
 	eq "w1 pppoe" "$WAN_PROTO|$PPPOE_USER|$PPPOE_PASS" "pppoe|user@isp|ppppass"
 	eq "w1 link type" "$LINK_TYPE" fiber
 	eq "w1 family" "$FAMILY_FILTER" 1
-	eq "w1 lists" "$ADBLOCK_LISTS" "hagezi:pro hagezi:tif.mini hagezi:nsfw hagezi:nosafesearch hagezi:doh-vpn-proxy-bypass"
+	eq "w1 extra lists" "$ADBLOCK_EXTRA_LISTS" "hagezi:nsfw hagezi:nosafesearch hagezi:doh-vpn-proxy-bypass"
 	eq "w1 redlib allow" "$REDLIB_ALLOW" "safereddit.com"
 	eq "w1 vpn" "$ENABLE_VPN|$VPN_IFACE|$WG_ENDPOINT_HOST" "1|protonvpn|198.51.100.7"
 	eq "w1 vpn routes" "$VPN_ROUTE_DOMAINS|$VPN_ROUTE_SUBNETS" "archive.org newegg.com|91.108.4.0/22"
 	eq "w1 mangadex" "$ENABLE_MANGADEX" 1
+	eq "w1 remote" "$ENABLE_REMOTE|$REMOTE_HOST|$REMOTE_PORT|$REMOTE_NET" "1|home.example.org|51820|10.77.0.0/24"
+	eq "w1 remote devices" "$(remote_devices)" "phone tablet"
+	eq "w1 remote addresses" "$(printf '%s\n' "$REMOTE_PEERS" | cut -d'|' -f2 | tr '\n' ' ')" "2 3 "
+	is_wg_key "$REMOTE_SERVER_KEY" && ok "w1 remote server key" || bad "w1 remote server key: $REMOTE_SERVER_KEY"
 ) | tee "$T/w1.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/w1.res"))); n=$((n + $(wc -l < "$T/w1.res")))
 
 P2=$T/priv2
 # Everything optional off; existing key; save.
 printf '%s\n' y "Flat" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" \
-	UTC us n 9 n n n y \
+	UTC us n 9 n n n n y \
 	| ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w2.out" 2>&1
 eq "wizard (all off) exit" "$?" 0
 (
@@ -119,15 +124,16 @@ eq "wizard (all off) exit" "$?" 0
 	eq "w2 dhcp" "$WAN_PROTO" dhcp
 	eq "w2 country upper-cased" "$WIFI_COUNTRY" US
 	eq "w2 link unsure" "$LINK_TYPE" unsure
-	eq "w2 family off" "$FAMILY_FILTER|$ADBLOCK_LISTS|$BANIP_FEEDS|$REDLIB_ALLOW" "0|hagezi:pro hagezi:tif.mini||"
+	eq "w2 family off" "$FAMILY_FILTER|$ADBLOCK_EXTRA_LISTS|$BANIP_FEEDS|$REDLIB_ALLOW" "0|||"
 	eq "w2 vpn off" "$ENABLE_VPN" 0
 	eq "w2 mangadex off" "$ENABLE_MANGADEX" 0
+	eq "w2 remote off" "$ENABLE_REMOTE|${REMOTE_PEERS-}" "0|"
 ) | tee "$T/w2.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/w2.res"))); n=$((n + $(wc -l < "$T/w2.res")))
 
 # Declining to save keeps nothing on disk.
 P3=$T/priv3
-printf '%s\n' y "X" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n \
+printf '%s\n' y "X" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n n \
 	| ONECLICK_PRIVATE=$P3 "$HERE/setup.sh" --settings-only >"$T/w3.out" 2>&1
 eq "decline save: exit" "$?" 0
 eq "decline save: nothing written" "$(ls -A "$P3" 2>/dev/null)" ""
@@ -139,16 +145,16 @@ printf '%s\n' 4 | ONECLICK_PRIVATE=$P2 timeout 5 "$HERE/setup.sh" 127.0.0.1 1 >"
 eq "missing link type asked and saved" "$(. "$P2/config.env"; echo "$LINK_TYPE")" adsl
 
 # --- family filtering toggled later (review finding 1) ---------------------------
-. "$P2/config.env"   # family off, lists "hagezi:pro hagezi:tif.mini"
-ADBLOCK_LISTS="hagezi:pro hagezi:tif.mini oisd:big" BANIP_FEEDS="tiktok"
+. "$P2/config.env"   # family off, no extra lists
+ADBLOCK_EXTRA_LISTS="oisd:big" BANIP_FEEDS="tiktok"
 write_config "$P2/config.env"
-# reconfigure: keep Wi-Fi, keep admin pw, key path, tz, pppoe n, link (keep), family y, redlib, vpn n, mangadex n
-printf '%s\n' "" n n "" "" "" n "" y "" n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w5.out" 2>&1
+# reconfigure: keep Wi-Fi, keep admin pw, key path, tz, pppoe n, link (keep), family y, redlib, vpn n, mangadex n, remote n
+printf '%s\n' "" n n "" "" "" n "" y "" n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w5.out" 2>&1
 eq "family on later: exit" "$?" 0
-eq "family on later: lists" "$(. "$P2/config.env"; echo "$ADBLOCK_LISTS")" "hagezi:pro hagezi:tif.mini oisd:big hagezi:nsfw hagezi:nosafesearch hagezi:doh-vpn-proxy-bypass"
+eq "family on later: lists" "$(. "$P2/config.env"; echo "$ADBLOCK_EXTRA_LISTS")" "oisd:big hagezi:nsfw hagezi:nosafesearch hagezi:doh-vpn-proxy-bypass"
 eq "family on later: feeds" "$(. "$P2/config.env"; echo "$BANIP_FEEDS")" "tiktok doh vpn"
-printf '%s\n' "" n n "" "" "" n "" n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w6.out" 2>&1
-eq "family off later: lists" "$(. "$P2/config.env"; echo "$ADBLOCK_LISTS")" "hagezi:pro hagezi:tif.mini oisd:big"
+printf '%s\n' "" n n "" "" "" n "" n n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w6.out" 2>&1
+eq "family off later: lists" "$(. "$P2/config.env"; echo "$ADBLOCK_EXTRA_LISTS")" "oisd:big"
 eq "family off later: feeds" "$(. "$P2/config.env"; echo "$BANIP_FEEDS")" "tiktok"
 
 # --- OpenSSL without passwd -5, e.g. macOS LibreSSL (finding 3) -------------------
@@ -173,12 +179,13 @@ eq "interrupt saves nothing" "$(ls -A "$T/priv-int" 2>/dev/null)" ""
 	REDLIB_ALLOW=ok.example; eq "valid settings pass" "$(check_settings)" ""
 ) | tee "$T/v.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/v.res"))); n=$((n + $(wc -l < "$T/v.res")))
-printf '%s\n' y "X" "short" "short" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n y \
+printf '%s\n' y "X" "short" "short" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n y \
 	| ONECLICK_PRIVATE=$T/priv-short "$HERE/setup.sh" --settings-only >"$T/short.out" 2>&1
 rc=$?
 if [ "$rc" -ne 0 ] && grep -q "WIFI_KEY must be" "$T/short.out" && [ -z "$(ls -A "$T/priv-short" 2>/dev/null)" ]; then ok "wizard refuses a short Wi-Fi key, saves nothing"; else bad "wizard refuses a short Wi-Fi key (rc $rc)"; fi
 
 # --- second review: limits in bytes, names, parser, paths -------------------------
+# shellcheck disable=SC2034  # check_settings reads the settings through eval
 (
 	. "$P1/config.env"
 	WIFI_KEY=$(printf 'ä%.0s' $(seq 38)); eq "Wi-Fi key over 63 bytes rejected (38 x ä = 76 bytes)" "$(check_settings | grep -c WIFI_KEY)" 1
@@ -200,7 +207,7 @@ eq "country for Asia/Baghdad" "$(country_for_tz Asia/Baghdad)" IQ
 
 # --- changing the SSH key keeps the old one for the next login --------------------
 ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/new_key"
-printf '%s\n' "" n n "$HOME/.ssh/new_key" "" "" n "" n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/k.out" 2>&1
+printf '%s\n' "" n n "$HOME/.ssh/new_key" "" "" n "" n n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/k.out" 2>&1
 (
 	. "$P2/config.env"
 	eq "new key saved" "$SSH_KEY" "$HOME/.ssh/new_key"
@@ -213,6 +220,80 @@ fails=$((fails + $(grep -c '^FAIL' "$T/k.res"))); n=$((n + $(wc -l < "$T/k.res")
 grep -v '^WIFI_COUNTRY=' "$P2/config.env" > "$T/noc" && mv "$T/noc" "$P2/config.env"
 printf '%s\n' "" | ONECLICK_PRIVATE=$P2 timeout 5 "$HERE/setup.sh" 127.0.0.1 1 >"$T/c.out" 2>&1 || true
 eq "missing country asked, default from time zone, saved" "$(. "$P2/config.env"; echo "$WIFI_COUNTRY")" "$(country_for_tz UTC)"
+
+# --- adblock-lean lists: older settings keep only their additions ------------------
+grep -v '^ADBLOCK_EXTRA_LISTS=' "$P2/config.env" > "$T/old" && mv "$T/old" "$P2/config.env"
+echo "ADBLOCK_LISTS='hagezi:pro hagezi:tif.mini oisd:big hagezi:nsfw'" >> "$P2/config.env"
+ONECLICK_PRIVATE=$P2 timeout 5 "$HERE/setup.sh" 127.0.0.1 1 >"$T/m.out" 2>&1 || true
+eq "old ADBLOCK_LISTS: base lists dropped, additions kept" "$(. "$P2/config.env"; echo "${ADBLOCK_EXTRA_LISTS-unset}|${ADBLOCK_LISTS-gone}")" "oisd:big hagezi:nsfw|gone"
+
+# --- remote access ------------------------------------------------------------------
+# Turned on later with a name, then "-" goes back to the router's own address.
+printf '%s\n' "" n n "" "" "" n "" n n n y home.example.org "" "tv" | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/r1.out" 2>&1
+eq "remote on later" "$(. "$P2/config.env"; echo "$ENABLE_REMOTE|$REMOTE_HOST|$(remote_devices)")" "1|home.example.org|tv"
+printf '%s\n' "" n n "" "" "" n "" n n n y - "" "" | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/r2.out" 2>&1
+eq "remote host cleared with -" "$(. "$P2/config.env"; echo "$REMOTE_HOST|$(remote_devices)")" "|tv"
+# A * in the device list is a name (then refused), not the files here.
+mkdir -p "$T/globdir/afile.d" "$T/globdir/bfile"
+printf '%s\n' "" n n "" "" "" n "" n n n y "" "" "tv *" | (cd "$T/globdir" && ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only) >"$T/r3.out" 2>&1
+case $(. "$P2/config.env"; remote_devices) in *bfile*) bad "device list * expanded to file names" ;; *) ok "device list * not expanded to file names" ;; esac
+# RFC 7748 X25519 test vector (Alice): private 77076d0a..., public 8520f009...
+eq "WireGuard public key from private (RFC 7748)" "$(wg_pubkey dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=)" "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo="
+k=$(wg_genkey); is_wg_key "$k" && is_wg_key "$(wg_pubkey "$k")" && ok "new WireGuard key pair" || bad "new WireGuard key pair: $k"
+if is_wg_key 'abc='; then bad "short key rejected"; else ok "short key rejected"; fi
+(
+	REMOTE_PEERS=
+	REMOTE_PEERS=$(remote_peers_for "phone tablet laptop")
+	first=$REMOTE_PEERS
+	REMOTE_PEERS=$(remote_peers_for "laptop tv")
+	eq "devices: removed dropped, new added" "$(remote_devices)" "laptop tv"
+	eq "devices: kept device keeps key and address" "$(printf '%s\n' "$REMOTE_PEERS" | grep '^laptop|')" "$(printf '%s\n' "$first" | grep '^laptop|')"
+	eq "devices: new device gets lowest free address" "$(printf '%s\n' "$REMOTE_PEERS" | grep '^tv|' | cut -d'|' -f2)" 2
+	REMOTE_PEERS=$(remote_peers_for "laptop laptop")
+	eq "devices: repeated name counted once" "$(remote_devices)" "laptop"
+
+	REMOTE_NET=10.77.0.0/24 REMOTE_PORT=51820 REMOTE_SERVER_KEY=dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=
+	REMOTE_PEERS="phone|5|$(wg_genkey)|$(wg_psk)"
+	c=$(remote_client_conf phone 192.168.1.0/24 home.example.org)
+	eq "client conf: address" "$(echo "$c" | sed -n 's/^Address = //p')" 10.77.0.5/32
+	eq "client conf: router DNS" "$(echo "$c" | sed -n 's/^DNS = //p')" 10.77.0.1
+	eq "client conf: server key" "$(echo "$c" | sed -n 's/^PublicKey = //p')" "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo="
+	eq "client conf: tunnel and home network only" "$(echo "$c" | sed -n 's/^AllowedIPs = //p')" "10.77.0.0/24, 192.168.1.0/24"
+	eq "client conf: endpoint" "$(echo "$c" | sed -n 's/^Endpoint = //p')" home.example.org:51820
+	eq "client conf: IPv6 endpoint in brackets" "$(remote_client_conf phone 192.168.1.0/24 2001:db8::1 | sed -n 's/^Endpoint = //p')" "[2001:db8::1]:51820"
+	if remote_client_conf nobody 192.168.1.0/24 x >/dev/null; then bad "client conf: unknown device refused"; else ok "client conf: unknown device refused"; fi
+	p=$(remote_peers_public); dk=$(printf '%s' "$REMOTE_PEERS" | cut -d'|' -f3)
+	eq "router gets the device's public key, not its private key" "$p" "phone|5|$(wg_pubkey "$dk")|$(printf '%s' "$REMOTE_PEERS" | cut -d'|' -f4)"
+	# An OpenSSL that can't do X25519 (macOS LibreSSL): no config with an empty key.
+	mkdir -p "$T/nox"; printf '#!/bin/sh\ncase $1 in pkey) exit 1 ;; esac\nexec openssl "$@"\n' > "$T/nox/fakessl"; chmod 755 "$T/nox/fakessl"
+	OPENSSL=$T/nox/fakessl
+	if wg_pubkey "$dk" >/dev/null 2>&1; then bad "public key fails without X25519"; else ok "public key fails without X25519"; fi
+	if remote_client_conf phone 192.168.1.0/24 x >/dev/null 2>&1; then bad "client conf refused without X25519"; else ok "client conf refused without X25519"; fi
+	if remote_peers_public >/dev/null 2>&1; then bad "router keys refused without X25519"; else ok "router keys refused without X25519"; fi
+) | tee "$T/r.res"
+fails=$((fails + $(grep -c '^FAIL' "$T/r.res"))); n=$((n + $(wc -l < "$T/r.res")))
+for a in 10.77.0.0/24 172.16.5.0/24 192.168.200.0/24; do remote_net_ok "$a" && ok "tunnel range $a accepted" || bad "tunnel range $a accepted"; done
+for a in 10.077.0.0/24 010.77.0.0/24 8.8.8.0/24 10.77.0.1/24 10.77.0.0/16 172.32.0.0/24 10.300.0.0/24 'x'; do
+	if remote_net_ok "$a"; then bad "tunnel range $a rejected"; else ok "tunnel range $a rejected"; fi
+done
+for a in 100.64.1.2 100.127.0.1 10.0.2.15 192.168.0.5 172.20.1.1; do behind_nat_v4 "$a" && ok "$a is behind NAT" || bad "$a is behind NAT"; done
+for a in 100.128.0.1 81.2.3.4 172.32.1.1; do if behind_nat_v4 "$a"; then bad "$a is public"; else ok "$a is public"; fi; done
+(
+	. "$P1/config.env"
+	eq "remote settings pass" "$(check_settings)" ""
+	REMOTE_PORT=70000; eq "remote port out of range rejected" "$(check_settings | grep -c REMOTE_PORT)" 1
+	REMOTE_PORT=51820 REMOTE_HOST='x;reboot'; eq "remote host with shell characters rejected" "$(check_settings | grep -c REMOTE_HOST)" 1
+	REMOTE_HOST='' REMOTE_PEERS="$REMOTE_PEERS
+$(printf '%s\n' "$REMOTE_PEERS" | head -1)"; eq "repeated remote device rejected" "$(check_settings | grep -c REMOTE_PEERS)" 1
+	k=$(wg_genkey); REMOTE_PEERS="phone|2|${k%??}'=|$k"; eq "remote key with a quote rejected" "$(check_settings | grep -c REMOTE_PEERS)" 1
+	REMOTE_PEERS="a b|2|k|p"; eq "bad remote device line rejected" "$(check_settings | grep -c REMOTE_PEERS)" 1
+	REMOTE_PEERS=; eq "remote on without devices rejected" "$(check_settings | grep -c REMOTE_PEERS)" 1
+	VPN_IFACE=remote; eq "VPN_IFACE 'remote' rejected" "$(check_settings | grep -c VPN_IFACE)" 1
+	REMOTE_HOST=home.example.org:51820; eq "remote host with a port rejected" "$(check_settings | grep -c REMOTE_HOST)" 1
+	REMOTE_HOST=2001:db8::1; eq "remote host IPv6 address accepted" "$(check_settings | grep -c REMOTE_HOST)" 0
+	REMOTE_HOST='' REMOTE_PEERS="living-room-ipad|2|$(wg_genkey)|$(wg_psk)"; eq "device name over 15 characters rejected" "$(check_settings | grep -c REMOTE_PEERS)" 1
+) | tee "$T/r2.res"
+fails=$((fails + $(grep -c '^FAIL' "$T/r2.res"))); n=$((n + $(wc -l < "$T/r2.res")))
 
 # --- kids.sh refuses lists that would cut off the whole LAN ------------------------
 for bad_list in "" "|aa:bb:cc:dd:ee:ff|192.168.1.50" "TV|nonsense|192.168.1.50" "TV|aa:bb:cc:dd:ee:ff|300.1.1"; do

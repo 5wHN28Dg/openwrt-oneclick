@@ -27,7 +27,7 @@ valid_name() { printf '%s' "$1" | grep -qE '^[A-Za-z0-9._-]{1,32}$'; }
 valid_hm()  { printf '%s' "$1" | grep -qE '^([01][0-9]|2[0-3]):[0-5][0-9]$'; }
 
 if [ -n "$REMOVE" ]; then
-	DEVICES= CUTOFF_START= CUTOFF_STOP=
+	DEVICES='' CUTOFF_START='' CUTOFF_STOP=''
 elif [ ! -f "$KIDS" ]; then
 	say "No kids' devices saved yet ($KIDS)."
 	ask_yn "Enter them now?" y || exit 1
@@ -56,6 +56,7 @@ elif [ ! -f "$KIDS" ]; then
 		say "Saved $KIDS"
 	fi
 else
+	# shellcheck source=/dev/null
 	. "$KIDS"
 fi
 
@@ -87,7 +88,7 @@ ssh -p "$PORT" -i "$SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
 	"REMOVE=$(shq "$REMOVE") DEVICES=$(shq "$DEVICES") START=$(shq "$CUTOFF_START") STOP=$(shq "$CUTOFF_STOP") sh -s" <<'EOF'
 set -eu
 for cfg in dhcp firewall; do
-	for s in $(uci -q show $cfg | sed -n "s/^$cfg\.\([^.]*\)\.kids='1'$/\1/p" | sort -r); do uci delete "$cfg.$s"; done
+	for s in $(uci -q show $cfg | sed -n "s/^$cfg\.\([^.]*\)\.kids='1'$/\1/p" | sort -t'[' -k2 -n -r); do uci delete "$cfg.$s"; done
 done
 if [ -n "$REMOVE" ] || [ -z "$(printf '%s' "$DEVICES" | tr -d ' \n')" ]; then
 	uci commit dhcp; uci commit firewall
