@@ -88,8 +88,11 @@ make_private() { # dir full|minimal
 			VPN_ROUTE_DOMAINS="example.com" VPN_ROUTE_SUBNETS="198.51.100.0/24"
 			ENABLE_MANGADEX=1
 			ENABLE_REMOTE=1 REMOTE_HOST='' REMOTE_PORT=51820 REMOTE_NET=10.77.0.0/24
+			# 11 devices: re-runs then delete peer sections across [9]/[10]
 			REMOTE_SERVER_KEY=$(wg_genkey) REMOTE_PEERS="phone|2|$(wg_genkey)|$(wg_psk)
 laptop|3|$(wg_genkey)|$(wg_psk)"
+			for i in 4 5 6 7 8 9 10 11 12; do REMOTE_PEERS="$REMOTE_PEERS
+dev$i|$i|$(wg_genkey)|$(wg_psk)"; done
 		else
 			FAMILY_FILTER=0 ADBLOCK_EXTRA_LISTS='' BANIP_FEEDS='' ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0
 		fi
@@ -168,6 +171,29 @@ scenario_full() {
 	a=$(vm_ssh 'nslookup -type=aaaa example.com 127.0.0.1 | awk "/^Address: /{print \$2}" | tail -1')
 	[ "$a" = "::" ] && ok "VPN domain has no IPv6 answer (VPN has no IPv6)" || bad "VPN domain AAAA: $a"
 	run_setup "$P" "$W/full-rerun.log"
+
+	# Settings that can't work (tunnel range = the LAN) stop the run before
+	# anything changes: blocking and remote access stay as they were.
+	cp -R "$P" "$W/p-overlap"
+	# shellcheck disable=SC2034  # write_config reads the settings through eval
+	(. "$W/p-overlap/config.env"; REMOTE_NET=192.168.1.0/24; write_config "$W/p-overlap/config.env")
+	out=$(ONECLICK_PRIVATE=$W/p-overlap timeout 600 "$W/setup.sh" 127.0.0.1 "$PORT" 2>&1); rc=$?
+	st=$(vm_ssh '/etc/init.d/adblock-lean status >/dev/null 2>&1 && echo blocking; uci -q get network.remote.listen_port' | tr '\n' ' ')
+	case $out in *"overlaps the LAN"*) [ "$rc|$st" = "1|blocking 51820 " ] && ok "tunnel range overlapping the LAN: stopped before changing anything" \
+		|| bad "overlap: exit $rc, after: $st" ;; *) bad "overlapping tunnel range not refused (exit $rc)" ;; esac
+
+	# GitHub's API unreachable on a re-run: the installed adblock-lean is kept
+	# (one FAIL in the report), and the router still blocks.
+	vm_ssh 'echo "0.0.0.0 api.github.com" >> /etc/hosts'
+	ONECLICK_PRIVATE=$P timeout 1500 "$W/setup.sh" 127.0.0.1 "$PORT" > "$W/full-nogh.log" 2>&1; rc=$?
+	vm_ssh 'sed -i "/api.github.com/d" /etc/hosts; /etc/init.d/dnsmasq restart >/dev/null 2>&1'
+	other=$(grep '^FAIL' "$W/full-nogh.log" | sort -u | grep -v 'VPN WireGuard handshake\|SQM speed test failed.*429\|kept the installed adblock-lean')
+	if [ "$rc" = 2 ] && [ -z "$other" ] && grep -q '^FAIL.*kept the installed adblock-lean' "$W/full-nogh.log" \
+		&& grep -q '^PASS  adblock-lean blocklist loaded' "$W/full-nogh.log"; then
+		ok "GitHub unreachable: kept the installed adblock-lean, still blocking"
+	else
+		bad "GitHub unreachable: exit $rc; other FAILs: $other"; tail -8 "$W/full-nogh.log" | sed 's/^/        | /'
+	fi
 	counts=$(vm_ssh 'printf "%s %s %s %s %s %s %s %s %s\n" \
 		"$(uci show firewall | grep -c "name=.testvpn.")" \
 		"$(uci show firewall | grep -c "name=.Block-WireGuard-LAN.")" \
@@ -178,7 +204,7 @@ scenario_full() {
 		"$(uci show network | grep -c "=wireguard_remote")" \
 		"$(uci show firewall | grep -c "name=.Allow-Remote-WireGuard.")" \
 		"$(uci show firewall | grep "\.network=" | grep -o "remote" | wc -l)"')
-	[ "$counts" = "1 1 1 1 1 1 2 1 1" ] && ok "re-run: no duplicates" || bad "re-run duplicates (zone rule domain cron peer kids remote-peers remote-rule remote-in-lan): $counts"
+	[ "$counts" = "1 1 1 1 1 1 11 1 1" ] && ok "re-run: no duplicates" || bad "re-run duplicates (zone rule domain cron peer kids remote-peers remote-rule remote-in-lan): $counts"
 	# Re-runs delete their old sections by position; every rule must be there once.
 	d=$(vm_ssh "uci show firewall | sed -n \"s/^firewall\.[^.]*\.name='\(.*\)'\$/\1/p\" | sort | uniq -d")
 	[ -z "$d" ] && ok "re-run: no firewall rule left twice" || bad "re-run: rules present twice: $(echo $d)"

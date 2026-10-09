@@ -118,15 +118,18 @@ check_settings() {
 	case ${BANIP_FEEDS-} in *[!a-z0-9_\ -]*) echo "BANIP_FEEDS has unexpected characters" ;; esac
 	case ${ADBLOCK_EXTRA_LISTS-} in *[!A-Za-z0-9:._/\ -]*) echo "ADBLOCK_EXTRA_LISTS has unexpected characters" ;; esac
 	if [ "${ENABLE_REMOTE-}" = 1 ]; then
-		case ${REMOTE_HOST-} in *[!A-Za-z0-9.:-]*) echo "REMOTE_HOST is not a host name or address" ;; esac
+		case ${REMOTE_HOST-} in
+			*:*) case $REMOTE_HOST in *[!0-9A-Fa-f:]*) echo "REMOTE_HOST is not a host name or address (no port: that is REMOTE_PORT)" ;; esac ;;
+			*[!A-Za-z0-9.-]*) echo "REMOTE_HOST is not a host name or address" ;;
+		esac
 		case ${REMOTE_PORT-} in ''|*[!0-9]*) echo "REMOTE_PORT must be a number" ;; *)
 			[ "$REMOTE_PORT" -ge 1 ] && [ "$REMOTE_PORT" -le 65535 ] || echo "REMOTE_PORT must be 1-65535" ;; esac
 		remote_net_ok "${REMOTE_NET-}" || echo "REMOTE_NET must be a private x.y.z.0/24 range, e.g. 10.77.0.0/24"
 		is_wg_key "${REMOTE_SERVER_KEY-}" || echo "REMOTE_SERVER_KEY is not a WireGuard key"
 		[ -n "${REMOTE_PEERS-}" ] || echo "REMOTE_PEERS is empty (remote access is on)"
 		printf '%s\n' "${REMOTE_PEERS-}" | awk -F'|' 'NF {
-			if (NF != 4 || $1 !~ /^[A-Za-z0-9_-]+$/ || $2 !~ /^[0-9]+$/ || $2 < 2 || $2 > 254 || length($3) != 44 || length($4) != 44 || ($3 $4) !~ /^[A-Za-z0-9+\/=]+$/ || seen[$1]++ || used[$2]++)
-				print "REMOTE_PEERS line " NR " is not name|2-254|private key|preshared key (or repeats a name or number)"
+			if (NF != 4 || $1 !~ /^[A-Za-z0-9_-]+$/ || length($1) > 15 || $2 !~ /^[0-9]+$/ || $2 < 2 || $2 > 254 || length($3) != 44 || length($4) != 44 || ($3 $4) !~ /^[A-Za-z0-9+\/=]+$/ || seen[$1]++ || used[$2]++)
+				print "REMOTE_PEERS line " NR " is not name (letters, digits, _ or -, up to 15)|2-254|private key|preshared key, or repeats a name or number"
 		}'
 	fi
 	return 0
@@ -171,7 +174,7 @@ remote_peers_public() {
 
 # remote_net_ok NET -> status 0 for a private x.y.z.0/24 range
 remote_net_ok() {
-	printf '%s\n' "$1" | awk -F'[./]' 'NF == 5 && $4 == 0 && $5 == 24 && $1 $2 $3 ~ /^[0-9]+$/ && $2 < 256 && $3 < 256 \
+	printf '%s\n' "$1" | awk -F'[./]' 'NF == 5 && $4 == "0" && $5 == "24" && ($1 "." $2 "." $3) ~ /^([1-9][0-9]*|0)\.([1-9][0-9]*|0)\.([1-9][0-9]*|0)$/ && $2 < 256 && $3 < 256 \
 		&& ($1 == 10 || ($1 == 172 && $2 >= 16 && $2 < 32) || ($1 == 192 && $2 == 168)) { ok = 1 } END { exit !ok }'
 }
 
@@ -183,15 +186,17 @@ remote_devices() {
 # remote_peers_for NAMES -> REMOTE_PEERS for exactly NAMES: known devices keep
 # their keys and address, new ones get new keys and the lowest free address.
 remote_peers_for() {
+	set -f   # a * typed in the list is a name, not a file pattern
 	_keep=$(printf '%s\n' "${REMOTE_PEERS-}" | awk -F'|' -v names=" $1 " 'NF && index(names, " " $1 " ") && !seen[$1]++')
 	_out=$_keep
 	for _d in $1; do
 		printf '%s\n' "$_out" | cut -d'|' -f1 | grep -qxF "$_d" && continue
 		_n=$(printf '%s\n' "$_out" | awk -F'|' 'NF { used[$2] = 1 } END { for (i = 2; i <= 254; i++) if (!used[i]) { print i; exit } }')
-		[ -n "$_n" ] || return 1
+		[ -n "$_n" ] || { set +f; return 1; }
 		_out="${_out:+$_out
 }$_d|$_n|$(wg_genkey)|$(wg_psk)"
 	done
+	set +f
 	printf '%s\n' "$_out"
 }
 

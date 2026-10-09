@@ -228,6 +228,15 @@ ONECLICK_PRIVATE=$P2 timeout 5 "$HERE/setup.sh" 127.0.0.1 1 >"$T/m.out" 2>&1 || 
 eq "old ADBLOCK_LISTS: base lists dropped, additions kept" "$(. "$P2/config.env"; echo "${ADBLOCK_EXTRA_LISTS-unset}|${ADBLOCK_LISTS-gone}")" "oisd:big hagezi:nsfw|gone"
 
 # --- remote access ------------------------------------------------------------------
+# Turned on later with a name, then "-" goes back to the router's own address.
+printf '%s\n' "" n n "" "" "" n "" n n n y home.example.org "" "tv" | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/r1.out" 2>&1
+eq "remote on later" "$(. "$P2/config.env"; echo "$ENABLE_REMOTE|$REMOTE_HOST|$(remote_devices)")" "1|home.example.org|tv"
+printf '%s\n' "" n n "" "" "" n "" n n n y - "" "" | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/r2.out" 2>&1
+eq "remote host cleared with -" "$(. "$P2/config.env"; echo "$REMOTE_HOST|$(remote_devices)")" "|tv"
+# A * in the device list is a name (then refused), not the files here.
+mkdir -p "$T/globdir/afile.d" "$T/globdir/bfile"
+printf '%s\n' "" n n "" "" "" n "" n n n y "" "" "tv *" | (cd "$T/globdir" && ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only) >"$T/r3.out" 2>&1
+case $(. "$P2/config.env"; remote_devices) in *bfile*) bad "device list * expanded to file names" ;; *) ok "device list * not expanded to file names" ;; esac
 # RFC 7748 X25519 test vector (Alice): private 77076d0a..., public 8520f009...
 eq "WireGuard public key from private (RFC 7748)" "$(wg_pubkey dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=)" "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo="
 k=$(wg_genkey); is_wg_key "$k" && is_wg_key "$(wg_pubkey "$k")" && ok "new WireGuard key pair" || bad "new WireGuard key pair: $k"
@@ -264,7 +273,7 @@ if is_wg_key 'abc='; then bad "short key rejected"; else ok "short key rejected"
 ) | tee "$T/r.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/r.res"))); n=$((n + $(wc -l < "$T/r.res")))
 for a in 10.77.0.0/24 172.16.5.0/24 192.168.200.0/24; do remote_net_ok "$a" && ok "tunnel range $a accepted" || bad "tunnel range $a accepted"; done
-for a in 8.8.8.0/24 10.77.0.1/24 10.77.0.0/16 172.32.0.0/24 10.300.0.0/24 'x'; do
+for a in 10.077.0.0/24 010.77.0.0/24 8.8.8.0/24 10.77.0.1/24 10.77.0.0/16 172.32.0.0/24 10.300.0.0/24 'x'; do
 	if remote_net_ok "$a"; then bad "tunnel range $a rejected"; else ok "tunnel range $a rejected"; fi
 done
 for a in 100.64.1.2 100.127.0.1 10.0.2.15 192.168.0.5 172.20.1.1; do behind_nat_v4 "$a" && ok "$a is behind NAT" || bad "$a is behind NAT"; done
@@ -280,6 +289,9 @@ $(printf '%s\n' "$REMOTE_PEERS" | head -1)"; eq "repeated remote device rejected
 	REMOTE_PEERS="a b|2|k|p"; eq "bad remote device line rejected" "$(check_settings | grep -c REMOTE_PEERS)" 1
 	REMOTE_PEERS=; eq "remote on without devices rejected" "$(check_settings | grep -c REMOTE_PEERS)" 1
 	VPN_IFACE=remote; eq "VPN_IFACE 'remote' rejected" "$(check_settings | grep -c VPN_IFACE)" 1
+	REMOTE_HOST=home.example.org:51820; eq "remote host with a port rejected" "$(check_settings | grep -c REMOTE_HOST)" 1
+	REMOTE_HOST=2001:db8::1; eq "remote host IPv6 address accepted" "$(check_settings | grep -c REMOTE_HOST)" 0
+	REMOTE_HOST='' REMOTE_PEERS="living-room-ipad|2|$(wg_genkey)|$(wg_psk)"; eq "device name over 15 characters rejected" "$(check_settings | grep -c REMOTE_PEERS)" 1
 ) | tee "$T/r2.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/r2.res"))); n=$((n + $(wc -l < "$T/r2.res")))
 

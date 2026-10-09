@@ -15,19 +15,49 @@ pass() { echo "PASS  $1" | tee -a "$REPORT"; }
 fail() { echo "FAIL  $1" | tee -a "$REPORT"; }
 info() { echo "INFO  $1" | tee -a "$REPORT"; }
 step() { echo; echo "==> $1"; }
-die()  { fail "$1"; echo; cat "$REPORT"; exit 1; }
+# Stopping after adblock-lean's installer stopped it: start it again, so the
+# router keeps blocking with what it has.
+ABL_STOPPED=
+die()  {
+	fail "$1"
+	[ -n "$ABL_STOPPED" ] && [ -s /etc/adblock-lean/config ] && /etc/init.d/adblock-lean start >/dev/null 2>&1
+	echo; cat "$REPORT"; exit 1
+}
 on()   { [ "${1:-0}" = 1 ]; }
 
-VPN=${VPN_IFACE:-vpn}
-case $VPN in *[!a-z0-9_]*|'') echo "VPN_IFACE must be lowercase letters, digits or _"; exit 1 ;; esac
-RESERVED=' lan wan wan6 wan_6 loopback remote '
-case $RESERVED in *" $VPN "*) echo "VPN_IFACE '$VPN' is reserved"; exit 1 ;; esac
-if [ -n "$VPN" ] && uci -q get "network.$VPN" >/dev/null && [ "$(uci -q get "network.$VPN.setup")" != 1 ]; then
-	echo "VPN_IFACE '$VPN' is an existing interface not made by this tool; pick another name"; exit 1
+VPN=
+if on "${ENABLE_VPN:-0}"; then
+	VPN=${VPN_IFACE:-vpn}
+	case $VPN in *[!a-z0-9_]*|'') echo "VPN_IFACE must be lowercase letters, digits or _"; exit 1 ;; esac
+	RESERVED=' lan wan wan6 wan_6 loopback remote '
+	case $RESERVED in *" $VPN "*) echo "VPN_IFACE '$VPN' is reserved"; exit 1 ;; esac
+	if uci -q get "network.$VPN" >/dev/null && [ "$(uci -q get "network.$VPN.setup")" != 1 ]; then
+		echo "VPN_IFACE '$VPN' is an existing interface not made by this tool; pick another name"; exit 1
+	fi
 fi
-on "${ENABLE_VPN:-0}" || VPN=
 LAN_IP=$(uci get network.lan.ipaddr | cut -d/ -f1)
+LAN_ZONE=$(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='lan'$/\1/p" | head -1)
+
+# Remote access: everything that can stop it is checked before anything changes.
 REMOTE=; on "${ENABLE_REMOTE:-0}" && REMOTE=1
+ip2int() { # a.b.c.d -> integer
+	echo "$1" | { IFS=. read -r a b c d; echo $(( (a << 24) + (b << 16) + (c << 8) + d )); }
+}
+if [ -n "$REMOTE" ]; then
+	if uci -q get network.remote >/dev/null && [ "$(uci -q get network.remote.setup_remote)" != 1 ]; then
+		echo "an interface 'remote' exists that this tool did not make; rename it first"; exit 1
+	fi
+	[ -n "$LAN_ZONE" ] || { echo "no firewall zone named lan, needed for remote access"; exit 1; }
+	lan_st=$(ubus call network.interface.lan status)
+	lan_sub=$(echo "$lan_st" | jsonfilter -e '@["ipv4-address"][0].address')/$(echo "$lan_st" | jsonfilter -e '@["ipv4-address"][0].mask')
+	case $lan_sub in /*|*/) lan_sub=$LAN_IP/24 ;; esac
+	# The tunnel range must not overlap the LAN (compare at the shorter prefix).
+	p=${lan_sub#*/}; [ "$p" -gt 24 ] && p=24
+	m=$(( (0xffffffff << (32 - p)) & 0xffffffff ))
+	if [ $(( $(ip2int "${lan_sub%/*}") & m )) -eq $(( $(ip2int "${REMOTE_NET%/*}") & m )) ]; then
+		echo "REMOTE_NET $REMOTE_NET overlaps the LAN $lan_sub; pick another range (./setup.sh --reconfigure)"; exit 1
+	fi
+fi
 
 # curl: SQM speed test (streamed upload); gawk, sed, coreutils-sort: adblock-lean's
 # fast list processing; dnsmasq-full: nftset support for pbr and adblock-lean.
@@ -118,18 +148,26 @@ pass "installed: $(echo $PACKAGES | tr -s ' \t\n' ' ')"
 # follows the router's memory. Our extra lists are added on top.
 step "adblock-lean"
 ABL_INSTALLER=https://raw.githubusercontent.com/lynxthecat/adblock-lean/master/abl-install.sh
-abl_fail() { # keep blocking with what is there (a re-run), then stop
+# On a re-run (adblock-lean already there), a failed update (GitHub down or
+# rate-limited) keeps the installed version and its config instead of stopping.
+ABL_OLD=; [ -s /etc/adblock-lean/config ] && [ -x /etc/init.d/adblock-lean ] && ABL_OLD=1
+abl_fail() {
 	tail -5 /tmp/setup-abl.log
-	[ -s /etc/adblock-lean/config ] && /etc/init.d/adblock-lean start >/dev/null 2>&1
-	die "$1 (/tmp/setup-abl.log)"
+	[ -n "$ABL_OLD" ] || die "$1 (/tmp/setup-abl.log)"
+	fail "$1 (/tmp/setup-abl.log); kept the installed adblock-lean and its config"
 }
 : > /tmp/setup-abl.log
-uclient-fetch -q -O /tmp/abl-install.sh "$ABL_INSTALLER" || abl_fail "could not download $ABL_INSTALLER"
-DO_DIALOGS=0 sh /tmp/abl-install.sh -v release >>/tmp/setup-abl.log 2>&1 || abl_fail "adblock-lean install failed"
-rm -f /tmp/abl-install.sh
+ABL_STOPPED=1   # the installer stops a running adblock-lean
+if ! uclient-fetch -q -O /tmp/abl-install.sh "$ABL_INSTALLER"; then
+	abl_fail "could not download $ABL_INSTALLER"
+elif ! DO_DIALOGS=0 sh /tmp/abl-install.sh -v release >>/tmp/setup-abl.log 2>&1; then
+	abl_fail "adblock-lean install failed"
 # A fresh default config each run (replaces the old one only if it succeeds).
-DO_DIALOGS=0 luci_preset=auto luci_upd_cron_job=1 luci_cron_schedule='0 5 * * *' \
-	/etc/init.d/adblock-lean gen_config >>/tmp/setup-abl.log 2>&1 || abl_fail "adblock-lean gen_config failed"
+elif ! DO_DIALOGS=0 luci_preset=auto luci_upd_cron_job=1 luci_cron_schedule='0 5 * * *' \
+	/etc/init.d/adblock-lean gen_config >>/tmp/setup-abl.log 2>&1; then
+	abl_fail "adblock-lean gen_config failed"
+fi
+rm -f /tmp/abl-install.sh
 ABL_VER=$(sed -n 's/^ABL_VERSION="\(.*\)"$/\1/p' /etc/init.d/adblock-lean)
 abl_get() { sed -n "s/^$1=\"\(.*\)\"\$/\1/p" /etc/adblock-lean/config; }
 abl_set() { sed -i "s|^$1=.*|$1=\"$2\"|" /etc/adblock-lean/config; }
@@ -289,20 +327,8 @@ if [ "$(uci -q get network.remote.setup_remote)" = 1 ]; then
 	uci delete network.remote
 	uci commit network
 fi
-ip2int() { # a.b.c.d -> integer
-	echo "$1" | { IFS=. read -r a b c d; echo $(( (a << 24) + (b << 16) + (c << 8) + d )); }
-}
 if [ -n "$REMOTE" ]; then
 	step "Remote access"
-	uci -q get network.remote >/dev/null && die "an interface 'remote' exists that this tool did not make; rename it first"
-	lan_st=$(ubus call network.interface.lan status)
-	lan_sub=$(echo "$lan_st" | jsonfilter -e '@["ipv4-address"][0].address')/$(echo "$lan_st" | jsonfilter -e '@["ipv4-address"][0].mask')
-	case $lan_sub in /*|*/) lan_sub=$LAN_IP/24 ;; esac
-	# The tunnel range must not overlap the LAN (compare at the shorter prefix).
-	p=${lan_sub#*/}; [ "$p" -gt 24 ] && p=24
-	m=$(( (0xffffffff << (32 - p)) & 0xffffffff ))
-	[ $(( $(ip2int "${lan_sub%/*}") & m )) -eq $(( $(ip2int "${REMOTE_NET%/*}") & m )) ] \
-		&& die "REMOTE_NET $REMOTE_NET overlaps the LAN $lan_sub; pick another range"
 	RNET=${REMOTE_NET%.0/24}
 	uci batch >/dev/null <<-EOF
 		set network.remote=interface
@@ -335,7 +361,6 @@ step "Firewall"
 for s in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.setup='1'$/\1/p" | sort -t'[' -k2 -n -r); do uci delete "firewall.$s"; done
 uci -q delete firewall.dns_int
 uci -q delete firewall.dot_fwd
-LAN_ZONE=$(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='lan'$/\1/p" | head -1)
 [ -n "$LAN_ZONE" ] && uci -q del_list "firewall.$LAN_ZONE.network=remote"
 uci batch >/dev/null <<-EOF
 	set firewall.@defaults[0].flow_offloading='1'
@@ -394,7 +419,6 @@ if [ -n "$VPN" ]; then
 	EOF
 fi
 if [ -n "$REMOTE" ]; then
-	[ -n "$LAN_ZONE" ] || die "no firewall zone named lan"
 	uci add_list "firewall.$LAN_ZONE.network=remote"
 	uci batch >/dev/null <<-EOF
 		add firewall rule

@@ -123,9 +123,15 @@ wizard() {
 		ENABLE_REMOTE=1
 		say "  A dynamic-DNS name (e.g. myhome.duckdns.org) keeps working when your provider"
 		say "  changes your address; without one, the router's current address is used."
-		ask REMOTE_HOST "Public name or address of your home (Enter = the router's current one)" "${REMOTE_HOST-}"
+		if [ -n "${REMOTE_HOST-}" ]; then
+			ask REMOTE_HOST "Public name or address of your home (- = the router's current address)" "$REMOTE_HOST"
+		else
+			ask REMOTE_HOST "Public name or address of your home (Enter = the router's current address)"
+		fi
+		[ "$REMOTE_HOST" = - ] && REMOTE_HOST=''
 		ask REMOTE_PORT "UDP port for the tunnel" "${REMOTE_PORT:-51820}"
 		_d=$(remote_devices)
+		say "  Device names: letters, digits, _ or -, up to 15 characters (the WireGuard apps' limit)."
 		ask _d "Devices that may connect, space separated" "${_d:-phone laptop}"
 		OPENSSL=$(find_openssl) || { say "Need OpenSSL 1.1.1+ to make WireGuard keys (macOS: brew install openssl@3)."; exit 1; }
 		REMOTE_NET=${REMOTE_NET:-10.77.0.0/24}
@@ -227,6 +233,8 @@ cp -R "$HERE/router" "$STAGE/b/router"
 (
 	if [ "${ENABLE_REMOTE-}" = 1 ]; then
 		REMOTE_PEERS=$(remote_peers_public) || { say "Could not derive the remote-access public keys."; exit 1; }
+	else
+		unset REMOTE_PEERS REMOTE_SERVER_KEY
 	fi
 	write_config "$STAGE/b/private/config.env"
 ) || exit 1
@@ -312,6 +320,11 @@ if [ "${ENABLE_REMOTE-}" = 1 ] && [ "$rc" != 1 ]; then
 			say "  provider for a public IPv4 address."
 		fi
 	fi
+fi
+
+# Remote access off: its device configs no longer work.
+if [ "${ENABLE_REMOTE-}" != 1 ] && [ "$rc" != 1 ] && [ -d "$PRIV/remote" ]; then
+	rm -f "$PRIV"/remote/*.conf; rmdir "$PRIV/remote" 2>/dev/null
 fi
 
 case $rc in

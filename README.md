@@ -77,13 +77,17 @@ The router listens for WireGuard on UDP 51820 (changeable) and puts tunnel
 devices (10.77.0.0/24 unless you set `REMOTE_NET`) in the LAN zone. The keys
 are made on your computer with OpenSSL and kept in `private/config.env`, so a
 re-install keeps every device working; removing a name from the device list
-revokes it.
+revokes it. Device names are letters, digits, `_` or `-`, up to 15 characters
+(the WireGuard apps use the file name as the tunnel name). The router only
+ever gets the devices' public keys. Turning remote access off deletes the
+configs in `private/remote/`; the keys stay in the settings for next time.
 
 Devices outside need to find your home:
 
 - Give a dynamic-DNS name (e.g. from DuckDNS) when asked, if your provider
   changes your address. Without one, the configs point at the router's current
-  address and need re-running `./setup.sh` when it changes.
+  address and need re-running `./setup.sh` when it changes (answer `-` in
+  `./setup.sh --reconfigure` to go back from a name to the router's address).
 - If the router's internet address is private or carrier-grade NAT (100.64.x.x;
   common on mobile and some fibre lines, or with a modem that routes), it
   can't be reached from outside: forward UDP 51820 to the router on the modem,
