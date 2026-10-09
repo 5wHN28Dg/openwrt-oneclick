@@ -176,6 +176,9 @@ else
 fi
 validate
 [ -n "$ONLY" ] && exit 0
+if [ "${ENABLE_REMOTE-}" = 1 ]; then
+	OPENSSL=$(find_openssl) || { say "Remote access needs OpenSSL 1.1.1+ for its keys (macOS: brew install openssl@3)."; exit 1; }
+fi
 
 # ------------------------------------------------------------------ connect
 KEY=$SSH_KEY
@@ -220,7 +223,13 @@ done
 # ------------------------------------------------------------------ bundle
 mkdir -p "$STAGE/b/private"
 cp -R "$HERE/router" "$STAGE/b/router"
-cp "$USED" "$STAGE/b/private/config.env"
+# The router gets the devices' public keys only.
+(
+	if [ "${ENABLE_REMOTE-}" = 1 ]; then
+		REMOTE_PEERS=$(remote_peers_public) || { say "Could not derive the remote-access public keys."; exit 1; }
+	fi
+	write_config "$STAGE/b/private/config.env"
+) || exit 1
 link_params "$LINK_TYPE" | awk '{ printf "LINK_LL=%s\nLINK_OVERHEAD=%s\nLINK_MPU=%s\n", $1, $2, $3 }' >> "$STAGE/b/private/config.env"
 for f in blocklist.txt allowlist.txt; do [ -f "$PRIV/$f" ] && cp "$PRIV/$f" "$STAGE/b/private/"; done
 [ -d "$PRIV/host_keys" ] && cp -R "$PRIV/host_keys" "$STAGE/b/private/host_keys"
@@ -273,13 +282,22 @@ if [ "${ENABLE_REMOTE-}" = 1 ] && [ "$rc" != 1 ]; then
 	info=$(ssh_r '. /lib/functions/network.sh; network_get_subnet s lan; eval "$(ipcalc.sh "$s")"; echo "$NETWORK/$PREFIX"
 		network_get_ipaddr a wan; [ -n "$a" ] || network_get_ipaddr6 a wan6; echo "$a"' 2>/dev/null) || info=
 	lan_net=$(printf '%s\n' "$info" | sed -n 1p) wan_ip=$(printf '%s\n' "$info" | sed -n 2p)
+	case $lan_net in [0-9]*.*/[0-9]*) ;; *) lan_net='' ;; esac
 	endpoint=${REMOTE_HOST:-$wan_ip}
 	if [ -z "$lan_net" ] || [ -z "$endpoint" ]; then
 		say "Could not read the router's network or address; remote-access configs not written."
 	else
+		[ -d "$PRIV" ] || { mkdir -p "$PRIV"; chmod 700 "$PRIV"; }
 		mkdir -p "$PRIV/remote"; chmod 700 "$PRIV/remote"
+		for f in "$PRIV"/remote/*.conf; do   # devices no longer listed
+			[ -f "$f" ] || continue
+			n=${f##*/}; n=${n%.conf}
+			case " $(remote_devices) " in *" $n "*) ;; *) rm -f "$f" ;; esac
+		done
 		for d in $(remote_devices); do
-			(umask 077; remote_client_conf "$d" "$lan_net" "$endpoint" > "$PRIV/remote/$d.conf")
+			(umask 077; remote_client_conf "$d" "$lan_net" "$endpoint" > "$PRIV/remote/$d.conf.tmp") \
+				&& mv "$PRIV/remote/$d.conf.tmp" "$PRIV/remote/$d.conf" \
+				|| { rm -f "$PRIV/remote/$d.conf.tmp"; say "Could not write the remote-access config for $d."; }
 		done
 		say ""
 		say "Remote access: WireGuard configs for $(remote_devices) are in $PRIV/remote/."

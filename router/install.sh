@@ -118,14 +118,18 @@ pass "installed: $(echo $PACKAGES | tr -s ' \t\n' ' ')"
 # follows the router's memory. Our extra lists are added on top.
 step "adblock-lean"
 ABL_INSTALLER=https://raw.githubusercontent.com/lynxthecat/adblock-lean/master/abl-install.sh
-uclient-fetch -q -O /tmp/abl-install.sh "$ABL_INSTALLER" || die "could not download $ABL_INSTALLER"
-DO_DIALOGS=0 sh /tmp/abl-install.sh -v release >/tmp/setup-abl.log 2>&1 \
-	|| { tail -5 /tmp/setup-abl.log; die "adblock-lean install failed (/tmp/setup-abl.log)"; }
+abl_fail() { # keep blocking with what is there (a re-run), then stop
+	tail -5 /tmp/setup-abl.log
+	[ -s /etc/adblock-lean/config ] && /etc/init.d/adblock-lean start >/dev/null 2>&1
+	die "$1 (/tmp/setup-abl.log)"
+}
+: > /tmp/setup-abl.log
+uclient-fetch -q -O /tmp/abl-install.sh "$ABL_INSTALLER" || abl_fail "could not download $ABL_INSTALLER"
+DO_DIALOGS=0 sh /tmp/abl-install.sh -v release >>/tmp/setup-abl.log 2>&1 || abl_fail "adblock-lean install failed"
 rm -f /tmp/abl-install.sh
-rm -f /etc/adblock-lean/config   # a fresh default config each run
+# A fresh default config each run (replaces the old one only if it succeeds).
 DO_DIALOGS=0 luci_preset=auto luci_upd_cron_job=1 luci_cron_schedule='0 5 * * *' \
-	/etc/init.d/adblock-lean gen_config >>/tmp/setup-abl.log 2>&1 && [ -s /etc/adblock-lean/config ] \
-	|| { tail -5 /tmp/setup-abl.log; die "adblock-lean gen_config failed (/tmp/setup-abl.log)"; }
+	/etc/init.d/adblock-lean gen_config >>/tmp/setup-abl.log 2>&1 || abl_fail "adblock-lean gen_config failed"
 ABL_VER=$(sed -n 's/^ABL_VERSION="\(.*\)"$/\1/p' /etc/init.d/adblock-lean)
 abl_get() { sed -n "s/^$1=\"\(.*\)\"\$/\1/p" /etc/adblock-lean/config; }
 abl_set() { sed -i "s|^$1=.*|$1=\"$2\"|" /etc/adblock-lean/config; }
@@ -225,14 +229,14 @@ pass "time zone ${TZ_NAME:-UTC}, NTP by IP (no DNS needed), packet steering on a
 # VPN interfaces from earlier runs (tagged setup=1) go first, also when the VPN
 # is now off or renamed.
 for i in $(uci -q show network | sed -n "s/^network\.\([^.]*\)\.setup='1'$/\1/p"); do
-	for s in $(uci -q show network | sed -n "s/^network\.\(@wireguard_$i\[[0-9]*\]\)=.*/\1/p" | sort -r); do uci delete "network.$s"; done
+	for s in $(uci -q show network | sed -n "s/^network\.\(@wireguard_$i\[[0-9]*\]\)=.*/\1/p" | sort -t'[' -k2 -n -r); do uci delete "network.$s"; done
 	uci delete "network.$i"
 done
 uci commit network
 if [ -n "$VPN" ]; then
 	step "VPN ($VPN)"
 	uci -q delete "network.$VPN"
-	for s in $(uci -q show network | sed -n "s/^network\.\(@wireguard_$VPN\[[0-9]*\]\)=.*/\1/p" | sort -r); do uci delete "network.$s"; done
+	for s in $(uci -q show network | sed -n "s/^network\.\(@wireguard_$VPN\[[0-9]*\]\)=.*/\1/p" | sort -t'[' -k2 -n -r); do uci delete "network.$s"; done
 	uci set "network.$VPN=interface"
 	uci set "network.$VPN.proto=wireguard"
 	uci set "network.$VPN.setup=1"
@@ -251,7 +255,7 @@ if [ -n "$VPN" ]; then
 	uci commit network
 
 	# PBR: only the chosen domains and ranges go through the VPN
-	for s in $(uci -q show pbr | sed -n "s/^pbr\.\([^.]*\)\.setup='1'$/\1/p" | sort -r); do uci delete "pbr.$s"; done
+	for s in $(uci -q show pbr | sed -n "s/^pbr\.\([^.]*\)\.setup='1'$/\1/p" | sort -t'[' -k2 -n -r); do uci delete "pbr.$s"; done
 	policy() { # name dest
 		uci add pbr policy >/dev/null
 		uci set pbr.@policy[-1].setup=1
@@ -281,7 +285,7 @@ fi
 # DNS (so manga.lan) through it. The interface joins the lan zone below.
 # Earlier runs' interface and peers (tagged setup_remote=1) go first.
 if [ "$(uci -q get network.remote.setup_remote)" = 1 ]; then
-	for s in $(uci -q show network | sed -n "s/^network\.\(@wireguard_remote\[[0-9]*\]\)=.*/\1/p" | sort -r); do uci delete "network.$s"; done
+	for s in $(uci -q show network | sed -n "s/^network\.\(@wireguard_remote\[[0-9]*\]\)=.*/\1/p" | sort -t'[' -k2 -n -r); do uci delete "network.$s"; done
 	uci delete network.remote
 	uci commit network
 fi
@@ -308,12 +312,14 @@ if [ -n "$REMOTE" ]; then
 		set network.remote.listen_port='$REMOTE_PORT'
 		add_list network.remote.addresses='$RNET.1/24'
 	EOF
-	printf '%s\n' "$REMOTE_PEERS" | while IFS='|' read -r name n key psk; do
+	# REMOTE_PEERS: name|host number|public key|preshared key (setup.sh sends
+	# public keys only)
+	printf '%s\n' "$REMOTE_PEERS" | while IFS='|' read -r name n pub psk; do
 		[ -n "$name" ] || continue
 		uci batch >/dev/null <<-EOF
 			add network wireguard_remote
 			set network.@wireguard_remote[-1].description='$name'
-			set network.@wireguard_remote[-1].public_key='$(printf '%s' "$key" | wg pubkey)'
+			set network.@wireguard_remote[-1].public_key='$pub'
 			set network.@wireguard_remote[-1].preshared_key='$psk'
 			add_list network.@wireguard_remote[-1].allowed_ips='$RNET.$n/32'
 		EOF
@@ -326,7 +332,7 @@ fi
 # ---------------------------------------------------------------- firewall
 step "Firewall"
 # Remove what this script added before, so re-runs don't duplicate.
-for s in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.setup='1'$/\1/p" | sort -r); do uci delete "firewall.$s"; done
+for s in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.setup='1'$/\1/p" | sort -t'[' -k2 -n -r); do uci delete "firewall.$s"; done
 uci -q delete firewall.dns_int
 uci -q delete firewall.dot_fwd
 LAN_ZONE=$(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='lan'$/\1/p" | head -1)
@@ -415,7 +421,7 @@ done
 pass "dnsproxy answers on 127.0.0.1:5354 (Cloudflare h3, NextDNS, Quad9)"
 
 step "dnsmasq"
-for s in $(uci -q show dhcp | sed -n "s/^dhcp\.\([^.]*\)\.setup='1'$/\1/p" | sort -r); do uci delete "dhcp.$s"; done
+for s in $(uci -q show dhcp | sed -n "s/^dhcp\.\([^.]*\)\.setup='1'$/\1/p" | sort -t'[' -k2 -n -r); do uci delete "dhcp.$s"; done
 uci batch >/dev/null <<-EOF
 	set dhcp.@dnsmasq[0].cachesize='$DNS_CACHE'
 	set dhcp.@dnsmasq[0].noresolv='1'

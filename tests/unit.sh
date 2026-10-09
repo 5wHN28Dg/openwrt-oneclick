@@ -253,6 +253,14 @@ if is_wg_key 'abc='; then bad "short key rejected"; else ok "short key rejected"
 	eq "client conf: endpoint" "$(echo "$c" | sed -n 's/^Endpoint = //p')" home.example.org:51820
 	eq "client conf: IPv6 endpoint in brackets" "$(remote_client_conf phone 192.168.1.0/24 2001:db8::1 | sed -n 's/^Endpoint = //p')" "[2001:db8::1]:51820"
 	if remote_client_conf nobody 192.168.1.0/24 x >/dev/null; then bad "client conf: unknown device refused"; else ok "client conf: unknown device refused"; fi
+	p=$(remote_peers_public); dk=$(printf '%s' "$REMOTE_PEERS" | cut -d'|' -f3)
+	eq "router gets the device's public key, not its private key" "$p" "phone|5|$(wg_pubkey "$dk")|$(printf '%s' "$REMOTE_PEERS" | cut -d'|' -f4)"
+	# An OpenSSL that can't do X25519 (macOS LibreSSL): no config with an empty key.
+	mkdir -p "$T/nox"; printf '#!/bin/sh\ncase $1 in pkey) exit 1 ;; esac\nexec openssl "$@"\n' > "$T/nox/fakessl"; chmod 755 "$T/nox/fakessl"
+	OPENSSL=$T/nox/fakessl
+	if wg_pubkey "$dk" >/dev/null 2>&1; then bad "public key fails without X25519"; else ok "public key fails without X25519"; fi
+	if remote_client_conf phone 192.168.1.0/24 x >/dev/null 2>&1; then bad "client conf refused without X25519"; else ok "client conf refused without X25519"; fi
+	if remote_peers_public >/dev/null 2>&1; then bad "router keys refused without X25519"; else ok "router keys refused without X25519"; fi
 ) | tee "$T/r.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/r.res"))); n=$((n + $(wc -l < "$T/r.res")))
 for a in 10.77.0.0/24 172.16.5.0/24 192.168.200.0/24; do remote_net_ok "$a" && ok "tunnel range $a accepted" || bad "tunnel range $a accepted"; done

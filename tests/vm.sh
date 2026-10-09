@@ -179,6 +179,9 @@ scenario_full() {
 		"$(uci show firewall | grep -c "name=.Allow-Remote-WireGuard.")" \
 		"$(uci show firewall | grep "\.network=" | grep -o "remote" | wc -l)"')
 	[ "$counts" = "1 1 1 1 1 1 2 1 1" ] && ok "re-run: no duplicates" || bad "re-run duplicates (zone rule domain cron peer kids remote-peers remote-rule remote-in-lan): $counts"
+	# Re-runs delete their old sections by position; every rule must be there once.
+	d=$(vm_ssh "uci show firewall | sed -n \"s/^firewall\.[^.]*\.name='\(.*\)'\$/\1/p\" | sort | uniq -d")
+	[ -z "$d" ] && ok "re-run: no firewall rule left twice" || bad "re-run: rules present twice: $(echo $d)"
 	sqm=$(vm_ssh 'uci -q get sqm.wan.linklayer; uci -q get sqm.wan.overhead; uci -q get sqm.wan.tcMPU; uci -q get sqm.wan.iqdisc_opts' | tr '\n' '|')
 	[ "$sqm" = "ethernet|44|84|nat dual-dsthost|" ] && ok "SQM fiber values + NAT fairness: $sqm" || bad "SQM values: $sqm"
 	perms=$(vm_ssh 'stat -c %a / /etc /usr /www 2>/dev/null || ls -ld / /etc /usr /www | cut -c1-10' | tr '\n' ' ')

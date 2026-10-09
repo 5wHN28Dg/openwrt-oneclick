@@ -88,7 +88,7 @@ ssh -p "$PORT" -i "$SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
 	"REMOVE=$(shq "$REMOVE") DEVICES=$(shq "$DEVICES") START=$(shq "$CUTOFF_START") STOP=$(shq "$CUTOFF_STOP") sh -s" <<'EOF'
 set -eu
 for cfg in dhcp firewall; do
-	for s in $(uci -q show $cfg | sed -n "s/^$cfg\.\([^.]*\)\.kids='1'$/\1/p" | sort -r); do uci delete "$cfg.$s"; done
+	for s in $(uci -q show $cfg | sed -n "s/^$cfg\.\([^.]*\)\.kids='1'$/\1/p" | sort -t'[' -k2 -n -r); do uci delete "$cfg.$s"; done
 done
 if [ -n "$REMOVE" ] || [ -z "$(printf '%s' "$DEVICES" | tr -d ' \n')" ]; then
 	uci commit dhcp; uci commit firewall

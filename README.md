@@ -88,6 +88,9 @@ Devices outside need to find your home:
   common on mobile and some fibre lines, or with a modem that routes), it
   can't be reached from outside: forward UDP 51820 to the router on the modem,
   or ask your provider for a public IPv4 address. The setup warns about this.
+- On a network that uses the same address range as your home (often
+  192.168.1.x), the device can't tell the two apart: give your router's LAN an
+  uncommon range in LuCI (e.g. 192.168.47.1) if you use remote access a lot.
 
 ## Packet steering
 

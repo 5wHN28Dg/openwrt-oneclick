@@ -151,10 +151,22 @@ wg_genkey() {
 wg_psk() { "${OPENSSL:-openssl}" rand -base64 32; }
 
 # wg_pubkey PRIVATE -> its public key (the private key wrapped in the PKCS#8
-# header for X25519, then OpenSSL derives the public half)
+# header for X25519, then OpenSSL derives the public half); fails if OpenSSL
+# can't (e.g. macOS LibreSSL without X25519)
 wg_pubkey() {
-	{ printf '\060\056\002\001\000\060\005\006\003\053\145\156\004\042\004\040'; printf '%s' "$1" | "${OPENSSL:-openssl}" base64 -d -A; } \
-		| "${OPENSSL:-openssl}" pkey -inform DER -pubout -outform DER | tail -c 32 | "${OPENSSL:-openssl}" base64 -A; echo
+	_k=$({ printf '\060\056\002\001\000\060\005\006\003\053\145\156\004\042\004\040'; printf '%s' "$1" | "${OPENSSL:-openssl}" base64 -d -A; } \
+		| "${OPENSSL:-openssl}" pkey -inform DER -pubout -outform DER | tail -c 32 | "${OPENSSL:-openssl}" base64 -A)
+	is_wg_key "$_k" && printf '%s\n' "$_k"
+}
+
+# remote_peers_public -> REMOTE_PEERS with each device's public key in place of
+# its private key: what the router needs (private keys stay on this computer)
+remote_peers_public() {
+	printf '%s\n' "${REMOTE_PEERS-}" | while IFS='|' read -r _n _i _k _p; do
+		[ -n "$_n" ] || continue
+		_pub=$(wg_pubkey "$_k") || exit 1
+		printf '%s|%s|%s|%s\n' "$_n" "$_i" "$_pub" "$_p"
+	done
 }
 
 # remote_net_ok NET -> status 0 for a private x.y.z.0/24 range
@@ -188,6 +200,7 @@ remote_peers_for() {
 remote_client_conf() {
 	_l=$(printf '%s\n' "$REMOTE_PEERS" | awk -F'|' -v n="$1" '$1 == n' | head -1)
 	[ -n "$_l" ] || return 1
+	_pub=$(wg_pubkey "$REMOTE_SERVER_KEY") || return 1
 	_p=${REMOTE_NET%.0/24}
 	_e=$3; case $_e in *:*) _e="[$_e]" ;; esac
 	cat <<-EOF
@@ -198,7 +211,7 @@ remote_client_conf() {
 		DNS = $_p.1
 
 		[Peer]
-		PublicKey = $(wg_pubkey "$REMOTE_SERVER_KEY")
+		PublicKey = $_pub
 		PresharedKey = $(printf '%s' "$_l" | cut -d'|' -f4)
 		AllowedIPs = $REMOTE_NET, $2
 		Endpoint = $_e:$REMOTE_PORT
