@@ -1,5 +1,6 @@
 #!/bin/sh
-# Kids' devices: fixed addresses plus a nightly internet cut-off.
+# Kids' devices: fixed addresses plus a nightly internet cut-off, matched by MAC
+# address (so it covers IPv4 and IPv6, and any IP the device picks itself).
 # Run after setup.sh (safe to re-run; it replaces its own rules):
 #
 #   ./kids.sh                  # router at 192.168.1.1
@@ -71,7 +72,7 @@ uci batch >/dev/null <<-B
 	set firewall.@rule[-1].kids='1'
 	set firewall.@rule[-1].name='kids time restriction'
 	set firewall.@rule[-1].src='lan'
-	set firewall.@rule[-1].dest='wan'
+	set firewall.@rule[-1].dest='*'
 	set firewall.@rule[-1].target='REJECT'
 	set firewall.@rule[-1].start_time='$START'
 	set firewall.@rule[-1].stop_time='$STOP'
@@ -85,7 +86,6 @@ printf '%s\n' "$DEVICES" | while IFS='|' read -r name mac ip; do
 		set dhcp.@host[-1].ip='$ip'
 		add_list dhcp.@host[-1].mac='$mac'
 		add_list firewall.@rule[-1].src_mac='$mac'
-		add_list firewall.@rule[-1].src_ip='$ip'
 	B
 done
 uci commit dhcp; uci commit firewall

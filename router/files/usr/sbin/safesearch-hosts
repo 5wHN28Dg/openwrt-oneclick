@@ -15,9 +15,10 @@ safe.duckduckgo.com|duckduckgo.com www.duckduckgo.com start.duckduckgo.com
 safe.startpage.com|startpage.com www.startpage.com eu.startpage.com www.eu.startpage.com search.startpage.com
 forcesafe.search.brave.com|search.brave.com'
 
-lookup() {
-	dig +short +time=3 +tries=2 -p "$PORT" @"$UPSTREAM" "$1" "$2" |
-		grep -E '^[0-9a-fA-F:.]+$' | grep -E '\.|:'
+lookup() { # name A|AAAA -> addresses (BusyBox nslookup; answers follow "Non-authoritative answer:")
+	nslookup -type="$2" "$1" "$UPSTREAM:$PORT" 2>/dev/null |
+		awk '/^Non-authoritative answer:/ { f = 1 } f && /^Address: / { print $2 }' |
+		grep -E '^[0-9a-fA-F:.]+$'
 }
 
 : > "$TMP"

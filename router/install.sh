@@ -23,8 +23,10 @@ case $VPN in *[!a-z0-9_]*|'') echo "VPN_IFACE must be lowercase letters, digits 
 on "${ENABLE_VPN:-0}" || VPN=
 LAN_IP=$(uci get network.lan.ipaddr | cut -d/ -f1)
 
+# curl: SQM speed test (streamed upload); gawk, sed, coreutils-sort: adblock-lean's
+# fast list processing; dnsmasq-full: nftset support for pbr and adblock-lean.
 PACKAGES="luci luci-ssl luci-app-attendedsysupgrade owut luci-app-banip luci-app-sqm
-	dnsmasq-full dnsproxy curl bind-dig gawk sed coreutils-sort openssl-util"
+	dnsmasq-full dnsproxy curl gawk sed coreutils-sort"
 [ -n "$VPN" ] && PACKAGES="$PACKAGES luci-proto-wireguard luci-app-pbr"
 [ "${WAN_PROTO:-dhcp}" = pppoe ] && PACKAGES="$PACKAGES ppp-mod-pppoe luci-proto-ppp"
 
@@ -65,7 +67,8 @@ WAN_DEV=$(wan_dev wan); [ -n "$WAN_DEV" ] || WAN_DEV=$(wan_dev wan6)
 
 # IPv4 behind this router's NAT? Usable IPv6 (global address + default route + reachability)?
 HAS_V4=; online4 && [ -n "$(ubus call network.interface.wan status | jsonfilter -e '@["ipv4-address"][0].address')" ] && HAS_V4=1
-HAS_V6=; online6 && ip -6 route show default | grep -q . && ip -6 addr show scope global | grep -q inet6 && HAS_V6=1
+has_v6() { online6 && ip -6 route show default | grep -q . && ip -6 addr show scope global | grep -q inet6; }
+HAS_V6=; has_v6 && HAS_V6=1
 pass "online via $WAN_DEV: IPv4 ${HAS_V4:+yes (NAT)}${HAS_V4:-no}, IPv6 ${HAS_V6:+yes}${HAS_V6:-no}"
 
 i=0
@@ -82,9 +85,12 @@ if [ $PKG = apk ]; then
 	apk add $PACKAGES >/tmp/setup-pkg.log 2>&1 || { tail -5 /tmp/setup-pkg.log; die "package install failed (/tmp/setup-pkg.log)"; }
 else
 	opkg update >/dev/null 2>&1 || die "opkg update failed"
-	opkg remove dnsmasq >/dev/null 2>&1
+	# Download dnsmasq-full while the old dnsmasq still answers DNS, then swap.
+	(cd /tmp && opkg download dnsmasq-full >/dev/null 2>&1) || die "opkg download dnsmasq-full failed"
 	# shellcheck disable=SC2086
-	opkg install $PACKAGES >/tmp/setup-pkg.log 2>&1 || die "package install failed (/tmp/setup-pkg.log)"
+	opkg install $(echo $PACKAGES | sed 's/dnsmasq-full//') >/tmp/setup-pkg.log 2>&1 || die "package install failed (/tmp/setup-pkg.log)"
+	opkg remove dnsmasq >/dev/null 2>&1
+	opkg install /tmp/dnsmasq-full_*.ipk >>/tmp/setup-pkg.log 2>&1 || die "dnsmasq-full install failed (/tmp/setup-pkg.log)"
 fi
 # dnsmasq-full replaces dnsmasq but isn't started; keep the router's own DNS working.
 /etc/init.d/dnsmasq enable; /etc/init.d/dnsmasq restart >/dev/null 2>&1
@@ -120,8 +126,7 @@ uci -q delete banip.global.ban_ifv4; uci add_list banip.global.ban_ifv4=wan
 uci -q delete banip.global.ban_ifv6
 uci -q delete banip.global.ban_feed
 for f in ${BANIP_FEEDS-}; do uci add_list banip.global.ban_feed="$f"; done
-if [ -n "$HAS_V6" ]; then uci set banip.global.ban_protov6=1; uci add_list banip.global.ban_ifv6=wan6; else uci set banip.global.ban_protov6=0; fi
-uci commit banip
+uci commit banip   # IPv6 coverage is set after the network restart, once IPv6 had time to come up
 pass "copied adblock-lean, banIP, dnsproxy and safe-search files${ENABLE_MANGADEX:+$(on "$ENABLE_MANGADEX" && echo ', MangaDex app')}"
 
 # ---------------------------------------------------------------- access
@@ -159,12 +164,20 @@ uci commit network
 pass "time zone ${TZ_NAME:-UTC}, NTP by IP (no DNS needed), packet steering on all CPUs"
 
 # ---------------------------------------------------------------- VPN
+# VPN interfaces from earlier runs (tagged setup=1) go first, also when the VPN
+# is now off or renamed.
+for i in $(uci -q show network | sed -n "s/^network\.\([^.]*\)\.setup='1'$/\1/p"); do
+	for s in $(uci -q show network | sed -n "s/^network\.\(@wireguard_$i\[[0-9]*\]\)=.*/\1/p" | sort -r); do uci delete "network.$s"; done
+	uci delete "network.$i"
+done
+uci commit network
 if [ -n "$VPN" ]; then
 	step "VPN ($VPN)"
 	uci -q delete "network.$VPN"
 	for s in $(uci -q show network | sed -n "s/^network\.\(@wireguard_$VPN\[[0-9]*\]\)=.*/\1/p" | sort -r); do uci delete "network.$s"; done
 	uci set "network.$VPN=interface"
 	uci set "network.$VPN.proto=wireguard"
+	uci set "network.$VPN.setup=1"
 	uci set "network.$VPN.private_key=$WG_PRIVATE_KEY"
 	uci set "network.$VPN.multipath=off"
 	uci add network "wireguard_$VPN" >/dev/null
@@ -252,6 +265,7 @@ if [ -n "$VPN" ]; then
 		set firewall.@zone[-1].output='ACCEPT'
 		set firewall.@zone[-1].forward='REJECT'
 		set firewall.@zone[-1].masq='1'
+		set firewall.@zone[-1].mtu_fix='1'
 		add_list firewall.@zone[-1].network='$VPN'
 		add firewall forwarding
 		set firewall.@forwarding[-1].setup='1'
@@ -437,6 +451,13 @@ if [ -n "$VPN" ]; then
 	i=0; until [ "$(ifstatus "$VPN" | jsonfilter -e '@.up')" = true ] || [ $i -ge 20 ]; do sleep 1; i=$((i + 1)); done
 fi
 i=0; until online4 || online6 || [ $i -ge 30 ]; do sleep 1; i=$((i + 1)); done
+# IPv6 (RA, DHCPv6-PD) often comes up some seconds after IPv4: give it time, then decide.
+i=0; until has_v6 || [ $i -ge 20 ]; do sleep 1; i=$((i + 1)); done
+HAS_V6=; has_v6 && HAS_V6=1
+uci -q delete banip.global.ban_ifv6
+if [ -n "$HAS_V6" ]; then uci set banip.global.ban_protov6=1; uci add_list banip.global.ban_ifv6=wan6; else uci set banip.global.ban_protov6=0; fi
+uci commit banip
+info "after restart: IPv6 ${HAS_V6:+usable (banIP covers IPv6)}${HAS_V6:-not usable}"
 /etc/init.d/firewall restart >/dev/null 2>&1
 /etc/init.d/uhttpd restart
 /etc/init.d/cron enable; /etc/init.d/cron restart
@@ -480,13 +501,13 @@ check "adblock-lean list compressed in RAM" "[ -s /var/run/adblock-lean/abl-bloc
 check "DNS hijack rule active" "nft list chain inet fw4 dstnat_lan | grep -q 'dport 53.*redirect'"
 if [ -f "$PRIV/blocklist.txt" ]; then
 	d=$(grep -vE '^[[:space:]]*(#|$)' "$PRIV/blocklist.txt" | head -1)
-	[ -n "$d" ] && check "own blocklist: $d blocked" "blocked $d"
+	[ -n "$d" ] && check "own blocklist: $d blocked" "blocked \"\$d\""
 fi
 if on "${FAMILY_FILTER:-0}"; then
 	check "family list: mangadex.org blocked" "blocked mangadex.org"
 	check "family allowlist: api.mangadex.org resolves" "[ -n \"\$(resolve api.mangadex.org)\" ]"
 	check "Redlib: listed instance redlib.catsarch.com blocked" "blocked redlib.catsarch.com"
-	for h in ${REDLIB_ALLOW-}; do check "Redlib: $h allowed" "[ -n \"\$(resolve $h)\" ]"; done
+	for h in ${REDLIB_ALLOW-}; do check "Redlib: $h allowed" "[ -n \"\$(resolve \"\$h\")\" ]"; done
 	check "safe search: www.google.com -> forcesafesearch" "[ \"\$(resolve www.google.com)\" = 216.239.38.120 ]"
 	check "safe search: duckduckgo.com pinned" "grep -q ' duckduckgo.com' /tmp/hosts/safesearch"
 	check "safe search: yandex.com -> 213.180.193.56" "[ \"\$(resolve yandex.com)\" = 213.180.193.56 ]"
@@ -507,7 +528,8 @@ fi
 check "banIP running" "/etc/init.d/banip status 2>&1 | grep -qi 'status.*active'"
 [ -n "$RATE_DOWN" ] && check "SQM cake active on $WAN_DEV" "tc qdisc show dev $WAN_DEV | grep -q cake"
 check "root password set" "! grep -q '^root::' /etc/shadow"
-[ -n "$APS" ] && check "Wi-Fi up" "iwinfo | grep -q \"ESSID: \\\"$WIFI_SSID\\\"\""
+wifi_up() { iwinfo | grep -qF "ESSID: \"$WIFI_SSID\""; }
+[ -n "$APS" ] && check "Wi-Fi up" wifi_up
 
 # Host keys last, so the running session isn't disturbed earlier.
 /etc/init.d/dropbear restart

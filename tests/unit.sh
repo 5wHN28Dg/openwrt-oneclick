@@ -136,6 +136,46 @@ grep -v '^LINK_TYPE=' "$P2/config.env" > "$T/nolink" && mv "$T/nolink" "$P2/conf
 printf '%s\n' 4 | ONECLICK_PRIVATE=$P2 timeout 5 "$HERE/setup.sh" 127.0.0.1 1 >"$T/w4.out" 2>&1 || true
 eq "missing link type asked and saved" "$(. "$P2/config.env"; echo "$LINK_TYPE")" adsl
 
+# --- family filtering toggled later (review finding 1) ---------------------------
+. "$P2/config.env"   # family off, lists "hagezi:pro hagezi:tif.mini"
+ADBLOCK_LISTS="hagezi:pro hagezi:tif.mini oisd:big" BANIP_FEEDS="tiktok"
+write_config "$P2/config.env"
+# reconfigure: keep Wi-Fi, keep admin pw, key path, tz, pppoe n, link (keep), family y, redlib, vpn n, mangadex n
+printf '%s\n' "" n n "" "" n "" y "" n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w5.out" 2>&1
+eq "family on later: exit" "$?" 0
+eq "family on later: lists" "$(. "$P2/config.env"; echo "$ADBLOCK_LISTS")" "hagezi:pro hagezi:tif.mini oisd:big hagezi:nsfw hagezi:nosafesearch hagezi:doh-vpn-proxy-bypass"
+eq "family on later: feeds" "$(. "$P2/config.env"; echo "$BANIP_FEEDS")" "tiktok doh vpn"
+printf '%s\n' "" n n "" "" n "" n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w6.out" 2>&1
+eq "family off later: lists" "$(. "$P2/config.env"; echo "$ADBLOCK_LISTS")" "hagezi:pro hagezi:tif.mini oisd:big"
+eq "family off later: feeds" "$(. "$P2/config.env"; echo "$BANIP_FEEDS")" "tiktok"
+
+# --- OpenSSL without passwd -5, e.g. macOS LibreSSL (finding 3) -------------------
+mkdir -p "$T/fakebin"; printf '#!/bin/sh\necho "unknown option -5" >&2; exit 1\n' > "$T/fakebin/openssl"; chmod 755 "$T/fakebin/openssl"
+if PATH="$T/fakebin:/usr/bin:/bin" sh -c '. "$1/lib/laptop.sh"; [ "$(command -v openssl)" = "$2/fakebin/openssl" ] && ! find_openssl' _ "$HERE" "$T"; then
+	ok "openssl without -5 is not used"; else bad "openssl without -5 is not used"; fi
+eq "real openssl found" "$(find_openssl)" openssl
+
+# --- Ctrl-C at a prompt stops the wizard (finding 4) -------------------------------
+mkfifo "$T/in"
+ONECLICK_PRIVATE=$T/priv-int "$HERE/setup.sh" --settings-only <"$T/in" >"$T/int.out" 2>&1 &
+# (a background job ignores SIGINT in a non-interactive shell; TERM uses the same trap)
+pid=$!; exec 9>"$T/in"; sleep 1; kill -TERM $pid; wait $pid; rc=$?; exec 9>&-
+eq "interrupt exits 130" "$rc" 130
+eq "interrupt saves nothing" "$(ls -A "$T/priv-int" 2>/dev/null)" ""
+
+# --- settings validation (finding 12, 10) --------------------------------------------
+(
+	. "$P1/config.env"
+	WIFI_KEY=short; eq "short Wi-Fi key rejected" "$(check_settings | grep -c WIFI_KEY)" 1
+	WIFI_KEY=longenough REDLIB_ALLOW='ok.example $(reboot)'; eq "unsafe Redlib entry rejected" "$(check_settings | grep -c REDLIB_ALLOW)" 1
+	REDLIB_ALLOW=ok.example; eq "valid settings pass" "$(check_settings)" ""
+) | tee "$T/v.res"
+fails=$((fails + $(grep -c '^FAIL' "$T/v.res"))); n=$((n + $(wc -l < "$T/v.res")))
+printf '%s\n' y "X" "short" "short" pw pw "$HOME/.ssh/test_key" UTC n 9 n n n y \
+	| ONECLICK_PRIVATE=$T/priv-short "$HERE/setup.sh" --settings-only >"$T/short.out" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ] && grep -q "WIFI_KEY must be" "$T/short.out" && [ -z "$(ls -A "$T/priv-short" 2>/dev/null)" ]; then ok "wizard refuses a short Wi-Fi key, saves nothing"; else bad "wizard refuses a short Wi-Fi key (rc $rc)"; fi
+
 echo
 echo "$((n - fails))/$n passed"
 [ $fails -eq 0 ]

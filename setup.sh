@@ -13,6 +13,7 @@
 # and deletes the copy (it holds secrets).
 
 set -eu
+exec 3>&2   # the terminal, for questions asked while stderr is redirected
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib/laptop.sh"
 
@@ -26,7 +27,9 @@ PORT=${2:-22}
 PRIV=${ONECLICK_PRIVATE:-$HERE/private}   # override for tests
 CONF=$PRIV/config.env
 STAGE=$(mktemp -d)
-trap 'rm -rf "$STAGE"' EXIT INT TERM
+cleanup() { [ -t 0 ] && stty echo 2>/dev/null; rm -rf "$STAGE"; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 # ------------------------------------------------------------------ settings
 wizard() {
@@ -36,12 +39,14 @@ wizard() {
 	if [ -z "${WIFI_KEY-}" ] || ask_yn "Change the Wi-Fi password?" n; then
 		while ask_secret WIFI_KEY "Wi-Fi password (8+ characters)"; do
 			[ ${#WIFI_KEY} -ge 8 ] && break; say "  Too short."
+			[ -t 0 ] || break   # no terminal: don't eat the next answers; validation reports it
 		done
 	fi
 	WIFI_ENCRYPTION=${WIFI_ENCRYPTION:-sae-mixed}
 	if [ -z "${ROOT_PASSWORD_HASH-}" ] || ask_yn "Change the router admin (root) password?" n; then
+		OPENSSL=$(find_openssl) || { say "Need OpenSSL 1.1.1+ for 'openssl passwd -5' (macOS: brew install openssl@3)."; exit 1; }
 		ask_secret _pw "Router admin password"
-		ROOT_PASSWORD_HASH=$(printf '%s' "$_pw" | openssl passwd -5 -stdin); unset _pw
+		ROOT_PASSWORD_HASH=$(printf '%s' "$_pw" | "$OPENSSL" passwd -5 -stdin); unset _pw
 	fi
 
 	d=${SSH_KEY:-$HOME/.ssh/id_ed25519}
@@ -67,13 +72,16 @@ wizard() {
 	say ""
 	say "Family filtering: safe search on Google/Bing/DuckDuckGo/Brave/Startpage/Yandex,"
 	say "adult and anime-NSFW block lists, and blocking of DNS/VPN tricks that get around them."
+	ADBLOCK_LISTS=${ADBLOCK_LISTS:-hagezi:pro hagezi:tif.mini}
 	if ask_yn "Turn on family filtering?" "$(yn "${FAMILY_FILTER:-1}")"; then
 		FAMILY_FILTER=1
-		ADBLOCK_LISTS=${ADBLOCK_LISTS:-hagezi:pro hagezi:tif.mini hagezi:nsfw hagezi:nosafesearch hagezi:doh-vpn-proxy-bypass}
-		BANIP_FEEDS=${BANIP_FEEDS:-doh vpn}
+		ADBLOCK_LISTS=$(words_with "$ADBLOCK_LISTS" "$FAMILY_LISTS")
+		BANIP_FEEDS=$(words_with "${BANIP_FEEDS-}" "$FAMILY_FEEDS")
 		ask REDLIB_ALLOW "Redlib (Reddit viewer) instances to keep reachable, space separated (Enter = block all)" "${REDLIB_ALLOW-}"
 	else
-		FAMILY_FILTER=0 ADBLOCK_LISTS=${ADBLOCK_LISTS:-hagezi:pro hagezi:tif.mini} BANIP_FEEDS=${BANIP_FEEDS-} REDLIB_ALLOW=
+		FAMILY_FILTER=0 REDLIB_ALLOW=
+		ADBLOCK_LISTS=$(words_without "$ADBLOCK_LISTS" "$FAMILY_LISTS")
+		BANIP_FEEDS=$(words_without "${BANIP_FEEDS-}" "$FAMILY_FEEDS")
 	fi
 
 	say ""
@@ -101,6 +109,14 @@ wizard() {
 	fi
 }
 
+validate() { # stop before saving or using broken settings
+	problems=$(check_settings)
+	[ -z "$problems" ] && return 0
+	say "Settings problems:"; printf '%s\n' "$problems" | sed 's/^/  /' >&2
+	say "Fix them with ./setup.sh --reconfigure (or edit $CONF)."
+	exit 1
+}
+
 if [ -f "$CONF" ]; then
 	. "$CONF"
 	[ -n "$RECONF" ] && wizard
@@ -108,17 +124,13 @@ if [ -f "$CONF" ]; then
 		ask_link_type LINK_TYPE || exit 1
 		write_config "$CONF"; say "Saved the link type in $CONF"
 	fi
-	missing=
-	for k in WIFI_SSID WIFI_KEY ROOT_PASSWORD_HASH SSH_KEY TZ_POSIX LINK_TYPE; do
-		eval "[ -n \"\${$k-}\" ]" || missing="$missing $k"
-	done
-	[ -z "$missing" ] || { say "private/config.env lacks:$missing. Run ./setup.sh --reconfigure"; exit 1; }
-	[ -n "$RECONF" ] && { mkdir -p "$PRIV"; write_config "$CONF"; say "Saved $CONF"; }
+	[ -n "$RECONF" ] && { validate; mkdir -p "$PRIV"; write_config "$CONF"; say "Saved $CONF"; }
 	USED=$CONF
 else
 	say "No private settings yet ($CONF)."
 	ask_yn "Answer a few questions to create them now?" y || exit 1
 	wizard
+	validate
 	if ask_yn "Save these settings in $CONF for next time (kept off git)?" y; then
 		mkdir -p "$PRIV"; chmod 700 "$PRIV"
 		write_config "$CONF"; USED=$CONF; say "Saved $CONF"
@@ -126,7 +138,7 @@ else
 		USED=$STAGE/config.env; write_config "$USED"
 	fi
 fi
-link_params "$LINK_TYPE" >/dev/null || { say "Unknown LINK_TYPE '$LINK_TYPE'. Run ./setup.sh --reconfigure"; exit 1; }
+validate
 [ -n "$ONLY" ] && exit 0
 
 # ------------------------------------------------------------------ connect
@@ -145,9 +157,19 @@ ssh_with() { # known_hosts-file strictness command...
 	ssh -p "$PORT" -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
 		-o UserKnownHostsFile="$f" -o StrictHostKeyChecking="$strict" "root@$HOST" "$@"
 }
-ssh_r() { # 255 = could not connect/authenticate (e.g. other host key); the command never ran
-	s_rc=0; ssh_with "$KNOWN_OLD" yes "$@" 2>/dev/null || s_rc=$?
+# Without saved keys: trust on first use. With saved keys: a different key is
+# only accepted after a person confirms this is a freshly installed router;
+# otherwise settings (passwords, keys) could go to whatever answers at $HOST.
+TRUST_NEW=; [ -s "$KNOWN_OLD" ] || TRUST_NEW=1
+ssh_r() { # 255 = could not connect/authenticate; the command never ran
+	s_rc=0; ssh_with "$KNOWN_OLD" yes "$@" 2>"$STAGE/ssh.err" || s_rc=$?
 	[ $s_rc -eq 255 ] || return $s_rc
+	if [ -z "$TRUST_NEW" ] && grep -q 'Host key verification failed\|HOST IDENTIFICATION HAS CHANGED' "$STAGE/ssh.err"; then
+		say "The router at $HOST has a different SSH key than the one saved in private/host_keys." 2>&3
+		say "That is expected right after a fresh OpenWrt install, and a warning sign otherwise." 2>&3
+		if [ -t 0 ] && ask_yn "Is this a freshly installed router?" n 2>&3; then TRUST_NEW=1; else exit 1; fi
+	fi
+	[ -n "$TRUST_NEW" ] || return 255
 	ssh_with "$KNOWN_NEW" accept-new "$@"
 }
 
@@ -177,9 +199,12 @@ ssh_r 'rm -f /tmp/setup.log /tmp/setup.rc
 	( setsid sh -c "sh /tmp/setup/router/install.sh > /tmp/setup.log 2>&1; echo \$? > /tmp/setup.rc; rm -rf /tmp/setup" </dev/null >/dev/null 2>&1 & )'
 
 # Follow the log. The installer restarts the network and SSH, so reconnect as needed.
-shown=0
+shown=0 started=$(date +%s)
 while :; do
 	sleep 5
+	if [ $(( $(date +%s) - started )) -gt 2400 ]; then
+		say "No result after 40 minutes; check /tmp/setup.log on the router."; exit 1
+	fi
 	chunk=$(ssh_r "awk -v s=$shown 'NR > s' /tmp/setup.log 2>/dev/null; echo \"@@RC=\$(cat /tmp/setup.rc 2>/dev/null)\"" 2>/dev/null) || continue
 	rc=${chunk##*@@RC=}
 	body=$(printf '%s\n' "$chunk" | sed '/^@@RC=/d')

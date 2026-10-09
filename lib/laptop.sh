@@ -26,6 +26,57 @@ link_params() {
 	printf '%s\n' "$LINK_TYPES" | awk -F'|' -v id="$1" '$1 == id { print $3, $4, $5; f = 1 } END { exit !f }'
 }
 
+# Block lists and banIP feeds that belong to family filtering.
+FAMILY_LISTS='hagezi:nsfw hagezi:nosafesearch hagezi:doh-vpn-proxy-bypass'
+FAMILY_FEEDS='doh vpn'
+
+# words_with LIST ADD -> LIST plus the words of ADD it lacks (order kept)
+words_with() {
+	out=$1
+	for w in $2; do case " $out " in *" $w "*) ;; *) out="${out:+$out }$w" ;; esac; done
+	printf '%s\n' "$out"
+}
+
+# words_without LIST REMOVE -> LIST minus the words of REMOVE
+words_without() {
+	out=
+	for w in $1; do case " $2 " in *" $w "*) ;; *) out="${out:+$out }$w" ;; esac; done
+	printf '%s\n' "$out"
+}
+
+# find_openssl -> an openssl that can make SHA-256 crypt hashes (passwd -5).
+# macOS ships LibreSSL without -5; Homebrew's OpenSSL is keg-only.
+find_openssl() {
+	for o in openssl /opt/homebrew/opt/openssl@3/bin/openssl /usr/local/opt/openssl@3/bin/openssl; do
+		command -v "$o" >/dev/null 2>&1 || continue
+		h=$(printf x | "$o" passwd -5 -stdin 2>/dev/null) || continue
+		case $h in '$5$'*) printf '%s\n' "$o"; return 0 ;; esac
+	done
+	return 1
+}
+
+# check_settings -> complaints about required settings, one per line (empty = fine)
+check_settings() {
+	[ -n "${WIFI_SSID-}" ] || echo "WIFI_SSID is empty"
+	_k=${WIFI_KEY-}; [ ${#_k} -ge 8 ] && [ ${#_k} -le 63 ] || echo "WIFI_KEY must be 8-63 characters"
+	case ${ROOT_PASSWORD_HASH-} in '$5$'*|'$6$'*|'$1$'*) ;; *) echo "ROOT_PASSWORD_HASH is not a crypt hash" ;; esac
+	[ -n "${SSH_KEY-}" ] || echo "SSH_KEY is empty"
+	[ -n "${SSH_PUBKEYS-}" ] || echo "SSH_PUBKEYS is empty"
+	[ -n "${TZ_POSIX-}" ] || echo "TZ_POSIX is empty"
+	link_params "${LINK_TYPE-}" >/dev/null || echo "LINK_TYPE '${LINK_TYPE-}' is not one of: $(printf '%s\n' "$LINK_TYPES" | cut -d'|' -f1 | tr '\n' ' ')"
+	if [ "${WAN_PROTO-}" = pppoe ]; then [ -n "${PPPOE_USER-}" ] || echo "PPPOE_USER is empty"; fi
+	for h in ${REDLIB_ALLOW-}; do
+		case $h in *[!A-Za-z0-9.-]*) echo "REDLIB_ALLOW entry '$h' is not a host name" ;; esac
+	done
+	if [ "${ENABLE_VPN-}" = 1 ]; then
+		for k in WG_PRIVATE_KEY WG_PEER_PUBLIC_KEY WG_ENDPOINT_HOST WG_ENDPOINT_PORT; do
+			eval "[ -n \"\${$k-}\" ]" || echo "$k is empty (VPN is on)"
+		done
+		case ${VPN_IFACE:-vpn} in *[!a-z0-9_]*) echo "VPN_IFACE must be lowercase letters, digits or _" ;; esac
+	fi
+	return 0
+}
+
 # shq VALUE -> VALUE single-quoted for sh (safe for any content)
 shq() {
 	printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"

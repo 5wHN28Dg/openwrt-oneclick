@@ -4,7 +4,8 @@
 #
 #   tests/vm.sh [full|minimal|both]     (default: both)
 #
-# full:    every option on, then kids.sh, then setup.sh again (no duplicates)
+# full:    every option on, then kids.sh, setup.sh again (no duplicates), a
+#          different host key (refused), and a re-run with the VPN off
 # minimal: every option off; checks nothing optional was installed
 #
 # Environment:
@@ -134,6 +135,24 @@ scenario_full() {
 	[ "$sqm" = "ethernet|44|84|nat dual-dsthost|" ] && ok "SQM fiber values + NAT fairness: $sqm" || bad "SQM values: $sqm"
 	perms=$(vm_ssh 'stat -c %a / /etc /usr /www 2>/dev/null || ls -ld / /etc /usr /www | cut -c1-10' | tr '\n' ' ')
 	case $perms in *700*|*drwx------*) bad "system directory permissions changed: $perms" ;; *) ok "system directories untouched: $perms" ;; esac
+	[ "$(vm_ssh 'uci show firewall | grep -A8 "name=.testvpn." | grep -c "mtu_fix=.1."')" = 1 ] \
+		&& ok "VPN zone clamps MSS (mtu_fix)" || bad "VPN zone lacks mtu_fix"
+	k=$(vm_ssh "nft list ruleset | grep 'kids time restriction'")
+	case $k in *"ether saddr"*) case $k in *"ip saddr"*) bad "kids rule still needs an IP match" ;; *) ok "kids rule matches by MAC only" ;; esac ;; *) bad "kids rule missing: $k" ;; esac
+
+	# A router that presents a different SSH key than the saved one is refused
+	# when nobody is there to confirm it (settings must not go to an impostor).
+	cp -R "$P" "$W/p-impostor"
+	ssh-keygen -q -t ed25519 -N '' -f "$W/other"
+	cut -d' ' -f1,2 "$W/other.pub" > "$W/p-impostor/host_keys/host_keys.pub"
+	out=$(ONECLICK_PRIVATE=$W/p-impostor timeout 120 "$W/setup.sh" 127.0.0.1 "$PORT" </dev/null 2>&1); rc=$?
+	case $out in *"different SSH key"*) [ $rc -eq 1 ] && ok "different host key refused without confirmation" || bad "host key mismatch: exit $rc" ;; *) bad "host key mismatch not detected (exit $rc)" ;; esac
+
+	# Turning the VPN off on a re-run removes its interface too.
+	sed -i 's/^ENABLE_VPN=.*/ENABLE_VPN='"'"'0'"'"'/' "$P/config.env"
+	run_setup "$P" "$W/full-novpn.log"
+	left=$(vm_ssh 'uci show network | grep -c testvpn; uci show firewall | grep -c "name=.testvpn."' | tr '\n' ' ')
+	[ "$left" = "0 0 " ] && ok "VPN turned off: interface and zone removed" || bad "VPN leftovers after turning it off (network firewall): $left"
 }
 
 scenario_minimal() {
@@ -149,6 +168,8 @@ scenario_minimal() {
 		grep -q safesearch-hosts /etc/crontabs/root && echo "safe-search cron"
 		nft list ruleset | grep -q Block-WireGuard-LAN && echo "vpn-protocol blocks"
 		grep -q "nsfw" /etc/adblock-lean/config && echo "nsfw list"
+		apk info -e bind-dig >/dev/null 2>&1 && echo "bind-dig"
+		apk info -e openssl-util >/dev/null 2>&1 && echo "openssl-util"
 		true')
 	[ -z "$r" ] && ok "nothing optional installed" || bad "optional parts present: $(echo $r)"
 }
