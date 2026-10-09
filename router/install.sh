@@ -20,6 +20,10 @@ on()   { [ "${1:-0}" = 1 ]; }
 
 VPN=${VPN_IFACE:-vpn}
 case $VPN in *[!a-z0-9_]*|'') echo "VPN_IFACE must be lowercase letters, digits or _"; exit 1 ;; esac
+case " lan wan wan6 wan_6 loopback " in *" $VPN "*) echo "VPN_IFACE '$VPN' is reserved"; exit 1 ;; esac
+if [ -n "$VPN" ] && uci -q get "network.$VPN" >/dev/null && [ "$(uci -q get "network.$VPN.setup")" != 1 ]; then
+	echo "VPN_IFACE '$VPN' is an existing interface not made by this tool; pick another name"; exit 1
+fi
 on "${ENABLE_VPN:-0}" || VPN=
 LAN_IP=$(uci get network.lan.ipaddr | cut -d/ -f1)
 
@@ -51,6 +55,12 @@ if [ "${WAN_PROTO:-dhcp}" = pppoe ]; then
 	uci set network.wan.proto=pppoe
 	uci set "network.wan.username=$PPPOE_USER"
 	uci set "network.wan.password=$PPPOE_PASS"
+	uci set network.wan.setup_pppoe=1
+	uci commit network
+	ifup wan
+elif [ "$(uci -q get network.wan.setup_pppoe)" = 1 ]; then   # PPPoE turned off since the last run
+	uci set network.wan.proto=dhcp
+	uci -q delete network.wan.username; uci -q delete network.wan.password; uci -q delete network.wan.setup_pppoe
 	uci commit network
 	ifup wan
 fi
@@ -117,6 +127,10 @@ section() { # NAME FILE -> marked section, if the file has entries
 {
 	[ -f "$PRIV/allowlist.txt" ] && grep -vE '^[[:space:]]*(#|$)' "$PRIV/allowlist.txt"
 	on "${FAMILY_FILTER:-0}" && section safe-otaku "$ROUTER/lists/safe-otaku-allow.txt"
+	# The bypass lists block VPN providers; keep our own VPN's endpoint name resolvable.
+	if [ -n "$VPN" ] && ! echo "$WG_ENDPOINT_HOST" | grep -qE '^[0-9.]+$|:'; then
+		echo "# >>> vpn-endpoint"; echo "$WG_ENDPOINT_HOST"; echo "# <<< vpn-endpoint"
+	fi
 } > /etc/adblock-lean/allowlist
 printf '%s\n' ${REDLIB_ALLOW-} > /etc/redlib-block.allow
 
@@ -127,12 +141,23 @@ uci -q delete banip.global.ban_ifv6
 uci -q delete banip.global.ban_feed
 for f in ${BANIP_FEEDS-}; do uci add_list banip.global.ban_feed="$f"; done
 uci commit banip   # IPv6 coverage is set after the network restart, once IPv6 had time to come up
+MEM_KB=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+if [ "${MEM_KB:-0}" -lt 200000 ]; then   # 128 MB class: small caches, the block lists need the room
+	uci set dnsproxy.cache.size=4194304; uci commit dnsproxy; DNS_CACHE=2000
+else
+	DNS_CACHE=10000
+fi
 pass "copied adblock-lean, banIP, dnsproxy and safe-search files${ENABLE_MANGADEX:+$(on "$ENABLE_MANGADEX" && echo ', MangaDex app')}"
 
 # ---------------------------------------------------------------- access
 step "Access"
 sed -i "s|^root:[^:]*:|root:${ROOT_PASSWORD_HASH}:|" /etc/shadow
-printf '%s\n' "$SSH_PUBKEYS" > /etc/dropbear/authorized_keys
+# Keep keys added by hand; replace the previous key of this tool when it changed.
+touch /etc/dropbear/authorized_keys
+{
+	grep -vxF -e "$SSH_PUBKEYS" ${SSH_PUBKEYS_OLD:+-e "$SSH_PUBKEYS_OLD"} /etc/dropbear/authorized_keys
+	printf '%s\n' "$SSH_PUBKEYS"
+} > /tmp/setup-authkeys && cat /tmp/setup-authkeys > /etc/dropbear/authorized_keys; rm -f /tmp/setup-authkeys
 chmod 600 /etc/dropbear/authorized_keys
 if [ -f "$PRIV/host_keys/dropbear_ed25519_host_key" ]; then
 	for k in "$PRIV"/host_keys/dropbear_*_host_key; do cp "$k" /etc/dropbear/; done
@@ -205,9 +230,16 @@ if [ -n "$VPN" ]; then
 	[ -n "${VPN_ROUTE_SUBNETS-}" ] && policy 'IP ranges through VPN' "$VPN_ROUTE_SUBNETS"
 	uci commit pbr
 	[ -z "${VPN_ROUTE_DOMAINS-}${VPN_ROUTE_SUBNETS-}" ] && info "VPN set up, but no domains or ranges are routed through it"
-	if [ -n "$HAS_V6" ] && ! echo "${WG_ADDRESSES-}" | grep -q ':'; then
-		info "the VPN has no IPv6 address: IPv6 traffic to the VPN domains goes direct"
+	# IPv6 to the VPN domains must not go around the VPN: route it through the
+	# VPN when the VPN has IPv6, otherwise answer their AAAA queries with ::
+	# (no address) so devices use IPv4, which pbr sends through the VPN.
+	if echo "${WG_ADDRESSES-}" | grep -q ':'; then
+		uci set pbr.config.ipv6_enabled=1
+	else
+		uci set pbr.config.ipv6_enabled=0
+		for d in ${VPN_ROUTE_DOMAINS-}; do echo "/$d/::"; done > /etc/oneclick-vpn-aaaa
 	fi
+	uci commit pbr
 	pass "WireGuard $VPN to $WG_ENDPOINT_HOST; PBR: ${VPN_ROUTE_DOMAINS:-no domains}${VPN_ROUTE_SUBNETS:+ + IP ranges}"
 fi
 
@@ -290,7 +322,7 @@ pass "dnsproxy answers on 127.0.0.1:5354 (Cloudflare h3, NextDNS, Quad9)"
 step "dnsmasq"
 for s in $(uci -q show dhcp | sed -n "s/^dhcp\.\([^.]*\)\.setup='1'$/\1/p" | sort -r); do uci delete "dhcp.$s"; done
 uci batch >/dev/null <<-EOF
-	set dhcp.@dnsmasq[0].cachesize='10000'
+	set dhcp.@dnsmasq[0].cachesize='$DNS_CACHE'
 	set dhcp.@dnsmasq[0].noresolv='1'
 	set dhcp.@dnsmasq[0].min_cache_ttl='3600'
 	set dhcp.@dnsmasq[0].max_cache_ttl='86400'
@@ -302,6 +334,16 @@ uci batch >/dev/null <<-EOF
 	add_list dhcp.@dnsmasq[0].addnmount='/var/run/adblock-lean/abl-blocklist.gz'
 	add_list dhcp.@dnsmasq[0].addnmount='/var/run/pbr.dnsmasq'
 EOF
+# AAAA suppression for VPN domains: drop what an earlier run added, add the current set.
+if [ -f /etc/oneclick-vpn-aaaa.applied ]; then
+	while read -r a; do uci -q del_list "dhcp.@dnsmasq[0].address=$a"; done < /etc/oneclick-vpn-aaaa.applied
+	rm -f /etc/oneclick-vpn-aaaa.applied
+fi
+if [ -n "$VPN" ] && [ -s /etc/oneclick-vpn-aaaa ]; then
+	while read -r a; do uci add_list "dhcp.@dnsmasq[0].address=$a"; done < /etc/oneclick-vpn-aaaa
+	mv /etc/oneclick-vpn-aaaa /etc/oneclick-vpn-aaaa.applied
+fi
+rm -f /etc/oneclick-vpn-aaaa
 domain() { # name ip
 	uci batch >/dev/null <<-EOF
 		add dhcp domain
@@ -315,19 +357,26 @@ if on "${FAMILY_FILTER:-0}"; then
 fi
 on "${ENABLE_MANGADEX:-0}" && domain manga.lan "$LAN_IP"
 uci commit dhcp
+on "${FAMILY_FILTER:-0}" || rm -f /tmp/hosts/safesearch
 /etc/init.d/dnsmasq restart >/dev/null 2>&1
 if on "${FAMILY_FILTER:-0}"; then
 	/usr/sbin/safesearch-hosts
-	pass "dnsmasq forwards to dnsproxy; safe search pinned (Google, Bing, DuckDuckGo, Startpage, Brave, Yandex)"
+	pass "dnsmasq forwards to dnsproxy; safe search pinned (Google in all $(wc -l < /etc/safesearch/google.domains) country domains, Bing, DuckDuckGo, Startpage, Brave, Yandex)"
 else
-	rm -f /tmp/hosts/safesearch
 	pass "dnsmasq forwards to dnsproxy"
 fi
 
 # ---------------------------------------------------------------- MangaDex app
+if ! on "${ENABLE_MANGADEX:-0}"; then   # turned off since an earlier run: remove it
+	rm -rf /www/mangadex-safe /www/cgi-bin/md
+	sed -i '/safe-otaku: manga.lan/d' /www/index.html
+	if [ "$(uci -q get uhttpd.main.setup_maxreq)" = 1 ]; then
+		uci set uhttpd.main.max_requests=3; uci -q delete uhttpd.main.setup_maxreq; uci commit uhttpd
+	fi
+fi
 if on "${ENABLE_MANGADEX:-0}"; then
 	step "MangaDex app"
-	uci set uhttpd.main.max_requests='6'; uci commit uhttpd
+	uci set uhttpd.main.max_requests='6'; uci set uhttpd.main.setup_maxreq=1; uci commit uhttpd
 	grep -q 'safe-otaku: manga.lan' /www/index.html || sed -i 's|<head>|<head>\n\t\t<script>/* safe-otaku: manga.lan opens the MangaDex safe app */ if (location.hostname === "manga.lan") location.replace("/mangadex-safe/");</script>|' /www/index.html
 	pass "MangaDex reader at http://manga.lan (uhttpd max_requests 6)"
 fi
@@ -346,7 +395,9 @@ else
 		uci set "wireless.$ap.ocv=0"
 		uci set "wireless.$radio.disabled=0"
 		uci set "wireless.$radio.cell_density=0"
+		uci set "wireless.$radio.country=$WIFI_COUNTRY"
 		case "$(uci get "wireless.$radio.band")" in
+			6g) uci set "wireless.$ap.encryption=sae" ;;   # 6 GHz allows WPA3 only
 			2g) uci set "wireless.$radio.channel=auto"; uci set "wireless.$radio.htmode=HT20" ;;
 			5g) iwinfo "$(uci -q get "wireless.$radio.phy" || echo "$radio")" htmodelist 2>/dev/null | grep -qw HE80 \
 					&& uci set "wireless.$radio.htmode=HE80" ;;
@@ -403,7 +454,8 @@ NAT=; [ -n "$HAS_V4" ] && NAT="nat "
 if [ "${DOWN:-0}" -gt 1000 ] && [ "${UP:-0}" -gt 1000 ]; then
 	RATE_DOWN=$((DOWN * 90 / 100)) RATE_UP=$((UP * 90 / 100)) SQM_OK=1
 	SQM_MSG="SQM measured ${DOWN} down / ${UP} up kbit/s, shaping at 90%: $RATE_DOWN / $RATE_UP kbit/s"
-elif [ -n "${SQM_FALLBACK_DOWN-}" ] && [ -n "${SQM_FALLBACK_UP-}" ]; then
+elif [ -n "${SQM_FALLBACK_DOWN-}" ] && [ -n "${SQM_FALLBACK_UP-}" ] \
+	&& ! echo "$SQM_FALLBACK_DOWN$SQM_FALLBACK_UP" | grep -q '[^0-9]'; then
 	RATE_DOWN=$SQM_FALLBACK_DOWN RATE_UP=$SQM_FALLBACK_UP SQM_OK=
 	codes=$(sort -u /tmp/setup-speed.codes 2>/dev/null | tr '\n' ' '); codes=${codes:-none}
 	SQM_MSG="SQM speed test failed (down=${DOWN:-0} up=${UP:-0} kbit/s, Cloudflare HTTP codes: $codes); using saved rates $RATE_DOWN / $RATE_UP kbit/s"
@@ -454,8 +506,17 @@ i=0; until online4 || online6 || [ $i -ge 30 ]; do sleep 1; i=$((i + 1)); done
 # IPv6 (RA, DHCPv6-PD) often comes up some seconds after IPv4: give it time, then decide.
 i=0; until has_v6 || [ $i -ge 20 ]; do sleep 1; i=$((i + 1)); done
 HAS_V6=; has_v6 && HAS_V6=1
+V6_IF=
+for i in wan6 wan_6 wan; do
+	ifstatus "$i" 2>/dev/null | jsonfilter -e '@.route[*].target' 2>/dev/null | grep -qx '::' && { V6_IF=$i; break; }
+done
 uci -q delete banip.global.ban_ifv6
-if [ -n "$HAS_V6" ]; then uci set banip.global.ban_protov6=1; uci add_list banip.global.ban_ifv6=wan6; else uci set banip.global.ban_protov6=0; fi
+if [ -n "$HAS_V6" ] && [ -n "$V6_IF" ]; then
+	uci set banip.global.ban_protov6=1; uci add_list banip.global.ban_ifv6="$V6_IF"
+	[ -n "$VPN" ] && { uci set pbr.config.uplink_interface6="$V6_IF"; uci commit pbr; }
+else
+	uci set banip.global.ban_protov6=0
+fi
 uci commit banip
 info "after restart: IPv6 ${HAS_V6:+usable (banIP covers IPv6)}${HAS_V6:-not usable}"
 /etc/init.d/firewall restart >/dev/null 2>&1
@@ -528,8 +589,8 @@ fi
 check "banIP running" "/etc/init.d/banip status 2>&1 | grep -qi 'status.*active'"
 [ -n "$RATE_DOWN" ] && check "SQM cake active on $WAN_DEV" "tc qdisc show dev $WAN_DEV | grep -q cake"
 check "root password set" "! grep -q '^root::' /etc/shadow"
-wifi_up() { iwinfo | grep -qF "ESSID: \"$WIFI_SSID\""; }
-[ -n "$APS" ] && check "Wi-Fi up" wifi_up
+wifi_up() { [ "$(iwinfo | grep -cF "ESSID: \"$WIFI_SSID\"")" -ge "$(echo $APS | wc -w)" ]; }
+[ -n "$APS" ] && check "Wi-Fi up on all $(echo $APS | wc -w) radios" wifi_up
 
 # Host keys last, so the running session isn't disturbed earlier.
 /etc/init.d/dropbear restart

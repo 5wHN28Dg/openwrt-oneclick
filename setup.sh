@@ -50,15 +50,22 @@ wizard() {
 	fi
 
 	d=${SSH_KEY:-$HOME/.ssh/id_ed25519}
+	_prev_key=${SSH_KEY-} _prev_pub=${SSH_PUBKEYS-}
 	ask SSH_KEY "SSH key this computer logs in with" "$d"
 	if [ ! -f "$SSH_KEY" ]; then
 		ask_yn "$SSH_KEY doesn't exist. Create it?" y || { say "Need an SSH key."; exit 1; }
 		ssh-keygen -q -t ed25519 -N '' -C openwrt-oneclick -f "$SSH_KEY"
 	fi
 	SSH_PUBKEYS=$(cat "$SSH_KEY.pub")
+	# A changed key: log in with the old one until the router has the new one.
+	if [ -n "$_prev_key" ] && [ "$_prev_pub" != "$SSH_PUBKEYS" ]; then
+		SSH_KEY_OLD=$_prev_key SSH_PUBKEYS_OLD=$_prev_pub
+	fi
 
 	ask TZ_NAME "Time zone" "${TZ_NAME:-$(laptop_tz)}"
 	TZ_POSIX=$(posix_tz "$TZ_NAME") || { say "Unknown time zone $TZ_NAME, using UTC."; TZ_NAME=UTC TZ_POSIX=UTC0; }
+	ask WIFI_COUNTRY "Wi-Fi country code (sets legal channels and power)" "${WIFI_COUNTRY:-$(country_for_tz "$TZ_NAME")}"
+	WIFI_COUNTRY=$(printf '%s' "$WIFI_COUNTRY" | tr 'a-z' 'A-Z')
 
 	if ask_yn "Does your provider need a PPPoE username and password?" "$( [ "${WAN_PROTO-}" = pppoe ] && echo y || echo n)"; then
 		WAN_PROTO=pppoe
@@ -124,6 +131,11 @@ if [ -f "$CONF" ]; then
 		ask_link_type LINK_TYPE || exit 1
 		write_config "$CONF"; say "Saved the link type in $CONF"
 	fi
+	if [ -z "${WIFI_COUNTRY-}" ]; then
+		ask WIFI_COUNTRY "Wi-Fi country code (sets legal channels and power)" "$(country_for_tz "${TZ_NAME-}")"
+		WIFI_COUNTRY=$(printf '%s' "$WIFI_COUNTRY" | tr 'a-z' 'A-Z')
+		write_config "$CONF"; say "Saved the Wi-Fi country in $CONF"
+	fi
 	[ -n "$RECONF" ] && { validate; mkdir -p "$PRIV"; write_config "$CONF"; say "Saved $CONF"; }
 	USED=$CONF
 else
@@ -154,7 +166,7 @@ target=$HOST; [ "$PORT" = 22 ] || target="[$HOST]:$PORT"
 
 ssh_with() { # known_hosts-file strictness command...
 	f=$1 strict=$2; shift 2
-	ssh -p "$PORT" -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
+	ssh -p "$PORT" -i "$KEY" ${SSH_KEY_OLD:+-i "$SSH_KEY_OLD"} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
 		-o UserKnownHostsFile="$f" -o StrictHostKeyChecking="$strict" "root@$HOST" "$@"
 }
 # Without saved keys: trust on first use. With saved keys: a different key is
@@ -164,7 +176,7 @@ TRUST_NEW=; [ -s "$KNOWN_OLD" ] || TRUST_NEW=1
 ssh_r() { # 255 = could not connect/authenticate; the command never ran
 	s_rc=0; ssh_with "$KNOWN_OLD" yes "$@" 2>"$STAGE/ssh.err" || s_rc=$?
 	[ $s_rc -eq 255 ] || return $s_rc
-	if [ -z "$TRUST_NEW" ] && grep -q 'Host key verification failed\|HOST IDENTIFICATION HAS CHANGED' "$STAGE/ssh.err"; then
+	if [ -z "$TRUST_NEW" ] && grep -qE 'Host key verification failed|HOST IDENTIFICATION HAS CHANGED' "$STAGE/ssh.err"; then
 		say "The router at $HOST has a different SSH key than the one saved in private/host_keys." 2>&3
 		say "That is expected right after a fresh OpenWrt install, and a warning sign otherwise." 2>&3
 		if [ -t 0 ] && ask_yn "Is this a freshly installed router?" n 2>&3; then TRUST_NEW=1; else exit 1; fi
@@ -225,6 +237,11 @@ if [ "$USED" = "$CONF" ] && [ ! -f "$PRIV/host_keys/host_keys.pub" ] && [ "$rc" 
 	else
 		rm -rf "$PRIV/host_keys"
 	fi
+fi
+
+if [ -n "${SSH_KEY_OLD-}" ] && [ "$USED" = "$CONF" ] && [ "$rc" != 1 ]; then
+	SSH_KEY_OLD= SSH_PUBKEYS_OLD=; unset SSH_KEY_OLD SSH_PUBKEYS_OLD
+	write_config "$CONF"
 fi
 
 case $rc in

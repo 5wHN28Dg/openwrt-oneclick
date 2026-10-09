@@ -2,7 +2,8 @@
 # effects so tests/unit.sh can exercise them without a router.
 
 # Every setting setup.sh stores in private/config.env, in file order.
-CONFIG_KEYS='WIFI_SSID WIFI_KEY WIFI_ENCRYPTION ROOT_PASSWORD_HASH SSH_KEY SSH_PUBKEYS
+CONFIG_KEYS='WIFI_SSID WIFI_KEY WIFI_ENCRYPTION WIFI_COUNTRY ROOT_PASSWORD_HASH SSH_KEY SSH_PUBKEYS
+SSH_KEY_OLD SSH_PUBKEYS_OLD
 TZ_NAME TZ_POSIX WAN_PROTO PPPOE_USER PPPOE_PASS LINK_TYPE SQM_FALLBACK_DOWN SQM_FALLBACK_UP
 FAMILY_FILTER ADBLOCK_LISTS BANIP_FEEDS REDLIB_ALLOW
 ENABLE_VPN VPN_IFACE WG_PRIVATE_KEY WG_ADDRESSES WG_DNS WG_PEER_PUBLIC_KEY WG_PRESHARED_KEY
@@ -55,10 +56,22 @@ find_openssl() {
 	return 1
 }
 
+# bytes VALUE -> length in bytes (not characters: Wi-Fi limits are in bytes)
+bytes() { printf '%s' "$1" | wc -c | tr -d ' '; }
+
+# country_for_tz ZONE -> ISO country code from the zone database, if known
+country_for_tz() {
+	awk -F'\t' -v z="$1" '$3 == z { print $1; exit }' "${ZONEINFO:-/usr/share/zoneinfo}/zone.tab" 2>/dev/null
+}
+
+# Interface names the VPN must never take (they would replace core interfaces).
+RESERVED_IFACES='lan wan wan6 wan_6 loopback'
+
 # check_settings -> complaints about required settings, one per line (empty = fine)
 check_settings() {
-	[ -n "${WIFI_SSID-}" ] || echo "WIFI_SSID is empty"
-	_k=${WIFI_KEY-}; [ ${#_k} -ge 8 ] && [ ${#_k} -le 63 ] || echo "WIFI_KEY must be 8-63 characters"
+	_b=$(bytes "${WIFI_SSID-}"); [ "$_b" -ge 1 ] && [ "$_b" -le 32 ] || echo "WIFI_SSID must be 1-32 bytes"
+	_b=$(bytes "${WIFI_KEY-}"); [ "$_b" -ge 8 ] && [ "$_b" -le 63 ] || echo "WIFI_KEY must be 8-63 bytes"
+	case ${WIFI_COUNTRY-} in [A-Z][A-Z]) ;; *) echo "WIFI_COUNTRY must be a two-letter country code (e.g. DE)" ;; esac
 	case ${ROOT_PASSWORD_HASH-} in '$5$'*|'$6$'*|'$1$'*) ;; *) echo "ROOT_PASSWORD_HASH is not a crypt hash" ;; esac
 	[ -n "${SSH_KEY-}" ] || echo "SSH_KEY is empty"
 	[ -n "${SSH_PUBKEYS-}" ] || echo "SSH_PUBKEYS is empty"
@@ -72,8 +85,22 @@ check_settings() {
 		for k in WG_PRIVATE_KEY WG_PEER_PUBLIC_KEY WG_ENDPOINT_HOST WG_ENDPOINT_PORT; do
 			eval "[ -n \"\${$k-}\" ]" || echo "$k is empty (VPN is on)"
 		done
-		case ${VPN_IFACE:-vpn} in *[!a-z0-9_]*) echo "VPN_IFACE must be lowercase letters, digits or _" ;; esac
+		case ${VPN_IFACE:-vpn} in *[!a-z0-9_]*|[!a-z]*) echo "VPN_IFACE must start with a letter and use lowercase letters, digits or _" ;; esac
+		case " $RESERVED_IFACES " in *" ${VPN_IFACE:-vpn} "*) echo "VPN_IFACE '${VPN_IFACE-}' is reserved for the router's own interfaces" ;; esac
+		case ${WG_ENDPOINT_PORT-} in ''|*[!0-9]*) echo "WG_ENDPOINT_PORT must be a number" ;; *)
+			[ "$WG_ENDPOINT_PORT" -ge 1 ] && [ "$WG_ENDPOINT_PORT" -le 65535 ] || echo "WG_ENDPOINT_PORT must be 1-65535" ;; esac
+		case ${WG_ENDPOINT_HOST-} in *[!A-Za-z0-9.:-]*) echo "WG_ENDPOINT_HOST is not a host name or address" ;; esac
+		for h in ${VPN_ROUTE_DOMAINS-}; do
+			case $h in *[!A-Za-z0-9.-]*) echo "VPN_ROUTE_DOMAINS entry '$h' is not a domain" ;; esac
+		done
+		case ${VPN_ROUTE_SUBNETS-} in *[!0-9A-Fa-f:./\ ]*) echo "VPN_ROUTE_SUBNETS must be IP ranges like 91.108.4.0/22" ;; esac
 	fi
+	for k in SQM_FALLBACK_DOWN SQM_FALLBACK_UP; do
+		eval "_v=\${$k-}"; case $_v in *[!0-9]*) echo "$k must be a number (kbit/s)" ;; esac
+	done
+	case ${ULA_PREFIX-} in *[!0-9A-Fa-f:/]*) echo "ULA_PREFIX must look like fdxx:xxxx:xxxx::/48" ;; esac
+	case ${BANIP_FEEDS-} in *[!a-z0-9_\ -]*) echo "BANIP_FEEDS has unexpected characters" ;; esac
+	case ${ADBLOCK_LISTS-} in *[!A-Za-z0-9:._/\ -]*) echo "ADBLOCK_LISTS has unexpected characters" ;; esac
 	return 0
 }
 
@@ -98,6 +125,7 @@ write_config() {
 
 # posix_tz ZONE -> POSIX TZ string from the zoneinfo footer (e.g. "<+03>-3")
 posix_tz() {
+	case $1 in ''|/*|*..*) return 1 ;; esac
 	f=${ZONEINFO:-/usr/share/zoneinfo}/$1
 	[ -f "$f" ] || return 1
 	tail -n 1 "$f" | grep -E '^[A-Za-z<]' || return 1
@@ -115,7 +143,7 @@ laptop_tz() {
 parse_wg_conf() {
 	awk -F '=' '
 		function trim(s) { gsub(/^[ \t]+|[ \t\r]+$/, "", s); return s }
-		function val() { v = $0; sub(/^[^=]*=/, "", v); return trim(v) }
+		function val() { v = $0; sub(/^[^=]*=/, "", v); sub(/[ \t]+#.*$/, "", v); return trim(v) }
 		function add(k, v) { gsub(/[ \t]*,[ \t]*/, " ", v); out[k] = (out[k] == "" ? v : out[k] " " v) }
 		/^[ \t]*\[Interface\]/ { sec = "i"; next }
 		/^[ \t]*\[Peer\]/      { sec = "p"; peers++; next }
@@ -132,8 +160,9 @@ parse_wg_conf() {
 				if (k == "persistentkeepalive") out["WG_KEEPALIVE"] = val()
 				if (k == "endpoint") {
 					e = val()
-					if (e ~ /^\[/) { h = e; sub(/^\[/, "", h); sub(/\].*/, "", h); p = e; sub(/.*\]:/, "", p) }
-					else { h = e; sub(/:[^:]*$/, "", h); p = e; sub(/.*:/, "", p) }
+					if (e ~ /^\[/) { h = e; sub(/^\[/, "", h); sub(/\].*/, "", h); p = e; if (p ~ /\]:/) sub(/.*\]:/, "", p); else p = "" }
+					else if (e ~ /:/) { h = e; sub(/:[^:]*$/, "", h); p = e; sub(/.*:/, "", p) }
+					else { h = e; p = "" }
 					out["WG_ENDPOINT_HOST"] = h; out["WG_ENDPOINT_PORT"] = p
 				}
 			}

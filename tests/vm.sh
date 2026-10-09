@@ -75,7 +75,7 @@ make_private() { # dir full|minimal
 		ROOT_PASSWORD_HASH=$(printf test | openssl passwd -5 -stdin)
 		SSH_KEY=$W/key SSH_PUBKEYS=$(cat "$W/key.pub")
 		TZ_NAME=Europe/Berlin TZ_POSIX=$(posix_tz Europe/Berlin)
-		WAN_PROTO=dhcp LINK_TYPE=fiber SQM_FALLBACK_DOWN=100000 SQM_FALLBACK_UP=20000
+		WAN_PROTO=dhcp LINK_TYPE=fiber SQM_FALLBACK_DOWN=100000 SQM_FALLBACK_UP=20000 WIFI_COUNTRY=DE
 		if [ "$2" = full ]; then
 			FAMILY_FILTER=1 BANIP_FEEDS="doh vpn" REDLIB_ALLOW=safereddit.com
 			ADBLOCK_LISTS="hagezi:pro hagezi:tif.mini hagezi:nsfw hagezi:nosafesearch hagezi:doh-vpn-proxy-bypass"
@@ -96,7 +96,7 @@ make_private() { # dir full|minimal
 }
 
 vm_ssh() { # uses the host keys setup.sh saved, or accepts a fresh one
-	ssh -p "$PORT" -i "$W/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
+	ssh -p "$PORT" -i "${VM_KEY:-$W/key}" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
 		-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR root@127.0.0.1 "$@"
 }
 
@@ -121,7 +121,13 @@ scenario_full() {
 	run_setup "$P" "$W/full.log"
 	r=$(ONECLICK_PRIVATE=$P "$W/kids.sh" 127.0.0.1 "$PORT" 2>&1)
 	case $r in *PASS*) ok "kids.sh: $r" ;; *) bad "kids.sh: $r" ;; esac
+	r=$(ONECLICK_PRIVATE=$P "$W/kids.sh" --remove 127.0.0.1 "$PORT" 2>&1)
+	[ "$(vm_ssh 'uci show firewall | grep -c "kids time restriction"')" = 0 ] && ok "kids.sh --remove: $r" || bad "kids.sh --remove left rules: $r"
 	ONECLICK_PRIVATE=$P "$W/kids.sh" 127.0.0.1 "$PORT" >/dev/null 2>&1
+	g=$(vm_ssh 'nslookup -type=a www.google.de 127.0.0.1 | awk "/^Address: /{print \$2}" | tail -1')
+	[ "$g" = 216.239.38.120 ] && ok "safe search on a Google country domain (www.google.de)" || bad "www.google.de -> $g"
+	a=$(vm_ssh 'nslookup -type=aaaa example.com 127.0.0.1 | awk "/^Address: /{print \$2}" | tail -1')
+	[ "$a" = "::" ] && ok "VPN domain has no IPv6 answer (VPN has no IPv6)" || bad "VPN domain AAAA: $a"
 	run_setup "$P" "$W/full-rerun.log"
 	counts=$(vm_ssh 'printf "%s %s %s %s %s %s\n" \
 		"$(uci show firewall | grep -c "name=.testvpn.")" \
@@ -148,15 +154,34 @@ scenario_full() {
 	out=$(ONECLICK_PRIVATE=$W/p-impostor timeout 120 "$W/setup.sh" 127.0.0.1 "$PORT" </dev/null 2>&1); rc=$?
 	case $out in *"different SSH key"*) [ $rc -eq 1 ] && ok "different host key refused without confirmation" || bad "host key mismatch: exit $rc" ;; *) bad "host key mismatch not detected (exit $rc)" ;; esac
 
-	# Turning the VPN off on a re-run removes its interface too.
-	sed -i 's/^ENABLE_VPN=.*/ENABLE_VPN='"'"'0'"'"'/' "$P/config.env"
-	run_setup "$P" "$W/full-novpn.log"
-	left=$(vm_ssh 'uci show network | grep -c testvpn; uci show firewall | grep -c "name=.testvpn."' | tr '\n' ' ')
-	[ "$left" = "0 0 " ] && ok "VPN turned off: interface and zone removed" || bad "VPN leftovers after turning it off (network firewall): $left"
+	# Re-run with VPN and MangaDex off, PPPoE switched off (simulated: the
+	# PPPoE marker set on a DHCP line), a new SSH key, and a key added by hand.
+	vm_ssh 'uci set network.wan.setup_pppoe=1; uci commit network; echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy3handaddedkeyhandaddedkeyhandadd hand" >> /etc/dropbear/authorized_keys'
+	ssh-keygen -q -t ed25519 -N '' -f "$W/key2"
+	. "$P/config.env"
+	(
+		. "$P/config.env"
+		ENABLE_VPN=0 ENABLE_MANGADEX=0
+		SSH_KEY_OLD=$SSH_KEY SSH_PUBKEYS_OLD=$SSH_PUBKEYS SSH_KEY=$W/key2 SSH_PUBKEYS=$(cat "$W/key2.pub")
+		write_config "$P/config.env"
+	)
+	run_setup "$P" "$W/full-off.log"
+	VM_KEY=$W/key2   # the router now only knows the new key
+	left=$(vm_ssh 'uci show network | grep -c testvpn; uci show firewall | grep -c "name=.testvpn."; uci -q get dhcp.@dnsmasq[0].address | grep -c "::"' | tr '\n' ' ')
+	[ "$left" = "0 0 0 " ] && ok "VPN turned off: interface, zone and IPv6 suppression removed" || bad "VPN leftovers (network firewall aaaa): $left"
+	oldk=$(cut -d' ' -f2 "$W/key.pub")
+	m=$(ssh -p "$PORT" -i "$W/key2" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR root@127.0.0.1 "
+		[ -e /www/mangadex-safe ] && echo app; grep -q 'safe-otaku: manga.lan' /www/index.html && echo redirect
+		echo maxreq=\$(uci get uhttpd.main.max_requests) wan=\$(uci get network.wan.proto)
+		grep -c handaddedkey /etc/dropbear/authorized_keys; grep -cF '$oldk' /etc/dropbear/authorized_keys" 2>&1 | tr '\n' ' ')
+	[ "$m" = "maxreq=3 wan=dhcp 1 0 " ] && ok "MangaDex removed, PPPoE back to DHCP, new key works, old key gone, hand-added key kept" \
+		|| bad "after turning things off (expect 'maxreq=3 wan=dhcp 1 0'): $m"
+	[ -z "$(. "$P/config.env"; echo "${SSH_KEY_OLD-}")" ] && ok "old SSH key dropped from settings after the run" || bad "SSH_KEY_OLD still saved"
 }
 
 scenario_minimal() {
 	echo "== minimal: every option off"
+	VM_KEY=
 
 	start_vm; P=$W/p-min; make_private "$P" minimal
 	run_setup "$P" "$W/minimal.log"

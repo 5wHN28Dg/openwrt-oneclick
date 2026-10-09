@@ -5,6 +5,7 @@
 #
 #   ./kids.sh                  # router at 192.168.1.1
 #   ./kids.sh HOST [PORT]
+#   ./kids.sh --remove [HOST [PORT]]   # take the kids' rules off the router
 #
 # Devices and times live in private/kids.conf; if it doesn't exist yet you are
 # asked for them and can save them.
@@ -12,6 +13,7 @@
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib/laptop.sh"
+REMOVE=; [ "${1-}" = --remove ] && { REMOVE=1; shift; }
 HOST=${1:-192.168.1.1}
 PORT=${2:-22}
 PRIV=${ONECLICK_PRIVATE:-$HERE/private}   # override for tests
@@ -24,7 +26,9 @@ valid_ip()  { printf '%s' "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
 valid_name() { printf '%s' "$1" | grep -qE '^[A-Za-z0-9._-]{1,32}$'; }
 valid_hm()  { printf '%s' "$1" | grep -qE '^([01][0-9]|2[0-3]):[0-5][0-9]$'; }
 
-if [ ! -f "$KIDS" ]; then
+if [ -n "$REMOVE" ]; then
+	DEVICES= CUTOFF_START= CUTOFF_STOP=
+elif [ ! -f "$KIDS" ]; then
 	say "No kids' devices saved yet ($KIDS)."
 	ask_yn "Enter them now?" y || exit 1
 	DEVICES=
@@ -55,6 +59,24 @@ else
 	. "$KIDS"
 fi
 
+# Never send an empty or broken list: a cut-off rule without devices would
+# switch off every device on the LAN.
+if [ -z "$REMOVE" ]; then
+	rows=0
+	while IFS='|' read -r name mac ip; do
+		[ -z "$name$mac$ip" ] && continue
+		valid_name "$name" && valid_mac "$mac" && valid_ip "$ip" \
+			|| { say "kids.conf: bad device line '$name|$mac|$ip' (name|aa:bb:cc:dd:ee:ff|IPv4)."; exit 1; }
+		rows=$((rows + 1))
+	done <<-ROWS
+	$DEVICES
+	ROWS
+	[ "$rows" -ge 1 ] || { say "kids.conf has no devices. Use ./kids.sh --remove to take the rules off."; exit 1; }
+	for t in "$CUTOFF_START" "$CUTOFF_STOP"; do
+		valid_hm "${t%:00}" || { say "kids.conf: bad time '$t' (HH:MM:00)."; exit 1; }
+	done
+fi
+
 KNOWN=$(mktemp); trap 'rm -f "$KNOWN"' EXIT
 target=$HOST; [ "$PORT" = 22 ] || target="[$HOST]:$PORT"
 [ -f "$PRIV/host_keys/host_keys.pub" ] && sed "s|^|$target |" "$PRIV/host_keys/host_keys.pub" > "$KNOWN"
@@ -62,11 +84,16 @@ STRICT=yes; [ -s "$KNOWN" ] || STRICT=accept-new
 
 ssh -p "$PORT" -i "$SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
 	-o UserKnownHostsFile="$KNOWN" -o StrictHostKeyChecking="$STRICT" "root@$HOST" \
-	"DEVICES=$(shq "$DEVICES") START=$(shq "$CUTOFF_START") STOP=$(shq "$CUTOFF_STOP") sh -s" <<'EOF'
+	"REMOVE=$(shq "$REMOVE") DEVICES=$(shq "$DEVICES") START=$(shq "$CUTOFF_START") STOP=$(shq "$CUTOFF_STOP") sh -s" <<'EOF'
 set -eu
 for cfg in dhcp firewall; do
 	for s in $(uci -q show $cfg | sed -n "s/^$cfg\.\([^.]*\)\.kids='1'$/\1/p" | sort -r); do uci delete "$cfg.$s"; done
 done
+if [ -n "$REMOVE" ] || [ -z "$(printf '%s' "$DEVICES" | tr -d ' \n')" ]; then
+	uci commit dhcp; uci commit firewall
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1; /etc/init.d/firewall reload >/dev/null 2>&1
+	echo "PASS  kids: rules removed"; exit 0
+fi
 uci batch >/dev/null <<-B
 	add firewall rule
 	set firewall.@rule[-1].kids='1'

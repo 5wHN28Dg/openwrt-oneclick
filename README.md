@@ -31,18 +31,20 @@ Always:
 | Ad and tracker blocking | [adblock-lean](https://github.com/lynxthecat/adblock-lean) 0.8.1 (bundled) with Hagezi Pro and Threat Intelligence (mini), plus your own list. |
 | banIP | Blocks incoming scans and brute force on the WAN; extra feeds from your settings. |
 | SQM (bufferbloat) | Measures your line (Cloudflare, 4 streams, 10 s each way) and shapes at 90% with cake, following the [OpenWrt SQM guide](https://openwrt.org/docs/guide-user/network/traffic-shaping/sqm). Link-layer values come from the link type you pick. Per-device fairness (`dual-srchost`/`dual-dsthost`), plus cake's `nat` lookup only when the router does IPv4 NAT. |
-| System | Your admin password, SSH key login, time zone, NTP servers by IP address (works before DNS does), packet steering on all CPUs, Wi-Fi name and password on every radio. |
+| System | Your admin password, SSH key login (keys you added yourself are kept), time zone, NTP servers by IP address (works before DNS does), packet steering on all CPUs, Wi-Fi name, password and country on every radio (WPA3-only on 6 GHz). On routers with less than about 200 MB of RAM the DNS caches are kept small. |
 
 Optional (asked on the first run):
 
 | Option | What |
 |---|---|
-| Family filtering | Safe search forced on Google, Bing, DuckDuckGo, Brave, Startpage and Yandex (refreshed every 30 minutes); Hagezi NSFW, "no safe search" and DoH/VPN/proxy bypass lists; anime/manga NSFW sites from [safe-otaku](https://github.com/5wHN28Dg/safe-otaku); every [listed Redlib instance](https://github.com/redlib-org/redlib-instances) except the ones you allow (refreshed daily); DoT and common VPN protocols blocked from the LAN; banIP `doh` and `vpn` feeds. |
-| VPN for chosen sites | Any WireGuard provider (Proton VPN, Mullvad, ...): give it the provider's `.conf` file. Only the domains and IP ranges you list go through the VPN (policy-based routing with `pbr`). |
+| Family filtering | Safe search forced on Google (all its country domains, from Google's own list), Bing, DuckDuckGo, Brave, Startpage and Yandex (refreshed every 30 minutes); Hagezi NSFW, "no safe search" and DoH/VPN/proxy bypass lists; anime/manga NSFW sites from [safe-otaku](https://github.com/5wHN28Dg/safe-otaku); every [listed Redlib instance](https://github.com/redlib-org/redlib-instances) except the ones you allow (refreshed daily); DoT and common VPN protocols blocked from the LAN; banIP `doh` and `vpn` feeds. |
+| VPN for chosen sites | Any WireGuard provider (Proton VPN, Mullvad, ...): give it the provider's `.conf` file. Only the domains and IP ranges you list go through the VPN (policy-based routing with `pbr`). IPv6 to those domains never goes around the VPN: it is routed through the VPN when the provider's config has an IPv6 address, otherwise their IPv6 answers are suppressed so devices use IPv4 through the VPN. |
 | MangaDex safe-mode reader | The [safe-otaku](https://github.com/5wHN28Dg/safe-otaku) reader at `http://manga.lan`. |
 
 Separately, `./kids.sh` gives chosen devices fixed addresses and turns their
-internet off at night (asks for the devices and times on first use).
+internet off at night, matched by MAC address so IPv6 and self-chosen
+addresses are covered too (asks for the devices and times on first use;
+`./kids.sh --remove` takes the rules off).
 
 ## Your internet line
 
@@ -100,14 +102,19 @@ end. Hardware differences (WAN port name, which Wi-Fi radios exist, 5 GHz
 802.11ax support) are detected on the router, so other models work too.
 
 Running it again on a router it already set up is safe: it replaces its own
-rules instead of adding new ones.
+rules instead of adding new ones, and removes parts you switched off (VPN,
+MangaDex reader, PPPoE, family filtering). It also resets the files it manages
+(`/etc/config/dnsproxy`, `pbr`, `banip`, adblock-lean's config, dnsmasq's
+upstream servers) to its own settings, so change those through
+`private/config.env`, not by hand.
 
 ## Tests
 
 - `tests/unit.sh`: the laptop-side helpers and the question flow, no router
   needed.
 - `tests/vm.sh`: the whole setup on a throwaway OpenWrt virtual machine
-  (qemu), with every option on and with every option off. It never touches a
+  (qemu): every option on, then re-runs that switch parts off, change the SSH
+  key and present a different host key; and every option off. It never touches a
   real router. If your own network blocks DNS-over-HTTPS for its devices, run
   it with `TEST_DNS_UPSTREAM=10.0.2.3:53`.
 
@@ -116,9 +123,10 @@ rules instead of adding new ones.
 - Not configured: static WAN addresses, VLAN-tagged WAN (some DSL/fibre
   providers need a VLAN ID), DS-Lite/MAP-E. Set those in LuCI first; the
   setup leaves them alone apart from PPPoE.
-- The VPN option carries IPv4 only unless your provider's config has an IPv6
-  address; IPv6 traffic to the chosen domains then goes direct (the report
-  says so).
+- The kids' cut-off stops new connections at the start time; a video or game
+  stream that is already open can keep running until it ends.
+- IPv6 routing through the VPN (provider config with an IPv6 address) is not
+  covered by the automated tests, which have no IPv6 internet.
 - Redlib blocking covers the instances in the public list, not unlisted ones.
 - Cloudflare rate-limits repeated speed tests from one address for about an
   hour; the setup then uses the rates saved in `SQM_FALLBACK_DOWN/UP`, or
