@@ -30,7 +30,7 @@ Always:
 | DNS hijack | Devices that use their own DNS server on port 53 are redirected to the router. |
 | Ad and tracker blocking | [adblock-lean](https://github.com/lynxthecat/adblock-lean), installed from its project on every run with its own installer (`abl-install.sh -v release`), so it is always the current release. The Hagezi lists come from adblock-lean's preset for the router's memory, chosen the way its own setup does it (Hagezi Pro mini on the smallest routers, Pro, then Threat Intelligence added as memory allows), plus your own list. |
 | banIP | Blocks incoming scans and brute force on the WAN; extra feeds from your settings. |
-| SQM (bufferbloat) | Measures your line (Cloudflare, 4 streams, 10 s each way) and shapes at 90% with cake, following the [OpenWrt SQM guide](https://openwrt.org/docs/guide-user/network/traffic-shaping/sqm). Link-layer values come from the link type you pick. Per-device fairness (`dual-srchost`/`dual-dsthost`), plus cake's `nat` lookup only when the router does IPv4 NAT. |
+| SQM (bufferbloat) | Measures your line, shapes at 90% with cake, then checks the latency under load, following the [OpenWrt SQM guide](https://openwrt.org/docs/guide-user/network/traffic-shaping/sqm); see [SQM](#sqm). Link-layer values come from the link type you pick. Per-device fairness (`dual-srchost`/`dual-dsthost`), plus cake's `nat` lookup only when the router does IPv4 NAT. Flow offloading is set to software (hardware offloading bypasses SQM). |
 | System | Your admin password, SSH key login (keys you added yourself are kept), time zone, NTP servers by IP address (works before DNS does), packet steering on all CPUs, Wi-Fi name, password and country on every radio (WPA3-only on 6 GHz). On routers with less than about 200 MB of RAM the DNS caches are kept small. |
 
 Optional (asked on the first run):
@@ -70,6 +70,46 @@ IPv4 and IPv6 are detected on the router, not assumed. With IPv4 behind the
 router's NAT, cake looks up the real device behind NAT so fairness works per
 device. Without IPv4 (IPv6-only lines) that lookup is skipped. With usable
 IPv6, banIP also covers IPv6.
+
+## SQM
+
+The guide's method is: measure the idle line, set 90% of it, test for
+bufferbloat, adjust. The setup does this on each run:
+
+1. **Measure.** Eight streams to Cloudflare's speed test load the line, 12 s
+   each way, while the router reads its WAN port's byte counter every second.
+   The counter sees all traffic, so what somebody else is using at that moment
+   counts toward the result instead of being missed. The rate is the median
+   after a 3 s warm-up, so neither the ramp-up nor a short dip sets it. Cable lines often get about 10 s of extra
+   speed at the start: they (and "Not sure") are measured for 25 s and the
+   first 10 s are left out. If your router sits behind a cable modem, pick a
+   cable link type so this applies.
+2. **Shape** at 90% of that.
+3. **Check.** It pings while the line is loaded in both directions. Up to
+   30 ms more than idle passes (the "A" grade of the
+   [Waveform test](https://www.waveform.com/tools/bufferbloat)); more, or most
+   pings lost, is a FAIL that tells you to lower the rates. If the load
+   stays under half the shaped rate in a direction, or the speed test failed
+   on this run, the report says the check was not done instead of passing it.
+
+To tune by hand, as the guide describes (raise the rates until latency
+appears, then back off), put the rates in `private/config.env`:
+
+```
+SQM_DOWN='95000'   # kbit/s, used as they are; the line is no longer measured
+SQM_UP='19000'
+```
+
+The check in step 3 still runs with fixed rates. Set them too if the report
+says the router's CPU was the limit during the speed test (a fast line on a
+small router measures low), or on a line whose speed changes during the day.
+`SQM_FALLBACK_DOWN/UP`, if you set them, are only used when the speed test
+fails.
+
+The test moves real data: the line runs at full speed for about 40 s per run
+(about 85 s on cable and "Not sure"), which is roughly 5 GB per 1 Gbit/s of
+line speed (10 GB on cable). On a metered line, set fixed rates; then only
+the latency check loads the line (about 11 s, or 18 s on cable).
 
 ## Remote access
 
@@ -145,7 +185,8 @@ own install instructions do; the setup trusts that project.
 - `tests/unit.sh`: the laptop-side helpers and the question flow, no router
   needed.
 - `tests/vm.sh`: the whole setup on a throwaway OpenWrt virtual machine
-  (qemu): every option on, then re-runs that switch parts off, change the SSH
+  (qemu), measuring a stand-in line of known speed (`tests/speedsrv.py`,
+  needs python3): every option on, then re-runs that switch parts off, change the SSH
   key and present a different host key; and every option off. It never touches a
   real router. If your own network blocks DNS-over-HTTPS for its devices, run
   it with `TEST_DNS_UPSTREAM=10.0.2.3:53`.
@@ -165,8 +206,16 @@ own install instructions do; the setup trusts that project.
 - adblock-lean's preset sizes its limits for its own lists. Family filtering
   raises the size limit for its lists; other extra lists must fit in what's left.
 - Cloudflare rate-limits repeated speed tests from one address for about an
-  hour; the setup then uses the rates saved in `SQM_FALLBACK_DOWN/UP`, or
-  leaves SQM off and says so.
+  hour; the setup then uses the rates you put in `SQM_FALLBACK_DOWN/UP`, or
+  leaves SQM off and says so. Fixed rates (`SQM_DOWN/UP`) need no speed test.
+- The speed test opens a new connection for each ~100 MB, so above roughly
+  1 Gbit/s (or upload above a few hundred Mbit/s on a small router) it can
+  measure low. The report notes when a CPU core was the limit; set fixed
+  rates then.
+- SQM rates are fixed numbers: on lines whose speed varies a lot (mobile,
+  Starlink) no single rate is right all day.
+- The latency check loads the line from the router itself, which is close to,
+  but not the same as, a test from a device behind it.
 
 ## Licences
 

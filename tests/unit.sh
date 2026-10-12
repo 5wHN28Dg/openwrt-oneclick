@@ -5,6 +5,7 @@
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 . "$HERE/lib/laptop.sh"
+. "$HERE/router/sqm-lib.sh"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 fails=0 n=0
 ok()   { n=$((n + 1)); printf 'ok    %s\n' "$1"; }
@@ -22,6 +23,55 @@ eq "link fiber"       "$(link_params fiber)"       "ethernet 44 84"
 eq "link ethernet"    "$(link_params ethernet)"    "ethernet 44 84"
 eq "link unsure"      "$(link_params unsure)"      "ethernet 44 96"
 if link_params bogus >/dev/null; then bad "unknown link type rejected"; else ok "unknown link type rejected"; fi
+
+# --- SQM numbers (router/sqm-lib.sh) --------------------------------------------
+eq "median, odd count"  "$(printf '5\n1\n9\n' | median)" 5
+eq "median, even count" "$(printf '4\n2\n' | median)" 3
+eq "median of nothing is empty" "$(printf '' | median)" ""
+# A cable line: 10 s of boost at 200 Mbit/s, then 100 Mbit/s with one dip.
+boost=$(awk 'BEGIN { c = 0; for (t = 0; t <= 25; t++) { printf "%d.00 %d\n", 100 + t, c; c += (t < 10 ? 25000000 : (t == 17 ? 2000000 : 12500000)) } }')
+eq "sustained rate leaves out the boost and a dip" "$(echo "$boost" | sustained_kbit 10)" 100000
+# Where the boost is most of the samples, only the warm-up keeps it out.
+eq "boost is most of the test: the warm-up leaves it out" "$(echo "$boost" | head -n 17 | sustained_kbit 10)" 100000
+eq "boost is most of the test: counted without a warm-up" "$(echo "$boost" | head -n 17 | sustained_kbit 0)" 200000
+eq "sustained rate with uneven sample times" "$(printf '10.00 0\n11.50 1500000\n12.00 2000000\n14.00 4000000\n' | sustained_kbit 0)" 8000
+eq "rate between two samples (warm-up -1 counts from the first)" "$(printf '10.00 1000\n17.00 8751000\n' | sustained_kbit -1)" 10000
+# Bursts with pauses (5 Mbyte every third second): the median would be 0.
+eq "bursty delivery: the average, not a median of pauses" "$(awk 'BEGIN { c = 0; for (t = 0; t <= 12; t++) { printf "%d.00 %d\n", t, c; if (t % 3 == 2) c += 5000000 } }' | sustained_kbit 0)" 13333
+eq "no samples after the warm-up: empty" "$(printf '10.00 0\n11.00 5\n' | sustained_kbit 5)" ""
+eq "ping median" "$(printf 'PING 1.1.1.1\n64 bytes from 1.1.1.1: seq=0 ttl=55 time=12.345 ms\n64 bytes from 1.1.1.1: seq=1 ttl=55 time=80.1 ms\n64 bytes from 1.1.1.1: seq=2 ttl=55 time=15.0 ms\n3 packets transmitted\n' | rtt_median)" 15
+eq "ping without replies: empty" "$(printf 'PING 1.1.1.1\n5 packets transmitted, 0 packets received\n' | rtt_median)" ""
+eq "ping replies counted" "$(printf 'PING 1.1.1.1\n64 bytes: seq=0 time=12.3 ms\n64 bytes: seq=4 time=15 ms\n7 packets transmitted, 2 packets received\n' | rtt_replies)" 2
+eq "CPU busy share of one core" "$(busy_percent 'cpu0 100 0 100 800 0 0 0 0' 'cpu0 150 0 150 900 0 0 0 0')" 50
+eq "CPU: waiting on I/O is not busy" "$(busy_percent 'cpu0 0 0 0 100 100 0 0 0' 'cpu0 0 0 0 150 150 0 0 0')" 0
+# One of four cores does all the network work: that core counts, not the average.
+before='cpu0 0 0 0 1000 0 0 0 0
+cpu1 0 0 0 1000 0 0 0 0
+cpu2 0 0 0 1000 0 0 0 0
+cpu3 0 0 0 1000 0 0 0 0'
+after='cpu0 0 0 0 2000 0 0 0 0
+cpu1 0 0 50 1050 0 0 900 0
+cpu2 0 0 0 2000 0 0 0 0
+cpu3 100 0 0 1900 0 0 0 0'
+eq "CPU: the busiest core counts" "$(busy_percent "$before" "$after")" 95
+
+# A server that refuses (HTTP 429): the installer's load() backs off and gives
+# up, instead of asking thousands of times (8 streams x 3 tries = 24 requests).
+if command -v python3 >/dev/null && command -v curl >/dev/null; then
+	python3 -I "$HERE/tests/speedsrv.py" 18081 1000 1000 refuse > "$T/refused" & spid=$!
+	sleep 1
+	(
+		# shellcheck disable=SC2034  # read by load(), defined through eval below
+		SPEED_URL=http://127.0.0.1:18081
+		eval "$(sed -n '/^load() {/,/^}/p' "$HERE/router/install.sh")"
+		load down 20 > "$T/load.out"
+	)
+	kill $spid 2>/dev/null; wait $spid 2>/dev/null
+	eq "refused speed test: 8 streams give up after 3 tries each" "$(wc -l < "$T/refused" | tr -d ' ')" 24
+	eq "refused speed test: HTTP code recorded" "$(cut -d' ' -f2 "$T/load.out" | sort -u)" 429
+else
+	echo "skip  refused speed test (needs python3 and curl)"
+fi
 
 # --- quoting and the settings file -------------------------------------------
 nasty="it's \"q\" \$HOME \`id\` back\\slash
@@ -195,6 +245,17 @@ if [ "$rc" -ne 0 ] && grep -q "WIFI_KEY must be" "$T/short.out" && [ -z "$(ls -A
 	VPN_IFACE=protonvpn WG_ENDPOINT_PORT=notaport; eq "non-numeric WireGuard port rejected" "$(check_settings | grep -c WG_ENDPOINT_PORT)" 1
 	WG_ENDPOINT_PORT=51820 WIFI_COUNTRY=Germany; eq "bad country rejected" "$(check_settings | grep -c WIFI_COUNTRY)" 1
 	WIFI_COUNTRY=DE SQM_FALLBACK_DOWN="1'0"; eq "non-numeric SQM fallback rejected" "$(check_settings | grep -c SQM_FALLBACK)" 1
+	SQM_FALLBACK_DOWN=1000 SQM_DOWN=50000 SQM_UP=10000; eq "fixed SQM rates accepted" "$(check_settings)" ""
+	SQM_UP=''; eq "fixed SQM rate for one direction only rejected" "$(check_settings | grep -c SQM_DOWN)" 1
+	SQM_UP=50; eq "fixed SQM rate that looks like Mbit/s rejected" "$(check_settings | grep -c 'at least 100')" 1
+	SQM_UP=99999999999999999999; r=$(check_settings 2>&1); eq "absurdly large fixed SQM rate rejected, no shell error" "$(echo "$r" | grep -c 'SQM_UP must be a number')|$(echo "$r" | grep -ci 'out of range')" "1|0"
+	SQM_UP='10000; reboot'; eq "non-numeric fixed SQM rate rejected" "$(check_settings | grep -c 'SQM_UP must be a number')" 1
+	SQM_DOWN='' SQM_UP='' SPEEDTEST_URL='http://10.0.2.2:18080'; eq "speed test server accepted" "$(check_settings)" ""
+	SPEEDTEST_URL='http://'; eq "speed test server without a host rejected" "$(check_settings | grep -c SPEEDTEST_URL)" 1
+	SPEEDTEST_URL='' SQM_FALLBACK_DOWN=0 SQM_FALLBACK_UP=0; eq "fallback rates of 0 rejected" "$(check_settings | grep -c 'at least 100')" 2
+	SQM_FALLBACK_DOWN=100000 SQM_FALLBACK_UP=20000
+	SPEEDTEST_URL='speed.example'; eq "speed test server without http(s) rejected" "$(check_settings | grep -c SPEEDTEST_URL)" 1
+	SPEEDTEST_URL='http://x/$(reboot)'; eq "speed test server with shell characters rejected" "$(check_settings | grep -c SPEEDTEST_URL)" 1
 ) | tee "$T/v2.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/v2.res"))); n=$((n + $(wc -l < "$T/v2.res")))
 printf '[Interface]\nPrivateKey = abc= # my key\nAddress = 10.0.0.2/32 # home\n[Peer]\nPublicKey = def=\nEndpoint = vpn.example.com\n' > "$T/c.conf"

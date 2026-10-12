@@ -8,6 +8,7 @@ umask 022
 ROUTER=$(cd "$(dirname "$0")" && pwd)
 PRIV=$ROUTER/../private
 . "$PRIV/config.env"
+. "$ROUTER/sqm-lib.sh"
 
 REPORT=/tmp/setup-report.txt
 : > "$REPORT"
@@ -362,8 +363,11 @@ for s in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.setup='1'$/\1/
 uci -q delete firewall.dns_int
 uci -q delete firewall.dot_fwd
 [ -n "$LAN_ZONE" ] && uci -q del_list "firewall.$LAN_ZONE.network=remote"
+# Software flow offloading works with SQM; hardware offloading moves packets
+# past the queues SQM shapes, so it is switched to software.
 uci batch >/dev/null <<-EOF
 	set firewall.@defaults[0].flow_offloading='1'
+	set firewall.@defaults[0].flow_offloading_hw='0'
 	set firewall.dns_int=redirect
 	set firewall.dns_int.name='Intercept-DNS'
 	set firewall.dns_int.family='any'
@@ -431,7 +435,7 @@ if [ -n "$REMOTE" ]; then
 	EOF
 fi
 uci commit firewall
-pass "DNS hijack${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo ', DoT and VPN-protocol blocks')}${VPN:+, $VPN zone}${REMOTE:+, remote access in the lan zone}"
+pass "software flow offloading (hardware offloading off: it bypasses SQM), DNS hijack${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo ', DoT and VPN-protocol blocks')}${VPN:+, $VPN zone}${REMOTE:+, remote access in the lan zone}"
 
 # ---------------------------------------------------------------- DNS
 step "Encrypted DNS"
@@ -550,44 +554,105 @@ pass "custom files kept across firmware upgrades${FAMILY_FILTER:+$(on "$FAMILY_F
 
 # ---------------------------------------------------------------- SQM (OpenWrt wiki method)
 # https://openwrt.org/docs/guide-user/network/traffic-shaping/sqm
-# Measured on an idle line, 90% of it, cake + piece_of_cake, link-layer values
-# for the chosen link type, plus per-host fairness. cake's "nat" keyword (find
-# the real LAN host behind NAT) is only used when there is IPv4 NAT.
-step "SQM: measuring line speed (about 20 s)"
+# 90% of the measured line, cake + piece_of_cake, link-layer values for the
+# chosen link type, plus per-host fairness. cake's "nat" keyword (find the real
+# LAN host behind NAT) is only used when there is IPv4 NAT. Then the guide's
+# last step: check the latency under load.
+#
+# Measuring: four streams load the line while the WAN device's byte counter is
+# read every second. The counter sees everything on the line, so other traffic
+# doesn't lower the result, and the rate is the median after a warm-up, so
+# neither TCP's ramp-up nor short dips set it. Cable providers often give about
+# 10 s of extra speed at the start (the guide warns about it): cable lines are
+# measured longer and those seconds are left out.
 /etc/init.d/sqm stop >/dev/null 2>&1
-measure() { # down|up -> kbit/s over 10 s, 4 parallel streams
-	out=/tmp/setup-speed.$$; : > $out
-	end=$(( $(date +%s) + 10 ))
-	for _ in 1 2 3 4; do (
-		while [ "$(date +%s)" -lt $end ]; do
+SPEED_URL=${SPEEDTEST_URL:-https://speed.cloudflare.com}
+# ("Not sure" may be cable too.)
+case $LINK_TYPE in docsis*|unsure) SPEED_DUR=25 SPEED_WARM=10 ;; *) SPEED_DUR=12 SPEED_WARM=3 ;; esac
+# Eight streams of just under 100 MB each (the most Cloudflare serves in one
+# request): on a 1 Gbit/s line a stream then runs for seconds, not fractions of
+# one, so reconnecting doesn't show in the samples. A stream that is refused or
+# fails at once (rate limit, no DNS) waits and gives up after three tries
+# instead of asking again and again.
+load() { # down|up SECONDS -> eight streams; one "bytes http-code" line per transfer
+	end=$(( $(date +%s) + $2 ))
+	for _ in 1 2 3 4 5 6 7 8; do (
+		refused=0
+		while [ "$(date +%s)" -lt $end ] && [ $refused -lt 3 ]; do
 			left=$(( end - $(date +%s) )); [ $left -lt 1 ] && break
 			if [ "$1" = down ]; then
-				curl -s -o /dev/null --max-time $left -w '%{size_download} %{http_code}\n' 'https://speed.cloudflare.com/__down?bytes=25000000'
+				r=$(curl -s -o /dev/null --max-time $left -w '%{size_download} %{http_code}\n' "$SPEED_URL/__down?bytes=99999999")
 			else
-				head -c 25000000 /dev/zero | curl -s -o /dev/null --max-time $left -X POST -H 'Expect:' -T - -w '%{size_upload} %{http_code}\n' 'https://speed.cloudflare.com/__up'
+				r=$(head -c 99999999 /dev/zero | curl -s -o /dev/null --max-time $left -X POST -H 'Expect:' -T - -w '%{size_upload} %{http_code}\n' "$SPEED_URL/__up")
 			fi
-		done >> $out ) &
+			echo "${r:-0 000}"
+			if [ "$(echo "${r:-0}" | cut -d' ' -f1)" -lt 100000 ]; then refused=$((refused + 1)); sleep 2; else refused=0; fi
+		done ) &
 	done
 	wait
-	awk '$2 !~ /^(2|000)/ {print $2 >> "/tmp/setup-speed.codes"} {s += $1} END {printf "%d", s * 8 / 10 / 1000}' $out; rm -f $out
 }
-rm -f /tmp/setup-speed.codes
-DOWN=$(measure down); UP=$(measure up)
+wan_bytes() { cat "/sys/class/net/$WAN_DEV/statistics/$1" 2>/dev/null || echo 0; }
+moved_kbit() { # FILE SECONDS -> kbit/s the transfers in FILE moved themselves
+	awk -v d="$2" '{ s += $1 } END { printf "%d", s * 8 / d / 1000 }' "$1"
+}
+measure() { # down|up -> sustained kbit/s on the WAN device; 0 if the test server gave nothing
+	out=/tmp/setup-speed.$$; smp=/tmp/setup-speed-samples.$$; : > $smp
+	case $1 in down) ctr=rx_bytes ;; *) ctr=tx_bytes ;; esac
+	load "$1" $SPEED_DUR > $out &
+	i=0 cpu0='' cpu1=''
+	while [ $i -le $SPEED_DUR ]; do
+		echo "$(cut -d' ' -f1 /proc/uptime) $(wan_bytes $ctr)" >> $smp
+		# CPU use while the load is in full swing (not its start or the idle end)
+		[ $i -eq 2 ] && cpu0=$(cpu_snapshot)
+		[ $i -eq $((SPEED_DUR - 1)) ] && cpu1=$(cpu_snapshot)
+		sleep 1; i=$((i + 1))
+	done
+	wait
+	busy_percent "$cpu0" "$cpu1" > "/tmp/setup-speed.cpu-$1"
+	awk '$2 !~ /^(2|000)/ { print $2 }' $out >> /tmp/setup-speed.codes
+	moved=$(moved_kbit $out $SPEED_DUR)
+	if [ "$moved" -gt 500 ]; then
+		rate=$(sustained_kbit $SPEED_WARM < $smp)
+		# No usable counter (device gone): what the transfers moved themselves.
+		[ "${rate:-0}" -gt 0 ] || rate=$moved
+		echo "$rate"
+	else
+		echo 0
+	fi
+	rm -f $out $smp
+}
 # Link-layer values for LINK_TYPE, computed by setup.sh from lib/laptop.sh.
 LL=${LINK_LL:-ethernet} OVH=${LINK_OVERHEAD:-44} MPU=${LINK_MPU:-96}
 NAT=; [ -n "$HAS_V4" ] && NAT="nat "
-if [ "${DOWN:-0}" -gt 1000 ] && [ "${UP:-0}" -gt 1000 ]; then
-	RATE_DOWN=$((DOWN * 90 / 100)) RATE_UP=$((UP * 90 / 100)) SQM_OK=1
-	SQM_MSG="SQM measured ${DOWN} down / ${UP} up kbit/s, shaping at 90%: $RATE_DOWN / $RATE_UP kbit/s"
-elif [ -n "${SQM_FALLBACK_DOWN-}" ] && [ -n "${SQM_FALLBACK_UP-}" ] \
-	&& ! echo "$SQM_FALLBACK_DOWN$SQM_FALLBACK_UP" | grep -q '[^0-9]'; then
-	RATE_DOWN=$SQM_FALLBACK_DOWN RATE_UP=$SQM_FALLBACK_UP SQM_OK=
-	codes=$(sort -u /tmp/setup-speed.codes 2>/dev/null | tr '\n' ' '); codes=${codes:-none}
-	SQM_MSG="SQM speed test failed (down=${DOWN:-0} up=${UP:-0} kbit/s, Cloudflare HTTP codes: $codes); using saved rates $RATE_DOWN / $RATE_UP kbit/s"
+rm -f /tmp/setup-speed.codes
+if [ -n "${SQM_DOWN-}" ] && [ -n "${SQM_UP-}" ] && ! echo "$SQM_DOWN$SQM_UP" | grep -q '[^0-9]'; then
+	# Rates tuned by hand: used as they are, nothing measured.
+	step "SQM: fixed rates from the settings"
+	RATE_DOWN=$SQM_DOWN RATE_UP=$SQM_UP SQM_OK=1
+	SQM_MSG="SQM fixed rates from the settings: $RATE_DOWN / $RATE_UP kbit/s"
 else
-	RATE_DOWN='' SQM_OK=''
+	step "SQM: measuring line speed (about $((SPEED_DUR * 2)) s)"
+	DOWN=$(measure down); UP=$(measure up)
+	CPU_DOWN=$(cat /tmp/setup-speed.cpu-down 2>/dev/null) CPU_UP=$(cat /tmp/setup-speed.cpu-up 2>/dev/null)
+	rm -f /tmp/setup-speed.cpu-down /tmp/setup-speed.cpu-up
 	codes=$(sort -u /tmp/setup-speed.codes 2>/dev/null | tr '\n' ' '); codes=${codes:-none}
-	SQM_MSG="SQM speed test failed (down=${DOWN:-0} up=${UP:-0} kbit/s, Cloudflare HTTP codes: $codes) and no saved rates; SQM left off, re-run setup later"
+	rm -f /tmp/setup-speed.codes
+	if [ "${DOWN:-0}" -gt 1000 ] && [ "${UP:-0}" -gt 1000 ]; then
+		RATE_DOWN=$((DOWN * 90 / 100)) RATE_UP=$((UP * 90 / 100)) SQM_OK=1
+		SQM_MSG="SQM measured ${DOWN} down / ${UP} up kbit/s (sustained, after ${SPEED_WARM} s warm-up), shaping at 90%: $RATE_DOWN / $RATE_UP kbit/s"
+		# The test runs on this router: a core with nothing to spare was the limit, not the line.
+		if [ "${CPU_DOWN:-0}" -ge 90 ] || [ "${CPU_UP:-0}" -ge 90 ]; then
+			info "a CPU core of the router was fully busy during the speed test (download ${CPU_DOWN:-?}%, upload ${CPU_UP:-?}%), so the line may be faster than measured; if so, set SQM_DOWN/SQM_UP in private/config.env"
+		fi
+	elif [ -n "${SQM_FALLBACK_DOWN-}" ] && [ -n "${SQM_FALLBACK_UP-}" ] \
+		&& ! echo "$SQM_FALLBACK_DOWN$SQM_FALLBACK_UP" | grep -q '[^0-9]' \
+		&& [ "$SQM_FALLBACK_DOWN" -ge 100 ] && [ "$SQM_FALLBACK_UP" -ge 100 ]; then
+		RATE_DOWN=$SQM_FALLBACK_DOWN RATE_UP=$SQM_FALLBACK_UP SQM_OK=
+		SQM_MSG="SQM speed test failed (down=${DOWN:-0} up=${UP:-0} kbit/s, speed test HTTP codes: $codes); using saved rates $RATE_DOWN / $RATE_UP kbit/s"
+	else
+		RATE_DOWN='' SQM_OK=''
+		SQM_MSG="SQM speed test failed (down=${DOWN:-0} up=${UP:-0} kbit/s, speed test HTTP codes: $codes) and no saved rates; SQM left off, re-run setup later"
+	fi
 fi
 if [ -n "$RATE_DOWN" ]; then
 	for s in $(uci -q show sqm | sed -n "s/^sqm\.\([^.]*\)=queue$/\1/p"); do uci delete "sqm.$s"; done
@@ -617,6 +682,49 @@ if [ -n "$RATE_DOWN" ]; then
 	SQM_MSG="$SQM_MSG on $WAN_DEV; $LINK_TYPE: $LL overhead $OVH mpu $MPU; per-host fairness${NAT:+ behind NAT}"
 fi
 if [ -n "$SQM_OK" ]; then pass "$SQM_MSG"; else fail "$SQM_MSG"; fi
+
+# The guide's check that the rates are right: ping while the line is loaded in
+# both directions. Up to 30 ms more than idle is fine (the "A" grade of the
+# Waveform bufferbloat test); more means the rates are above what the line
+# really carries.
+# The pings start after the warm-up, so a cable line's extra speed at the
+# start is used up before they count. Whether the line was really loaded is
+# read from the WAN device's counters over the time of the pings (they include
+# the download's acknowledgements, which fill a small upload direction).
+if [ -n "$RATE_DOWN" ] && [ -z "$SQM_OK" ]; then
+	info "SQM latency under load not checked: the speed test server is not usable right now"
+elif [ -n "$RATE_DOWN" ]; then
+	LOAD_DUR=$((SPEED_WARM + 8))
+	step "SQM: latency under load (about $((LOAD_DUR + 6)) s)"
+	PING_TO=1.1.1.1; [ -n "$HAS_V4" ] || PING_TO=2606:4700:4700::1111
+	RTT_IDLE=$(ping -c 5 -W 2 $PING_TO 2>/dev/null | rtt_median)
+	load down $LOAD_DUR > /tmp/setup-load-down.$$ &
+	load up $LOAD_DUR > /tmp/setup-load-up.$$ &
+	sleep $SPEED_WARM
+	c0="$(cut -d' ' -f1 /proc/uptime) $(wan_bytes rx_bytes) $(wan_bytes tx_bytes)"
+	PINGS=$(ping -c 7 -W 2 $PING_TO 2>/dev/null)
+	c1="$(cut -d' ' -f1 /proc/uptime) $(wan_bytes rx_bytes) $(wan_bytes tx_bytes)"
+	wait
+	RTT_LOAD=$(echo "$PINGS" | rtt_median) RTT_GOT=$(echo "$PINGS" | rtt_replies)
+	LOAD_DOWN=$(printf '%s\n%s\n' "$c0" "$c1" | cut -d' ' -f1,2 | sustained_kbit -1)
+	LOAD_UP=$(printf '%s\n%s\n' "$c0" "$c1" | cut -d' ' -f1,3 | sustained_kbit -1)
+	codes=$(cat /tmp/setup-load-down.$$ /tmp/setup-load-up.$$ | awk '$2 !~ /^(2|000)/ { print $2 }' | sort -u | tr '\n' ' ')
+	rm -f /tmp/setup-load-down.$$ /tmp/setup-load-up.$$
+	LOAD_MSG="load ${LOAD_DOWN:-0} down / ${LOAD_UP:-0} up kbit/s"
+	if [ -z "$RTT_IDLE" ]; then
+		info "SQM latency under load not checked: no ping replies from $PING_TO"
+	elif [ $((${LOAD_DOWN:-0} * 2)) -lt "$RATE_DOWN" ] || [ $((${LOAD_UP:-0} * 2)) -lt "$RATE_UP" ]; then
+		# Not loaded in both directions: a good result would mean nothing.
+		info "SQM latency under load not checked: the $LOAD_MSG was under half the shaped $RATE_DOWN / $RATE_UP in a direction${codes:+ (speed test HTTP codes: $codes)}; the speed test server gave too little, or the rates are far above what the line carries"
+	elif [ "$RTT_GOT" -lt 4 ]; then
+		fail "SQM latency under load: only $RTT_GOT of 7 pings answered ($LOAD_MSG); lower the rates: set SQM_DOWN/SQM_UP in private/config.env below $RATE_DOWN / $RATE_UP"
+	else
+		RTT_ADD=$((RTT_LOAD - RTT_IDLE)); [ $RTT_ADD -lt 0 ] && RTT_ADD=0
+		RTT_MSG="SQM latency under load: +$RTT_ADD ms (idle $RTT_IDLE ms, loaded $RTT_LOAD ms, $RTT_GOT of 7 pings answered, $LOAD_MSG)"
+		if [ $RTT_ADD -le 30 ]; then pass "$RTT_MSG"
+		else fail "$RTT_MSG; lower the rates: set SQM_DOWN/SQM_UP in private/config.env below $RATE_DOWN / $RATE_UP"; fi
+	fi
+fi
 
 # ---------------------------------------------------------------- start everything
 step "Starting services"
