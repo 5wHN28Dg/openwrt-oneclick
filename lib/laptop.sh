@@ -4,7 +4,7 @@
 # Every setting setup.sh stores in private/config.env, in file order.
 CONFIG_KEYS='WIFI_SSID WIFI_KEY WIFI_ENCRYPTION WIFI_COUNTRY ROOT_PASSWORD_HASH SSH_KEY SSH_PUBKEYS
 SSH_KEY_OLD SSH_PUBKEYS_OLD
-TZ_NAME TZ_POSIX WAN_PROTO PPPOE_USER PPPOE_PASS LINK_TYPE SQM_FALLBACK_DOWN SQM_FALLBACK_UP
+TZ_NAME TZ_POSIX WAN_PROTO PPPOE_USER PPPOE_PASS LINK_TYPE SQM_DOWN SQM_UP SQM_FALLBACK_DOWN SQM_FALLBACK_UP SPEEDTEST_URL
 FAMILY_FILTER ADBLOCK_EXTRA_LISTS BANIP_FEEDS REDLIB_ALLOW
 ENABLE_VPN VPN_IFACE WG_PRIVATE_KEY WG_ADDRESSES WG_DNS WG_PEER_PUBLIC_KEY WG_PRESHARED_KEY
 WG_ENDPOINT_HOST WG_ENDPOINT_PORT WG_ALLOWED_IPS WG_KEEPALIVE VPN_ROUTE_DOMAINS VPN_ROUTE_SUBNETS
@@ -111,9 +111,16 @@ check_settings() {
 		done
 		case ${VPN_ROUTE_SUBNETS-} in *[!0-9A-Fa-f:./\ ]*) echo "VPN_ROUTE_SUBNETS must be IP ranges like 91.108.4.0/22" ;; esac
 	fi
-	for k in SQM_FALLBACK_DOWN SQM_FALLBACK_UP; do
+	for k in SQM_DOWN SQM_UP SQM_FALLBACK_DOWN SQM_FALLBACK_UP; do
 		_v=''; eval "_v=\${$k-}"; case $_v in *[!0-9]*) echo "$k must be a number (kbit/s)" ;; esac
 	done
+	# Fixed SQM rates: both or neither, and not a typo that would choke the line.
+	if [ -n "${SQM_DOWN-}${SQM_UP-}" ]; then
+		case ${SQM_DOWN:-x}${SQM_UP:-x} in *[!0-9]*) echo "SQM_DOWN and SQM_UP must both be set (kbit/s), or both empty to measure the line" ;; *)
+			[ "$SQM_DOWN" -ge 100 ] && [ "$SQM_UP" -ge 100 ] || echo "SQM_DOWN and SQM_UP are in kbit/s and must be at least 100" ;; esac
+	fi
+	case ${SPEEDTEST_URL-} in ''|http://*|https://*) ;; *) echo "SPEEDTEST_URL must start with http:// or https://" ;; esac
+	case ${SPEEDTEST_URL-} in *[!A-Za-z0-9.:/_-]*) echo "SPEEDTEST_URL has unexpected characters" ;; esac
 	case ${ULA_PREFIX-} in *[!0-9A-Fa-f:/]*) echo "ULA_PREFIX must look like fdxx:xxxx:xxxx::/48" ;; esac
 	case ${BANIP_FEEDS-} in *[!a-z0-9_\ -]*) echo "BANIP_FEEDS has unexpected characters" ;; esac
 	case ${ADBLOCK_EXTRA_LISTS-} in *[!A-Za-z0-9:._/\ -]*) echo "ADBLOCK_EXTRA_LISTS has unexpected characters" ;; esac

@@ -16,11 +16,19 @@
 #                       networks that block DoH for their own LAN clients
 #                       (the VM is such a client); e.g. 10.0.2.3:53
 #   VM_SSH_PORT         localhost port for the VM's SSH (default 2222)
+#   SPEED_PORT          localhost port for the stand-in speed test server
+#                       (default 18080)
+#
+# The full scenario measures the line against tests/speedsrv.py on this
+# computer (needs python3), which holds four streams to 20 Mbit/s down and
+# 10 Mbit/s up, so the result is known. Without python3 it uses Cloudflare.
 #
 # Expected FAILs (the test checks these are the only ones):
 #   - "VPN WireGuard handshake": the test peer is a documentation address.
 #   - "SQM speed test failed" with HTTP 429: Cloudflare rate-limits repeated
 #     speed tests from one IP for about an hour; the saved rates are used.
+#   - "SQM latency under load" may pass or fail: qemu's user network has no
+#     real line behind it. The test only checks that it was measured.
 
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -30,8 +38,9 @@ PORT=${VM_SSH_PORT:-2222}
 CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/openwrt-oneclick
 IMG=openwrt-$VER-x86-64-generic-squashfs-combined.img
 W=$(mktemp -d)
-QPID=
-cleanup() { [ -n "$QPID" ] && kill "$QPID" 2>/dev/null; rm -rf "$W"; }
+QPID='' SPID=''
+SPORT=${SPEED_PORT:-18080}
+cleanup() { [ -n "$QPID" ] && kill "$QPID" 2>/dev/null; [ -n "$SPID" ] && kill "$SPID" 2>/dev/null; rm -rf "$W"; }
 trap cleanup EXIT INT TERM
 fails=0
 ok()  { printf 'ok    %s\n' "$1"; }
@@ -68,6 +77,13 @@ if [ -n "${TEST_DNS_UPSTREAM-}" ]; then
 	sed -i "/config dnsproxy 'servers'/a\\	list upstream '$TEST_DNS_UPSTREAM'\n\tlist bootstrap '$TEST_DNS_UPSTREAM'" "$f"
 fi
 ssh-keygen -q -t ed25519 -N '' -f "$W/key"
+# The VM reaches this computer's localhost as 10.0.2.2.
+SPEED_URL=
+if command -v python3 >/dev/null; then
+	python3 -I "$HERE/tests/speedsrv.py" "$SPORT" 5000 2500 & SPID=$!
+	sleep 1
+	if kill -0 "$SPID" 2>/dev/null; then SPEED_URL=http://10.0.2.2:$SPORT; else SPID=''; echo "speed test server did not start (port $SPORT in use?)"; exit 1; fi
+fi
 wgkey() { head -c 32 /dev/urandom | base64; }
 
 make_private() { # dir full|minimal
@@ -93,8 +109,10 @@ make_private() { # dir full|minimal
 laptop|3|$(wg_genkey)|$(wg_psk)"
 			for i in 4 5 6 7 8 9 10 11 12; do REMOTE_PEERS="$REMOTE_PEERS
 dev$i|$i|$(wg_genkey)|$(wg_psk)"; done
+			SPEEDTEST_URL=$SPEED_URL
 		else
 			FAMILY_FILTER=0 ADBLOCK_EXTRA_LISTS='' BANIP_FEEDS='' ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0
+			SQM_DOWN=50000 SQM_UP=10000   # fixed rates: nothing is measured
 		fi
 		write_config "$1/config.env"
 	)
@@ -114,7 +132,8 @@ run_setup() { # private-dir log
 	rc=$?
 	unexpected=$(grep '^FAIL' "$2" | sort -u \
 		| grep -v 'VPN WireGuard handshake' \
-		| grep -v 'SQM speed test failed.*HTTP codes: 429' || true)
+		| grep -v 'SQM speed test failed.*HTTP codes: 429' \
+		| grep -v 'SQM latency under load' || true)
 	# A crash prints no FAIL line: the report at the end must be there.
 	if [ -z "$unexpected" ] && [ "$rc" -le 2 ] && grep -q '^=* REPORT =*$' "$2"; then
 		ok "setup.sh ($(basename "$2" .log)): exit $rc, $(grep -c '^PASS' "$2") PASS, only expected FAILs"
@@ -140,6 +159,21 @@ scenario_full() {
 	start_vm; P=$W/p-full; make_private "$P" full
 	run_setup "$P" "$W/full.log"
 	abl_check
+	# SQM: 4 streams at 5/2.5 Mbit/s each = 20/10 Mbit/s, shaped at 90%. The
+	# bounds allow for packet framing (counted, about 4%) and for upload data
+	# buffered between the VM and the test server.
+	if [ -n "$SPEED_URL" ]; then
+		r=$(vm_ssh 'uci -q get sqm.wan.download; uci -q get sqm.wan.upload' | tr '\n' ' ')
+		# shellcheck disable=SC2086  # two numbers
+		set -- $r
+		if grep -q '^PASS  SQM measured' "$W/full.log" && [ "${1:-0}" -ge 14000 ] && [ "${1:-0}" -le 21000 ] && [ "${2:-0}" -ge 7000 ] && [ "${2:-0}" -le 11500 ]; then
+			ok "SQM measured the 20/10 Mbit/s test line: shaping at $r kbit/s"
+		else
+			bad "SQM measurement of the 20/10 Mbit/s test line: $r; $(grep 'SQM' "$W/full.log" | head -3 | tr '\n' ' ')"
+		fi
+		grep -q 'SQM latency under load' "$W/full.log" && ok "SQM latency under load measured: $(grep -m1 'SQM latency under load' "$W/full.log" | cut -c1-110)" \
+			|| bad "SQM latency under load not reported"
+	fi
 	grep -q 'IPv4 yes (NAT), IPv6 no$' "$W/full.log" && grep -q 'after restart: IPv6 not usable$' "$W/full.log" \
 		&& ok "report states IPv4/IPv6 plainly" || bad "report IPv4/IPv6 wording: $(grep -E 'online via|after restart' "$W/full.log" | tr '\n' ' ')"
 	# Remote access: the laptop got one config per device, pointing at the
@@ -170,7 +204,11 @@ scenario_full() {
 	[ "$g" = 216.239.38.120 ] && ok "safe search on a Google country domain (www.google.de)" || bad "www.google.de -> $g"
 	a=$(vm_ssh 'nslookup -type=aaaa example.com 127.0.0.1 | awk "/^Address: /{print \$2}" | tail -1')
 	[ "$a" = "::" ] && ok "VPN domain has no IPv6 answer (VPN has no IPv6)" || bad "VPN domain AAAA: $a"
+	# Hardware flow offloading switched on by hand goes back to software (it bypasses SQM).
+	vm_ssh 'uci set firewall.@defaults[0].flow_offloading_hw=1; uci commit firewall'
 	run_setup "$P" "$W/full-rerun.log"
+	r=$(vm_ssh 'uci -q get firewall.@defaults[0].flow_offloading; uci -q get firewall.@defaults[0].flow_offloading_hw' | tr '\n' ' ')
+	[ "$r" = "1 0 " ] && ok "flow offloading: software on, hardware off" || bad "flow offloading (software hardware): $r"
 
 	# Settings that can't work (tunnel range = the LAN) stop the run before
 	# anything changes: blocking and remote access stay as they were.
@@ -260,6 +298,12 @@ scenario_minimal() {
 	start_vm; P=$W/p-min; make_private "$P" minimal
 	run_setup "$P" "$W/minimal.log"
 	abl_check
+	r=$(vm_ssh 'uci -q get sqm.wan.download; uci -q get sqm.wan.upload' | tr '\n' ' ')
+	if [ "$r" = "50000 10000 " ] && grep -q '^PASS  SQM fixed rates' "$W/minimal.log" && ! grep -q 'measuring line speed' "$W/minimal.log"; then
+		ok "SQM fixed rates used as they are, nothing measured"
+	else
+		bad "SQM fixed rates: $r"
+	fi
 	r=$(vm_ssh '
 		[ -e /www/mangadex-safe ] && echo "mangadex installed"
 		uci -q get network.vpn >/dev/null && echo "vpn interface"
