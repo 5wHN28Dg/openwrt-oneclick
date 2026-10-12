@@ -8,11 +8,16 @@ median() {
 
 # sustained_kbit WARMUP: "seconds byte-counter" samples on stdin (about one a
 # second) -> median kbit/s between samples, ignoring the first WARMUP seconds.
-# The median leaves out a start-up boost and short dips alike.
+# The median leaves out a start-up boost and short dips alike. Where data
+# arrives in bursts with pauses, most samples are near zero and the median
+# says nothing: if it is under half the average, the average is used.
 sustained_kbit() {
-	awk -v w="$1" 'NR == 1 { t0 = $1 }
+	_r=$(awk -v w="$1" 'NR == 1 { t0 = $1 }
 		NR > 1 && $1 - t0 > w && $1 > pt { printf "%d\n", ($2 - pb) * 8 / 1000 / ($1 - pt) }
-		{ pt = $1; pb = $2 }' | median
+		{ pt = $1; pb = $2 }')
+	[ -n "$_r" ] || return 0
+	_m=$(echo "$_r" | median) _a=$(echo "$_r" | awk '{ s += $1 } END { printf "%d\n", s / NR }')
+	if [ $((_m * 2)) -lt "$_a" ]; then echo "$_a"; else echo "$_m"; fi
 }
 
 # rtt_median: ping output on stdin -> median round-trip time in ms; empty without replies

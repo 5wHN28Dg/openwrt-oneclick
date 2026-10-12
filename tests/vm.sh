@@ -20,8 +20,8 @@
 #                       (default 18080)
 #
 # The full scenario measures the line against tests/speedsrv.py on this
-# computer (needs python3), which holds four streams to 20 Mbit/s down and
-# 10 Mbit/s up, so the result is known. Without python3 it uses Cloudflare.
+# computer (needs python3), which holds the eight streams to 20 Mbit/s down
+# and 10 Mbit/s up together, so the result is known. Without python3 it uses Cloudflare.
 #
 # Expected FAILs (the test checks these are the only ones):
 #   - "VPN WireGuard handshake": the test peer is a documentation address.
@@ -80,7 +80,7 @@ ssh-keygen -q -t ed25519 -N '' -f "$W/key"
 # The VM reaches this computer's localhost as 10.0.2.2.
 SPEED_URL=
 if command -v python3 >/dev/null; then
-	python3 -I "$HERE/tests/speedsrv.py" "$SPORT" 5000 2500 & SPID=$!
+	python3 -I "$HERE/tests/speedsrv.py" "$SPORT" 2500 1250 & SPID=$!
 	sleep 1
 	if kill -0 "$SPID" 2>/dev/null; then SPEED_URL=http://10.0.2.2:$SPORT; else SPID=''; echo "speed test server did not start (port $SPORT in use?)"; exit 1; fi
 fi
@@ -159,7 +159,7 @@ scenario_full() {
 	start_vm; P=$W/p-full; make_private "$P" full
 	run_setup "$P" "$W/full.log"
 	abl_check
-	# SQM: 4 streams at 5/2.5 Mbit/s each = 20/10 Mbit/s, shaped at 90%. The
+	# SQM: 8 streams at 2.5/1.25 Mbit/s each = 20/10 Mbit/s, shaped at 90%. The
 	# bounds allow for packet framing (counted, about 4%) and for upload data
 	# that this computer's socket buffers take in before the server's pace
 	# holds the VM back (seen: 12.2 Mbit/s measured).

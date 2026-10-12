@@ -76,11 +76,11 @@ IPv6, banIP also covers IPv6.
 The guide's method is: measure the idle line, set 90% of it, test for
 bufferbloat, adjust. The setup does this on each run:
 
-1. **Measure.** Four streams to Cloudflare's speed test load the line, 12 s
+1. **Measure.** Eight streams to Cloudflare's speed test load the line, 12 s
    each way, while the router reads its WAN port's byte counter every second.
-   The counter sees all traffic, so somebody streaming during the run doesn't
-   lower the result. The rate is the median after a 3 s warm-up, so neither the
-   ramp-up nor a short dip sets it. Cable lines often get about 10 s of extra
+   The counter sees all traffic, so what somebody else is using at that moment
+   counts toward the result instead of being missed. The rate is the median
+   after a 3 s warm-up, so neither the ramp-up nor a short dip sets it. Cable lines often get about 10 s of extra
    speed at the start: they (and "Not sure") are measured for 25 s and the
    first 10 s are left out. If your router sits behind a cable modem, pick a
    cable link type so this applies.
@@ -89,8 +89,8 @@ bufferbloat, adjust. The setup does this on each run:
    30 ms more than idle passes (the "A" grade of the
    [Waveform test](https://www.waveform.com/tools/bufferbloat)); more, or most
    pings lost, is a FAIL that tells you to lower the rates. If the load
-   doesn't fill the line in both directions, the report says the check could
-   not be done instead of passing it.
+   stays under half the shaped rate in a direction, or the speed test failed
+   on this run, the report says the check was not done instead of passing it.
 
 To tune by hand, as the guide describes (raise the rates until latency
 appears, then back off), put the rates in `private/config.env`:
@@ -105,6 +105,11 @@ says the router's CPU was the limit during the speed test (a fast line on a
 small router measures low), or on a line whose speed changes during the day.
 `SQM_FALLBACK_DOWN/UP`, if you set them, are only used when the speed test
 fails.
+
+The test moves real data: the line runs at full speed for about 40 s per run
+(about 85 s on cable and "Not sure"), which is roughly 5 GB per 1 Gbit/s of
+line speed (10 GB on cable). On a metered line, set fixed rates; then only
+the latency check loads the line (about 11 s, or 18 s on cable).
 
 ## Remote access
 
@@ -203,6 +208,10 @@ own install instructions do; the setup trusts that project.
 - Cloudflare rate-limits repeated speed tests from one address for about an
   hour; the setup then uses the rates you put in `SQM_FALLBACK_DOWN/UP`, or
   leaves SQM off and says so. Fixed rates (`SQM_DOWN/UP`) need no speed test.
+- The speed test opens a new connection for each ~100 MB, so above roughly
+  1 Gbit/s (or upload above a few hundred Mbit/s on a small router) it can
+  measure low. The report notes when a CPU core was the limit; set fixed
+  rates then.
 - SQM rates are fixed numbers: on lines whose speed varies a lot (mobile,
   Starlink) no single rate is right all day.
 - The latency check loads the line from the router itself, which is close to,
