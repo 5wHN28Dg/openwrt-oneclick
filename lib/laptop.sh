@@ -112,11 +112,11 @@ check_settings() {
 		case ${VPN_ROUTE_SUBNETS-} in *[!0-9A-Fa-f:./\ ]*) echo "VPN_ROUTE_SUBNETS must be IP ranges like 91.108.4.0/22" ;; esac
 	fi
 	for k in SQM_DOWN SQM_UP SQM_FALLBACK_DOWN SQM_FALLBACK_UP; do
-		_v=''; eval "_v=\${$k-}"; case $_v in *[!0-9]*) echo "$k must be a number (kbit/s)" ;; esac
+		_v=''; eval "_v=\${$k-}"; case $_v in *[!0-9]*|?????????*) echo "$k must be a number (kbit/s, at most 8 digits)" ;; esac
 	done
 	# Fixed SQM rates: both or neither, and not a typo that would choke the line.
 	if [ -n "${SQM_DOWN-}${SQM_UP-}" ]; then
-		case ${SQM_DOWN:-x}${SQM_UP:-x} in *[!0-9]*) echo "SQM_DOWN and SQM_UP must both be set (kbit/s), or both empty to measure the line" ;; *)
+		case ${SQM_DOWN:-x}${SQM_UP:-x} in *[!0-9]*|?????????????????*) echo "SQM_DOWN and SQM_UP must both be set (kbit/s), or both empty to measure the line" ;; *)
 			[ "$SQM_DOWN" -ge 100 ] && [ "$SQM_UP" -ge 100 ] || echo "SQM_DOWN and SQM_UP are in kbit/s and must be at least 100" ;; esac
 	fi
 	case ${SPEEDTEST_URL-} in ''|http://*|https://*) ;; *) echo "SPEEDTEST_URL must start with http:// or https://" ;; esac

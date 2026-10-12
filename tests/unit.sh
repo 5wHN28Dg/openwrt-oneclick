@@ -38,8 +38,19 @@ eq "sustained rate with uneven sample times" "$(printf '10.00 0\n11.50 1500000\n
 eq "no samples after the warm-up: empty" "$(printf '10.00 0\n11.00 5\n' | sustained_kbit 5)" ""
 eq "ping median" "$(printf 'PING 1.1.1.1\n64 bytes from 1.1.1.1: seq=0 ttl=55 time=12.345 ms\n64 bytes from 1.1.1.1: seq=1 ttl=55 time=80.1 ms\n64 bytes from 1.1.1.1: seq=2 ttl=55 time=15.0 ms\n3 packets transmitted\n' | rtt_median)" 15
 eq "ping without replies: empty" "$(printf 'PING 1.1.1.1\n5 packets transmitted, 0 packets received\n' | rtt_median)" ""
-eq "CPU busy share" "$(busy_percent 'cpu  100 0 100 800 0 0 0 0' 'cpu  150 0 150 900 0 0 0 0')" 50
-eq "CPU busy share: waiting on I/O is not busy" "$(busy_percent 'cpu  0 0 0 100 100 0 0 0' 'cpu  0 0 0 150 150 0 0 0')" 0
+eq "ping replies counted" "$(printf 'PING 1.1.1.1\n64 bytes: seq=0 time=12.3 ms\n64 bytes: seq=4 time=15 ms\n7 packets transmitted, 2 packets received\n' | rtt_replies)" 2
+eq "CPU busy share of one core" "$(busy_percent 'cpu0 100 0 100 800 0 0 0 0' 'cpu0 150 0 150 900 0 0 0 0')" 50
+eq "CPU: waiting on I/O is not busy" "$(busy_percent 'cpu0 0 0 0 100 100 0 0 0' 'cpu0 0 0 0 150 150 0 0 0')" 0
+# One of four cores does all the network work: that core counts, not the average.
+before='cpu0 0 0 0 1000 0 0 0 0
+cpu1 0 0 0 1000 0 0 0 0
+cpu2 0 0 0 1000 0 0 0 0
+cpu3 0 0 0 1000 0 0 0 0'
+after='cpu0 0 0 0 2000 0 0 0 0
+cpu1 0 0 50 1050 0 0 900 0
+cpu2 0 0 0 2000 0 0 0 0
+cpu3 100 0 0 1900 0 0 0 0'
+eq "CPU: the busiest core counts" "$(busy_percent "$before" "$after")" 95
 
 # --- quoting and the settings file -------------------------------------------
 nasty="it's \"q\" \$HOME \`id\` back\\slash
@@ -216,6 +227,7 @@ if [ "$rc" -ne 0 ] && grep -q "WIFI_KEY must be" "$T/short.out" && [ -z "$(ls -A
 	SQM_FALLBACK_DOWN=1000 SQM_DOWN=50000 SQM_UP=10000; eq "fixed SQM rates accepted" "$(check_settings)" ""
 	SQM_UP=''; eq "fixed SQM rate for one direction only rejected" "$(check_settings | grep -c SQM_DOWN)" 1
 	SQM_UP=50; eq "fixed SQM rate that looks like Mbit/s rejected" "$(check_settings | grep -c 'at least 100')" 1
+	SQM_UP=99999999999999999999; r=$(check_settings 2>&1); eq "absurdly large fixed SQM rate rejected, no shell error" "$(echo "$r" | grep -c 'SQM_UP must be a number')|$(echo "$r" | grep -ci 'out of range')" "1|0"
 	SQM_UP='10000; reboot'; eq "non-numeric fixed SQM rate rejected" "$(check_settings | grep -c 'SQM_UP must be a number')" 1
 	SQM_DOWN='' SQM_UP='' SPEEDTEST_URL='http://10.0.2.2:18080'; eq "speed test server accepted" "$(check_settings)" ""
 	SPEEDTEST_URL='speed.example'; eq "speed test server without http(s) rejected" "$(check_settings | grep -c SPEEDTEST_URL)" 1

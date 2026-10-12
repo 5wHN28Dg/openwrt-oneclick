@@ -567,7 +567,8 @@ pass "custom files kept across firmware upgrades${FAMILY_FILTER:+$(on "$FAMILY_F
 # measured longer and those seconds are left out.
 /etc/init.d/sqm stop >/dev/null 2>&1
 SPEED_URL=${SPEEDTEST_URL:-https://speed.cloudflare.com}
-case $LINK_TYPE in docsis*) SPEED_DUR=25 SPEED_WARM=10 ;; *) SPEED_DUR=12 SPEED_WARM=3 ;; esac
+# ("Not sure" may be cable too.)
+case $LINK_TYPE in docsis*|unsure) SPEED_DUR=25 SPEED_WARM=10 ;; *) SPEED_DUR=12 SPEED_WARM=3 ;; esac
 load() { # down|up SECONDS -> four streams; one "bytes http-code" line per transfer
 	end=$(( $(date +%s) + $2 ))
 	for _ in 1 2 3 4; do (
@@ -588,15 +589,25 @@ moved_kbit() { # FILE SECONDS -> kbit/s the transfers in FILE moved themselves
 measure() { # down|up -> sustained kbit/s on the WAN device; 0 if the test server gave nothing
 	out=/tmp/setup-speed.$$; smp=/tmp/setup-speed-samples.$$; : > $smp
 	case $1 in down) ctr=rx_bytes ;; *) ctr=tx_bytes ;; esac
+	cpu0=$(cpu_snapshot)
 	load "$1" $SPEED_DUR > $out &
 	i=0
 	while [ $i -le $SPEED_DUR ]; do
-		echo "$(cut -d' ' -f1 /proc/uptime) $(cat "/sys/class/net/$WAN_DEV/statistics/$ctr")" >> $smp
+		echo "$(cut -d' ' -f1 /proc/uptime) $(cat "/sys/class/net/$WAN_DEV/statistics/$ctr" 2>/dev/null)" >> $smp
 		sleep 1; i=$((i + 1))
 	done
 	wait
+	busy_percent "$cpu0" "$(cpu_snapshot)" > "/tmp/setup-speed.cpu-$1"
 	awk '$2 !~ /^(2|000)/ { print $2 }' $out >> /tmp/setup-speed.codes
-	if [ "$(moved_kbit $out $SPEED_DUR)" -gt 500 ]; then sustained_kbit $SPEED_WARM < $smp; else echo 0; fi
+	moved=$(moved_kbit $out $SPEED_DUR)
+	if [ "$moved" -gt 500 ]; then
+		rate=$(sustained_kbit $SPEED_WARM < $smp)
+		# No usable counter (device gone): what the transfers moved themselves.
+		[ "${rate:-0}" -gt 0 ] || rate=$moved
+		echo "$rate"
+	else
+		echo 0
+	fi
 	rm -f $out $smp
 }
 # Link-layer values for LINK_TYPE, computed by setup.sh from lib/laptop.sh.
@@ -610,15 +621,17 @@ if [ -n "${SQM_DOWN-}" ] && [ -n "${SQM_UP-}" ] && ! echo "$SQM_DOWN$SQM_UP" | g
 	SQM_MSG="SQM fixed rates from the settings: $RATE_DOWN / $RATE_UP kbit/s"
 else
 	step "SQM: measuring line speed (about $((SPEED_DUR * 2)) s)"
-	cpu0=$(head -n 1 /proc/stat)
 	DOWN=$(measure down); UP=$(measure up)
-	CPU_BUSY=$(busy_percent "$cpu0" "$(head -n 1 /proc/stat)")
+	CPU_DOWN=$(cat /tmp/setup-speed.cpu-down 2>/dev/null) CPU_UP=$(cat /tmp/setup-speed.cpu-up 2>/dev/null)
+	rm -f /tmp/setup-speed.cpu-down /tmp/setup-speed.cpu-up
 	codes=$(sort -u /tmp/setup-speed.codes 2>/dev/null | tr '\n' ' '); codes=${codes:-none}
 	if [ "${DOWN:-0}" -gt 1000 ] && [ "${UP:-0}" -gt 1000 ]; then
 		RATE_DOWN=$((DOWN * 90 / 100)) RATE_UP=$((UP * 90 / 100)) SQM_OK=1
 		SQM_MSG="SQM measured ${DOWN} down / ${UP} up kbit/s (sustained, after ${SPEED_WARM} s warm-up), shaping at 90%: $RATE_DOWN / $RATE_UP kbit/s"
-		# The test runs on this router: a CPU with nothing to spare was the limit, not the line.
-		[ "${CPU_BUSY:-0}" -ge 90 ] && info "the router's CPU was ${CPU_BUSY}% busy during the speed test, so the line may be faster than measured; if so, set SQM_DOWN/SQM_UP in private/config.env"
+		# The test runs on this router: a core with nothing to spare was the limit, not the line.
+		if [ "${CPU_DOWN:-0}" -ge 90 ] || [ "${CPU_UP:-0}" -ge 90 ]; then
+			info "a CPU core of the router was fully busy during the speed test (download ${CPU_DOWN:-?}%, upload ${CPU_UP:-?}%), so the line may be faster than measured; if so, set SQM_DOWN/SQM_UP in private/config.env"
+		fi
 	elif [ -n "${SQM_FALLBACK_DOWN-}" ] && [ -n "${SQM_FALLBACK_UP-}" ] \
 		&& ! echo "$SQM_FALLBACK_DOWN$SQM_FALLBACK_UP" | grep -q '[^0-9]'; then
 		RATE_DOWN=$SQM_FALLBACK_DOWN RATE_UP=$SQM_FALLBACK_UP SQM_OK=
@@ -661,24 +674,32 @@ if [ -n "$SQM_OK" ]; then pass "$SQM_MSG"; else fail "$SQM_MSG"; fi
 # both directions. Up to 30 ms more than idle is fine (the "A" grade of the
 # Waveform bufferbloat test); more means the rates are above what the line
 # really carries.
+# The pings start after the warm-up, so a cable line's extra speed at the
+# start is used up before they count.
 if [ -n "$RATE_DOWN" ]; then
-	step "SQM: latency under load (about 20 s)"
+	LOAD_DUR=$((SPEED_WARM + 8))
+	step "SQM: latency under load (about $((LOAD_DUR + 6)) s)"
 	PING_TO=1.1.1.1; [ -n "$HAS_V4" ] || PING_TO=2606:4700:4700::1111
 	RTT_IDLE=$(ping -c 5 -W 2 $PING_TO 2>/dev/null | rtt_median)
-	load down 10 > /tmp/setup-load-down.$$ &
-	load up 10 > /tmp/setup-load-up.$$ &
-	sleep 2
-	RTT_LOAD=$(ping -c 7 -W 2 $PING_TO 2>/dev/null | rtt_median)
+	load down $LOAD_DUR > /tmp/setup-load-down.$$ &
+	load up $LOAD_DUR > /tmp/setup-load-up.$$ &
+	sleep $SPEED_WARM
+	PINGS=$(ping -c 7 -W 2 $PING_TO 2>/dev/null)
 	wait
-	LOAD_DOWN=$(moved_kbit /tmp/setup-load-down.$$ 10) LOAD_UP=$(moved_kbit /tmp/setup-load-up.$$ 10)
+	RTT_LOAD=$(echo "$PINGS" | rtt_median) RTT_GOT=$(echo "$PINGS" | rtt_replies)
+	LOAD_DOWN=$(moved_kbit /tmp/setup-load-down.$$ $LOAD_DUR) LOAD_UP=$(moved_kbit /tmp/setup-load-up.$$ $LOAD_DUR)
 	rm -f /tmp/setup-load-down.$$ /tmp/setup-load-up.$$
-	if [ -z "$RTT_IDLE" ] || [ -z "$RTT_LOAD" ]; then
+	LOAD_MSG="load $LOAD_DOWN down / $LOAD_UP up kbit/s"
+	if [ -z "$RTT_IDLE" ]; then
 		info "SQM latency under load not checked: no ping replies from $PING_TO"
-	elif [ $((LOAD_DOWN * 2)) -lt "$RATE_DOWN" ] && [ $((LOAD_UP * 2)) -lt "$RATE_UP" ]; then
-		info "SQM latency under load not checked: the speed test server only gave $LOAD_DOWN down / $LOAD_UP up kbit/s, too little to fill the line"
+	elif [ $((LOAD_DOWN * 2)) -lt "$RATE_DOWN" ] || [ $((LOAD_UP * 2)) -lt "$RATE_UP" ]; then
+		# Not loaded in both directions: a good result would mean nothing.
+		info "SQM latency under load not checked: the $LOAD_MSG did not fill the line in both directions (shaped at $RATE_DOWN / $RATE_UP); the speed test server gave too little, or the rates are far above what the line carries"
+	elif [ "$RTT_GOT" -lt 4 ]; then
+		fail "SQM latency under load: only $RTT_GOT of 7 pings answered ($LOAD_MSG); lower the rates: set SQM_DOWN/SQM_UP in private/config.env below $RATE_DOWN / $RATE_UP"
 	else
 		RTT_ADD=$((RTT_LOAD - RTT_IDLE)); [ $RTT_ADD -lt 0 ] && RTT_ADD=0
-		RTT_MSG="SQM latency under load: +$RTT_ADD ms (idle $RTT_IDLE ms, loaded $RTT_LOAD ms, load $LOAD_DOWN down / $LOAD_UP up kbit/s)"
+		RTT_MSG="SQM latency under load: +$RTT_ADD ms (idle $RTT_IDLE ms, loaded $RTT_LOAD ms, $RTT_GOT of 7 pings answered, $LOAD_MSG)"
 		if [ $RTT_ADD -le 30 ]; then pass "$RTT_MSG"
 		else fail "$RTT_MSG; lower the rates: set SQM_DOWN/SQM_UP in private/config.env below $RATE_DOWN / $RATE_UP"; fi
 	fi

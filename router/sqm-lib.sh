@@ -20,8 +20,19 @@ rtt_median() {
 	sed -n 's/.*time=\([0-9.]*\) *ms.*/\1/p' | median
 }
 
-# busy_percent "BEFORE" "AFTER": two first lines of /proc/stat -> CPU busy % in between
+# cpu_snapshot -> the per-core lines of /proc/stat
+cpu_snapshot() { grep '^cpu[0-9]' /proc/stat; }
+
+# busy_percent "BEFORE" "AFTER": two cpu_snapshot results -> busy % of the
+# busiest core in between. One core doing all the network work is the limit
+# even while the others idle.
 busy_percent() {
-	printf '%s\n%s\n' "$1" "$2" | awk '{ t = 0; for (i = 2; i <= NF; i++) t += $i; idle = $5 + $6 }
-		NR == 1 { t1 = t; i1 = idle } NR == 2 { if (t > t1) printf "%d\n", 100 - (idle - i1) * 100 / (t - t1); else print 0 }'
+	printf '%s\n-\n%s\n' "$1" "$2" | awk '$1 == "-" { after = 1; next }
+		{ t = 0; for (i = 2; i <= NF; i++) t += $i; idle = $5 + $6 }
+		!after { t1[$1] = t; i1[$1] = idle; next }
+		($1 in t1) && t > t1[$1] { b = 100 - (idle - i1[$1]) * 100 / (t - t1[$1]); if (b > max) max = b }
+		END { printf "%d\n", max }'
 }
+
+# rtt_replies: ping output on stdin -> number of replies
+rtt_replies() { grep -c 'time=[0-9]'; }

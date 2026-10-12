@@ -7,7 +7,6 @@ measure (four streams -> four times the rate).
 
 Usage: speedsrv.py PORT DOWN_KBIT_PER_STREAM UP_KBIT_PER_STREAM
 """
-import socket
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -82,12 +81,4 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
-class Server(ThreadingHTTPServer):
-    def server_bind(self):
-        # A small receive buffer, so uploads are held back at the sender
-        # (as on a real line) instead of piling up here.
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32768)
-        super().server_bind()
-
-
-Server(("127.0.0.1", PORT), Handler).serve_forever()
+ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

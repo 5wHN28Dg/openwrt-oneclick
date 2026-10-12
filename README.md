@@ -81,13 +81,16 @@ bufferbloat, adjust. The setup does this on each run:
    The counter sees all traffic, so somebody streaming during the run doesn't
    lower the result. The rate is the median after a 3 s warm-up, so neither the
    ramp-up nor a short dip sets it. Cable lines often get about 10 s of extra
-   speed at the start: they are measured for 25 s and the first 10 s are left
-   out.
+   speed at the start: they (and "Not sure") are measured for 25 s and the
+   first 10 s are left out. If your router sits behind a cable modem, pick a
+   cable link type so this applies.
 2. **Shape** at 90% of that.
 3. **Check.** It pings while the line is loaded in both directions. Up to
    30 ms more than idle passes (the "A" grade of the
-   [Waveform test](https://www.waveform.com/tools/bufferbloat)); more is a FAIL
-   that tells you to lower the rates.
+   [Waveform test](https://www.waveform.com/tools/bufferbloat)); more, or most
+   pings lost, is a FAIL that tells you to lower the rates. If the load
+   doesn't fill the line in both directions, the report says the check could
+   not be done instead of passing it.
 
 To tune by hand, as the guide describes (raise the rates until latency
 appears, then back off), put the rates in `private/config.env`:
@@ -100,7 +103,8 @@ SQM_UP='19000'
 The check in step 3 still runs with fixed rates. Set them too if the report
 says the router's CPU was the limit during the speed test (a fast line on a
 small router measures low), or on a line whose speed changes during the day.
-`SQM_FALLBACK_DOWN/UP` are only used when the speed test fails.
+`SQM_FALLBACK_DOWN/UP`, if you set them, are only used when the speed test
+fails.
 
 ## Remote access
 
@@ -197,7 +201,7 @@ own install instructions do; the setup trusts that project.
 - adblock-lean's preset sizes its limits for its own lists. Family filtering
   raises the size limit for its lists; other extra lists must fit in what's left.
 - Cloudflare rate-limits repeated speed tests from one address for about an
-  hour; the setup then uses the rates saved in `SQM_FALLBACK_DOWN/UP`, or
+  hour; the setup then uses the rates you put in `SQM_FALLBACK_DOWN/UP`, or
   leaves SQM off and says so. Fixed rates (`SQM_DOWN/UP`) need no speed test.
 - SQM rates are fixed numbers: on lines whose speed varies a lot (mobile,
   Starlink) no single rate is right all day.
