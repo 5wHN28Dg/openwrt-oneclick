@@ -27,7 +27,27 @@ LIST=/etc/proton/servers
 RUN=/tmp/proton
 PARSE=/usr/share/proton-pick/parse.uc
 mkdir -p "$RUN"; chmod 700 "$RUN"
+T=$RUN/tmp.$$   # this run's temporary files
 log() { logger -t proton-pick "$*"; [ -t 1 ] && echo "$*"; return 0; }
+
+# One run at a time (cron, boot and manual runs can meet). A lock left by a
+# run that died is noticed through its PID and taken over.
+lock() {
+	i=0
+	until mkdir "$RUN/lock" 2>/dev/null; do
+		p=$(cat "$RUN/lock/pid" 2>/dev/null)
+		if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$RUN/lock"; continue; fi
+		i=$((i + 1)); [ $i -ge 180 ] && { log "another proton-pick run is still busy; giving up"; exit 1; }
+		sleep 1
+	done
+	echo $$ > "$RUN/lock/pid"
+	trap 'rm -rf "$RUN/lock" "$T".*' EXIT
+	trap 'exit 1' INT TERM
+}
+
+# Tokens go into files that are read back by the shell and into HTTP headers:
+# accept only the characters Proton's tokens are made of.
+token_ok() { case $1 in ''|*[!A-Za-z0-9._~+/=-]*) return 1 ;; esac; }
 
 # --- Proton API ----------------------------------------------------------------
 # The API host is on common block lists (including this router's), so it is
@@ -42,54 +62,53 @@ api_init() {
 		RESOLVE="--resolve $host:443:$ip" ;;
 	esac
 	(umask 077; printf '%s\n' "x-pm-uid: $PROTON_UID" 'x-pm-appversion: Other' \
-		'Accept: application/vnd.protonmail.v1+json' > "$RUN/headers")
+		'Accept: application/vnd.protonmail.v1+json' > "$T.headers")
 }
 api() { # PATH OUTFILE [curl args...] -> prints the HTTP status
 	p=$1 o=$2; shift 2
 	# shellcheck disable=SC2086
-	curl -s --max-time 60 $RESOLVE -H @"$RUN/headers" -o "$o" -w '%{http_code}' "$@" "$API$p"
+	curl -s --max-time 60 $RESOLVE -H @"$T.headers" -o "$o" -w '%{http_code}' "$@" "$API$p"
 }
 
 refresh() {
 	[ -f "$SESSION" ] || { log "no Proton session; run ./proton-login.sh on the laptop, then ./setup.sh"; return 1; }
 	# shellcheck source=/dev/null
 	. "$SESSION"
+	token_ok "$PROTON_UID" && token_ok "$PROTON_REFRESH" || { log "the session file is damaged; run ./proton-login.sh, then ./setup.sh"; return 1; }
 	api_init || return 1
 	(umask 077; printf '{"ResponseType":"token","GrantType":"refresh_token","RefreshToken":"%s","RedirectURI":"http://protonmail.ch"}' \
-		"$PROTON_REFRESH" > "$RUN/body")
-	code=$(api /auth/refresh "$RUN/auth.json" -H 'Content-Type: application/json' --data-binary @"$RUN/body")
-	rm -f "$RUN/body"
+		"$PROTON_REFRESH" > "$T.body")
+	code=$(api /auth/refresh "$T.auth" -H 'Content-Type: application/json' --data-binary @"$T.body")
 	case $code in
 	200) ;;
 	400|401|422)
 		log "Proton ended the session (HTTP $code); keeping the last server list. Run ./proton-login.sh on the laptop, then ./setup.sh"
-		: > "$RUN/session-ended"; rm -f "$RUN/auth.json" "$RUN/headers"; return 1 ;;
-	*)	log "session renewal failed (HTTP ${code:-none}); will retry"; rm -f "$RUN/auth.json" "$RUN/headers"; return 1 ;;
+		: > "$RUN/session-ended"; return 1 ;;
+	*)	log "session renewal failed (HTTP ${code:-none}); will retry"; return 1 ;;
 	esac
-	access=$(jsonfilter -i "$RUN/auth.json" -e '@.AccessToken')
-	new=$(jsonfilter -i "$RUN/auth.json" -e '@.RefreshToken')
-	rm -f "$RUN/auth.json" "$RUN/session-ended"
-	if [ -n "$new" ] && [ "$new" != "$PROTON_REFRESH" ]; then   # Proton rotates it: keep the new one
+	access=$(jsonfilter -i "$T.auth" -e '@.AccessToken')
+	new=$(jsonfilter -i "$T.auth" -e '@.RefreshToken')
+	rm -f "$RUN/session-ended"
+	token_ok "$access" && token_ok "$new" || { log "Proton's answer had unexpected tokens; keeping the current session"; return 1; }
+	if [ "$new" != "$PROTON_REFRESH" ]; then   # Proton rotates it: keep the new one
 		(umask 077; printf "# Proton VPN session (secret)\nPROTON_UID='%s'\nPROTON_REFRESH='%s'\n" \
 			"$PROTON_UID" "$new" > "$SESSION.tmp") && mv "$SESSION.tmp" "$SESSION"
 	fi
-	echo "Authorization: Bearer $access" >> "$RUN/headers"
+	echo "Authorization: Bearer $access" >> "$T.headers"
 
-	code=$(api /vpn/v2 "$RUN/vpn.json")
-	tier=$(jsonfilter -i "$RUN/vpn.json" -e '@.VPN.MaxTier' 2>/dev/null); rm -f "$RUN/vpn.json"
-	[ "$code" = 200 ] && [ -n "$tier" ] || { log "account info failed (HTTP $code)"; rm -f "$RUN/headers"; return 1; }
-	code=$(api '/vpn/v1/logicals?SecureCoreFilter=all&WithState=true' "$RUN/logicals.json" --compressed)
-	rm -f "$RUN/headers"
-	if [ "$code" != 200 ]; then log "server list failed (HTTP $code)"; rm -f "$RUN/logicals.json"; return 1; fi
-	ucode "$PARSE" "$RUN/logicals.json" "$tier" "$COUNTRIES" > "$RUN/loads.new"
-	rm -f "$RUN/logicals.json"
-	[ -s "$RUN/loads.new" ] || { log "server list had no usable servers; keeping the last one"; rm -f "$RUN/loads.new"; return 1; }
-	mv "$RUN/loads.new" "$RUN/loads"
+	code=$(api /vpn/v2 "$T.vpn")
+	tier=$(jsonfilter -i "$T.vpn" -e '@.VPN.MaxTier' 2>/dev/null)
+	case $code:$tier in 200:[0-9]*) ;; *) log "account info failed (HTTP $code)"; return 1 ;; esac
+	code=$(api '/vpn/v1/logicals?SecureCoreFilter=all&WithState=true' "$T.list" --compressed)
+	if [ "$code" != 200 ]; then log "server list failed (HTTP $code)"; return 1; fi
+	ucode "$PARSE" "$T.list" "$tier" "$COUNTRIES" > "$T.loads"
+	rm -f "$T.list"
+	[ -s "$T.loads" ] || { log "server list had no usable servers; keeping the last one"; return 1; }
+	mv "$T.loads" "$RUN/loads"
 	# Flash copy without loads, written only when servers come or go.
-	awk '{ print $1, $3, $4, $5 }' "$RUN/loads" | sort > "$RUN/servers"
+	awk '{ print $1, $3, $4, $5 }' "$RUN/loads" | sort > "$T.servers"
 	mkdir -p /etc/proton; chmod 700 /etc/proton
-	cmp -s "$RUN/servers" "$LIST" || cp "$RUN/servers" "$LIST"
-	rm -f "$RUN/servers"
+	cmp -s "$T.servers" "$LIST" || cp "$T.servers" "$LIST"
 	log "server list: $(wc -l < "$RUN/loads") servers (plan tier $tier)"
 }
 
@@ -98,9 +117,18 @@ current() { wg show "$IFACE" endpoints 2>/dev/null | awk 'NR == 1 { print $1 }';
 handshake_age() {
 	t=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk 'NR == 1 { print $2 }')
 	if [ "${t:-0}" -gt 0 ]; then echo $(( $(date +%s) - t )); return; fi
-	# Never had one: count from when the interface came up.
-	up=$(ifstatus "$IFACE" 2>/dev/null | jsonfilter -e '@.uptime' 2>/dev/null)
-	echo "${up:-0}"
+	# Never had one: count from the last switch (a new server gets its own
+	# grace period) or else from when the interface came up.
+	up=$(ifstatus "$IFACE" 2>/dev/null | jsonfilter -e '@.uptime' 2>/dev/null); up=${up:-0}
+	last=$(cat "$RUN/last-switch" 2>/dev/null || echo 0)
+	since=$(( $(date +%s) - last ))
+	[ "$since" -lt "$up" ] && up=$since
+	echo "$up"
+}
+# The WAN itself answers (then a stale tunnel is the server's fault, not the line's).
+wan_up() {
+	ping -4 -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 || ping -4 -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 ||
+		ping -6 -c 1 -W 3 2606:4700:4700::1111 >/dev/null 2>&1
 }
 listed() { [ -f "$LIST" ] && awk -v k="$1" '$4 == k { f = 1 } END { exit !f }' "$LIST"; }
 name_of() { awk -v k="$1" '$4 == k { print $2 }' "$LIST" 2>/dev/null; }
@@ -113,15 +141,14 @@ best() {
 		awk -v x="$1" '$4 != x && !seen[$1]++ { print $1, 100, $2, $3, $4 }' "$LIST"
 	else
 		sort -k1,1 -k2,2n "$src" | awk -v x="$1" '$5 != x && !seen[$1]++'
-	fi > "$RUN/cands"
-	: > "$RUN/rtt"
+	fi > "$T.cands"
+	: > "$T.rtt"
 	while read -r _ load name ip key; do
 		( r=$(ping -c 3 -W 2 "$ip" 2>/dev/null | awk -F/ '/round-trip/ { print int($4 + 0.5) }')
-		  echo "${r:-99999} $load $name $ip $key" >> "$RUN/rtt" ) &
-	done < "$RUN/cands"
+		  echo "${r:-99999} $load $name $ip $key" >> "$T.rtt" ) &
+	done < "$T.cands"
 	wait
-	sort -n -k1,1 -k2,2n "$RUN/rtt" | awk 'NR == 1 { why = ($1 == 99999) ? "no ping answers, lowest load " $2 "%" : $1 " ms, load " $2 "%"; print $3, $4, $5, why }'
-	rm -f "$RUN/cands" "$RUN/rtt"
+	sort -n -k1,1 -k2,2n "$T.rtt" | awk 'NR == 1 { why = ($1 == 99999) ? "no ping answers, lowest load " $2 "%" : $1 " ms, load " $2 "%"; print $3, $4, $5, why }'
 }
 
 switch_to() { # NAME IP KEY WHY REASON
@@ -129,10 +156,16 @@ switch_to() { # NAME IP KEY WHY REASON
 	peer=$(uci -q show network | sed -n "s/^network\.\(@wireguard_$IFACE\[0\]\)=.*/\1/p")
 	[ -n "$peer" ] || { log "no WireGuard peer for $IFACE in /etc/config/network"; return 1; }
 	port=$(uci -q get "network.$peer.endpoint_port"); port=${port:-51820}
-	ka=$(uci -q get "network.$peer.persistent_keepalive"); ka=${ka:-25}
+	ka=$(uci -q get "network.$peer.persistent_keepalive"); [ "${ka:-0}" -gt 0 ] || ka=25
 	allowed=$(uci -q get "network.$peer.allowed_ips" | tr ' ' ',')
+	psk=$(uci -q get "network.$peer.preshared_key")
 	[ -n "$old" ] && wg set "$IFACE" peer "$old" remove
-	wg set "$IFACE" peer "$3" endpoint "$2:$port" allowed-ips "${allowed:-0.0.0.0/0,::/0}" persistent-keepalive "$ka"
+	if [ -n "$psk" ]; then
+		(umask 077; echo "$psk" > "$T.psk")
+		wg set "$IFACE" peer "$3" preshared-key "$T.psk" endpoint "$2:$port" allowed-ips "${allowed:-0.0.0.0/0,::/0}" persistent-keepalive "$ka"
+	else
+		wg set "$IFACE" peer "$3" endpoint "$2:$port" allowed-ips "${allowed:-0.0.0.0/0,::/0}" persistent-keepalive "$ka"
+	fi
 	uci set "network.$peer.public_key=$3"
 	uci set "network.$peer.endpoint_host=$2"
 	uci set "network.$peer.description=Proton $1"
@@ -155,6 +188,9 @@ check() {
 	# Give a new server time to answer before moving on again.
 	last=$(cat "$RUN/last-switch" 2>/dev/null || echo 0)
 	[ $(( $(date +%s) - last )) -lt 300 ] && return 0
+	# A dead line makes every server look dead: wait for the line instead of
+	# switching (and writing flash) over and over.
+	wan_up || { log "tunnel stale but the internet line is down; not switching"; return 0; }
 	# shellcheck disable=SC2046  # NAME IP KEY why... as words
 	set -- $(best "$key")
 	[ $# -ge 3 ] || { log "no other server to switch to"; return 1; }
@@ -173,8 +209,8 @@ status() {
 }
 
 case ${1-} in
-	refresh) refresh; rc=$?; check; exit $rc ;;
-	check) check ;;
+	refresh) lock; refresh; rc=$?; check; exit $rc ;;
+	check) lock; check ;;
 	status) status ;;
 	*) echo "usage: $0 refresh|check|status" >&2; exit 2 ;;
 esac

@@ -159,6 +159,8 @@ eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config
 	eq "w1 Proton server choice" "$PROTON_AUTO|$PROTON_COUNTRIES" "1|PL CH"
 	PROTON_COUNTRIES='PL; reboot'; eq "bad Proton countries rejected" "$(check_settings | grep -c PROTON_COUNTRIES)" 1
 	PROTON_COUNTRIES=PL PROTON_API='ftp://x'; eq "bad Proton API rejected" "$(check_settings | grep -c PROTON_API)" 1
+	PROTON_API='http://10.0.2.2:1'; eq "plain-http Proton API rejected outside tests" "$(check_settings | grep -c PROTON_API)" 1
+	eq "plain-http Proton API allowed in tests" "$(ONECLICK_TEST=1 check_settings | grep -c PROTON_API)" 0
 	PROTON_API='' ENABLE_VPN=0; eq "Proton server choice is ignored without the VPN" "$(check_settings | grep -c PROTON)" 0
 	eq "w1 remote" "$ENABLE_REMOTE|$REMOTE_HOST|$REMOTE_PORT|$REMOTE_NET" "1|home.example.org|51820|10.77.0.0/24"
 	eq "w1 remote devices" "$(remote_devices)" "phone tablet"

@@ -39,6 +39,7 @@ CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/openwrt-oneclick
 IMG=openwrt-$VER-x86-64-generic-squashfs-combined.img
 W=$(mktemp -d)
 QPID='' SPID='' XPID=''
+export ONECLICK_TEST=1   # allows the plain-http Proton API stand-in
 SPORT=${SPEED_PORT:-18080}
 XPORT=${PROTON_PORT:-18181}
 cleanup() { for p in "$QPID" "$SPID" "$XPID"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; rm -rf "$W"; }
@@ -180,6 +181,16 @@ proton_checks() {
 		|| bad "Proton failover (want '127.0.0.2 198.51.100.9 198.51.100.9:51820'): $r"
 	r=$(vm_ssh 'proton-pick refresh >/dev/null 2>&1; echo $?; grep -c "refresh-2" /etc/proton/session; logread | grep -cE "refresh-[0-9]|access-[0-9]|uid-test"' | tr '\n' ' ')
 	[ "$r" = "0 1 0 " ] && ok "Proton: next refresh uses the rotated token; no tokens in the system log" || bad "Proton refresh/log (want '0 1 0'): $r"
+	# A dead internet line makes every server look dead: no switching (and no flash writes) then.
+	r=$(vm_ssh 'ifdown wan; sleep 2; sed -i "s/^STALE=.*/STALE=1/" /etc/proton-pick.conf; echo 0 > /tmp/proton/last-switch
+		proton-pick check; uci -q get network.@wireguard_testvpn[0].endpoint_host; logread | grep -c "internet line is down"
+		sed -i "s/^STALE=.*/STALE=180/" /etc/proton-pick.conf; ifup wan; i=0; until ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || [ $i -ge 40 ]; do sleep 1; i=$((i+1)); done' | tr '\n' ' ')
+	[ "$r" = "198.51.100.9 1 " ] && ok "Proton: no switching while the internet line is down" || bad "Proton with the line down (want '198.51.100.9 1'): $r"
+	# Two runs at once (cron + boot + by hand): one waits for the other.
+	r=$(vm_ssh 'proton-pick refresh >/tmp/a 2>&1 & proton-pick refresh >/tmp/b 2>&1; wait
+		[ -f /tmp/proton/session-ended ] && echo ended; grep -c "refresh-4" /etc/proton/session' | tr '\n' ' ')
+	[ "$r" = "1 " ] && ok "Proton: two refreshes at once run one after the other (token rotated twice, session intact)" \
+		|| bad "Proton concurrent refreshes (want '1'): $r"
 }
 
 # After the re-run: the chosen server is kept; an ended session keeps the list.
@@ -187,6 +198,9 @@ proton_rerun_checks() {
 	r=$(vm_ssh 'uci -q get network.@wireguard_testvpn[0].endpoint_host')
 	[ "$r" = 198.51.100.9 ] && ok "Proton: re-run kept the server proton-pick chose" || bad "Proton: re-run reset the server to $r"
 	grep -q 'new Proton session installed' "$W/full-rerun.log" && bad "Proton: re-run sent a stale session" || ok "Proton: re-run left the router's own session alone"
+	curl -s "http://127.0.0.1:$XPORT/_evil" >/dev/null
+	r=$(vm_ssh 'proton-pick refresh >/dev/null 2>&1; echo $?; grep -c "PWNED" /etc/proton/session; [ -e /tmp/PWNED ] && echo pwned; logread | grep -c "unexpected tokens"' | tr '\n' ' ')
+	[ "$r" = "1 0 1 " ] && ok "Proton: a token with shell quotes is refused, never stored or run" || bad "Proton evil token (want '1 0 1'): $r"
 	curl -s "http://127.0.0.1:$XPORT/_end" >/dev/null
 	r=$(vm_ssh 'proton-pick refresh >/dev/null 2>&1; echo $?; proton-pick status | grep -c "session:    ENDED"; wc -l < /etc/proton/servers' | tr '\n' ' ')
 	[ "$r" = "1 1 3 " ] && ok "Proton: ended session reported in status, last list kept" || bad "Proton ended session (want '1 1 3'): $r"
@@ -323,12 +337,14 @@ scenario_full() {
 		SSH_KEY_OLD=$SSH_KEY SSH_PUBKEYS_OLD=$SSH_PUBKEYS SSH_KEY=$W/key2 SSH_PUBKEYS=$(cat "$W/key2.pub")
 		write_config "$P/config.env"
 	)
+	printf "PROTON_UID='uid-test'\nPROTON_REFRESH='refresh-x'\n" > "$P/proton-session"
 	run_setup "$P" "$W/full-off.log"
+	[ -f "$P/proton-session" ] && ok "Proton: with the VPN off the laptop session is not sent and stays" || bad "Proton: laptop session deleted though the VPN is off"
 	VM_KEY=$W/key2   # the router now only knows the new key
 	left=$(vm_ssh 'uci show network | grep -c testvpn; uci show firewall | grep -c "name=.testvpn."; uci -q get dhcp.@dnsmasq[0].address | grep -c "::"' | tr '\n' ' ')
 	[ "$left" = "0 0 0 " ] && ok "VPN turned off: interface, zone and IPv6 suppression removed" || bad "VPN leftovers (network firewall aaaa): $left"
-	left=$(vm_ssh 'ls -d /etc/proton /etc/proton-pick.conf /usr/sbin/proton-pick 2>/dev/null; grep -c proton-pick /etc/crontabs/root /etc/rc.local' | tr '\n' ' ')
-	[ "$left" = "/etc/crontabs/root:0 /etc/rc.local:0 " ] && ok "VPN turned off: Proton session, settings and jobs removed" || bad "Proton leftovers: $left"
+	left=$(vm_ssh 'ls -d /etc/proton /etc/proton-pick.conf /usr/sbin/proton-pick 2>/dev/null; grep -c proton /etc/crontabs/root /etc/rc.local /etc/sysupgrade.conf' | tr '\n' ' ')
+	[ "$left" = "/etc/crontabs/root:0 /etc/rc.local:0 /etc/sysupgrade.conf:0 " ] && ok "VPN turned off: Proton session, settings and jobs removed" || bad "Proton leftovers: $left"
 	left=$(vm_ssh 'uci show network | grep -c "remote"; uci show firewall | grep -c "remote\|Remote"; wg show remote 2>/dev/null | grep -c peer' | tr '\n' ' ')
 	[ "$left" = "0 0 0 " ] && ok "remote access turned off: interface, peers, lan-zone entry and port rule removed" || bad "remote access leftovers (network firewall peers): $left"
 	oldk=$(cut -d' ' -f2 "$W/key.pub")

@@ -27,7 +27,7 @@ SECURE_CORE, TOR = 1, 2
 ap = argparse.ArgumentParser()
 ap.add_argument("--ip", required=True, help=f"address of {API_HOST}")
 ap.add_argument("--private", required=True, help="private/ directory")
-ap.add_argument("--countries", default="RO PL CH", help="exit countries, best first")
+ap.add_argument("--countries", default="RO PL CH", help="exit countries to list (the router picks by ping)")
 args = ap.parse_args()
 
 # Pin the API host name to the given address for this process only.
@@ -110,7 +110,7 @@ try:
 finally:
     os.umask(old)
 
-say(f"\nPlan tier {tier}. {len(rows)} usable servers in {' '.join(want)} (country order, then load):")
+say(f"\nPlan tier {tier}. {len(rows)} usable servers in {' '.join(want)} (by country, then load; the router picks by ping):")
 for _, load, cc, name, ip, _key in rows[:12]:
     say(f"  {cc}  {name:<12} load {load:>3}%  {ip}")
 say(f"\nSaved private/proton-session (session for the router) and private/proton-servers.txt.")

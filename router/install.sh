@@ -340,6 +340,7 @@ if [ -n "$VPN" ] && on "${PROTON_AUTO:-0}"; then
 	[ -f /etc/proton/session ] || info "Proton server choice is on but has no session yet: run ./proton-login.sh, then ./setup.sh"
 else
 	rm -rf /etc/proton /etc/proton-pick.conf /usr/sbin/proton-pick /usr/share/proton-pick /tmp/proton
+	sed -i '\#^/usr/sbin/proton-pick$#d; \#^/usr/share/proton-pick/$#d; \#^/etc/proton/$#d; \#^/etc/proton-pick.conf$#d' /etc/sysupgrade.conf
 fi
 
 # ---------------------------------------------------------------- remote access
@@ -575,7 +576,10 @@ if on "${FAMILY_FILTER:-0}"; then
 	echo "50 4 * * * /usr/sbin/redlib-block" >> /etc/crontabs/root
 	sed -i 's|^exit 0$|(sleep 30; /usr/sbin/safesearch-hosts) \&\nexit 0|' /etc/rc.local
 fi
-for f in /usr/sbin/proton-pick /usr/share/proton-pick/ /etc/proton/ /etc/proton-pick.conf /usr/sbin/safesearch-hosts /usr/sbin/redlib-block /etc/redlib-block.allow /etc/init.d/adblock-lean /usr/lib/adblock-lean/ /etc/adblock-lean/ /www/mangadex-safe/ /www/cgi-bin/md; do
+[ -f /etc/proton-pick.conf ] && for f in /usr/sbin/proton-pick /usr/share/proton-pick/ /etc/proton/ /etc/proton-pick.conf; do
+	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
+done
+for f in /usr/sbin/safesearch-hosts /usr/sbin/redlib-block /etc/redlib-block.allow /etc/init.d/adblock-lean /usr/lib/adblock-lean/ /etc/adblock-lean/ /www/mangadex-safe/ /www/cgi-bin/md; do
 	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 done
 pass "custom files kept across firmware upgrades${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo '; safe search every 30 min, Redlib list daily 04:50')}"
@@ -787,6 +791,7 @@ info "after restart: IPv6 $(yes_no "$HAS_V6" 'usable (banIP covers IPv6)' 'not u
 if [ -n "$VPN" ]; then
 	/etc/init.d/pbr enable; /etc/init.d/pbr restart >/dev/null 2>&1
 	if [ -f /etc/proton-pick.conf ] && [ -f /etc/proton/session ]; then
+		rm -f /tmp/proton/loads   # a PASS below must come from this refresh
 		/usr/sbin/proton-pick refresh >/dev/null 2>&1
 		if [ -f /tmp/proton/session-ended ]; then
 			fail "Proton ended the session: run ./proton-login.sh, then ./setup.sh"

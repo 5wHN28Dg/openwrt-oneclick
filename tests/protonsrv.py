@@ -13,6 +13,7 @@ the new token fails on its next refresh.
   GET  /vpn/v1/logicals    -> the fixed list below              (needs the access token)
   GET  /_end               -> end the session (later refreshes get 422)
   GET  /_new               -> a new session from "refresh-new" (a fresh login)
+  GET  /_evil              -> the next refresh answers with a token holding shell quotes
   GET  /_stats             -> {"refreshes": N, "list_fetches": N}
 """
 import base64
@@ -22,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1])
 UID = "uid-test"
-state = {"refresh": "refresh-0", "access": None, "n": 0, "ended": False, "lists": 0}
+state = {"refresh": "refresh-0", "access": None, "n": 0, "ended": False, "lists": 0, "evil": False}
 
 
 def key(i):
@@ -72,6 +73,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(422, {"Code": 10013, "Error": "Invalid refresh token"})
         state["n"] += 1
         state["refresh"] = f"refresh-{state['n']}"
+        if state["evil"]:
+            state["evil"] = False
+            state["refresh"] = "x'; touch /tmp/PWNED; '"
         state["access"] = f"access-{state['n']}"
         self.reply(200, {"Code": 1000, "AccessToken": state["access"], "RefreshToken": state["refresh"],
                          "ExpiresIn": 86400, "UID": UID})
@@ -80,6 +84,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/_end":
             state["ended"] = True
             return self.reply(200, {"ended": True})
+        if self.path == "/_evil":
+            state["evil"] = True
+            return self.reply(200, {"evil": True})
         if self.path == "/_new":
             state.update(ended=False, refresh="refresh-new", access=None)
             return self.reply(200, {"refresh": "refresh-new"})

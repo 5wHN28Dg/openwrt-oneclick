@@ -117,7 +117,10 @@ check_settings() {
 	done
 	if [ "${PROTON_AUTO-}" = 1 ] && [ "${ENABLE_VPN-}" = 1 ]; then   # unused without the VPN
 		case ${PROTON_COUNTRIES-} in *[!A-Z\ ]*) echo "PROTON_COUNTRIES must be two-letter codes like 'PL CH'" ;; esac
-		case ${PROTON_API:-https://vpn-api.proton.me} in http://*|https://*) ;; *) echo "PROTON_API must start with http:// or https://" ;; esac
+		# http:// only for the test stand-in (tests/vm.sh): tokens would travel in clear text.
+		case ${PROTON_API:-https://vpn-api.proton.me} in https://*) ;;
+			http://*) [ "${ONECLICK_TEST-}" = 1 ] || echo "PROTON_API must use https://" ;;
+			*) echo "PROTON_API must start with https://" ;; esac
 		case ${PROTON_API-} in *[!A-Za-z0-9:/._-]*) echo "PROTON_API has unexpected characters" ;; esac
 	fi
 	for k in SQM_FALLBACK_DOWN SQM_FALLBACK_UP; do   # kbit/s, not Mbit/s

@@ -252,7 +252,7 @@ for f in blocklist.txt allowlist.txt; do [ -f "$PRIV/$f" ] && cp "$PRIV/$f" "$ST
 # A Proton session from ./proton-login.sh goes to the router, which renews it
 # from then on (each renewal replaces the token, so the laptop copy goes stale).
 SENT_SESSION=
-if [ "${PROTON_AUTO:-0}" = 1 ] && [ -f "$PRIV/proton-session" ]; then
+if [ "${PROTON_AUTO:-0}" = 1 ] && [ "${ENABLE_VPN:-0}" = 1 ] && [ -f "$PRIV/proton-session" ]; then
 	cp "$PRIV/proton-session" "$STAGE/b/private/"; SENT_SESSION=1
 fi
 [ -d "$PRIV/host_keys" ] && cp -R "$PRIV/host_keys" "$STAGE/b/private/host_keys"
@@ -342,9 +342,16 @@ if [ "${ENABLE_REMOTE-}" != 1 ] && [ "$rc" != 1 ] && [ -d "$PRIV/remote" ]; then
 	rm -f "$PRIV"/remote/*.conf; rmdir "$PRIV/remote" 2>/dev/null
 fi
 
-if [ -n "$SENT_SESSION" ] && [ "$rc" != 1 ]; then
-	rm -f "$PRIV/proton-session"
-	say "The router now holds the Proton session (removed the laptop copy)."
+if [ -n "$SENT_SESSION" ]; then
+	# Only once the router holds this very session (same UID): it renews it from now on.
+	mine=$(sed -n "s/^PROTON_UID='\([A-Za-z0-9._~+=-]*\)'$/\1/p" "$PRIV/proton-session")
+	theirs=; [ -n "$mine" ] && ssh_r "grep -qxF \"PROTON_UID='$mine'\" /etc/proton/session" 2>/dev/null && theirs=$mine
+	if [ -n "$mine" ] && [ "$mine" = "$theirs" ]; then
+		rm -f "$PRIV/proton-session"
+		say "The router now holds the Proton session (removed the laptop copy)."
+	else
+		say "The router did not take the Proton session; the laptop copy stays for the next run."
+	fi
 fi
 
 case $rc in
