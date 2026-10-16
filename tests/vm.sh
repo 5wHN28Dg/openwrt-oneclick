@@ -249,15 +249,30 @@ proton_rerun_checks() {
 		&& ok "Proton: after a new login, setup.sh installs the new session and the list refreshes" || bad "Proton re-login (status present: $r): $(grep -i proton "$W/full-relogin.log" | tr '\n' ' ')"
 }
 
+# The upload side of the test line: a 10 Mbit/s shaper on the VM's WAN, where
+# a real line's limit is. The speed stand-in's own pace can't do this: qemu's
+# user network queues up to the host's TCP send buffer (4 MB per connection)
+# ahead of it and refills that in bursts every few seconds, so the router's
+# byte counter swung between ~6 and ~11 Mbit/s (6 of 16 runs off; with the
+# shaper 0 of 16, each second within 2% of 10). It stays through the install's
+# package installs and "sqm stop"; the SQM it sets up replaces it afterwards.
+shape_line() {
+	i=0; until vm_ssh true 2>/dev/null; do i=$((i + 1)); [ $i -ge 40 ] && { bad "VM did not come up"; return 1; }; sleep 3; done
+	r=$(vm_ssh 'i=0; until ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || [ $i -ge 30 ]; do sleep 1; i=$((i + 1)); done
+		apk update >/dev/null 2>&1 && apk add tc-tiny kmod-sched-core >/dev/null 2>&1 &&
+		tc qdisc replace dev eth1 root tbf rate 10mbit burst 32kb latency 100ms && tc qdisc show dev eth1 root')
+	case $r in *"tbf"*"rate 10Mbit"*) ;; *) bad "test line shaper not set up: $r" ;; esac
+}
+
 scenario_full() {
 	echo "== full: every option on"
 	start_vm; P=$W/p-full; make_private "$P" full
+	shape_line
 	run_setup "$P" "$W/full.log"
 	abl_check
-	# SQM: 8 streams at 2.5/1.25 Mbit/s each = 20/10 Mbit/s, shaped at 90%. The
-	# bounds allow for packet framing (counted, about 4%) and for upload data
-	# that this computer's socket buffers take in before the server's pace
-	# holds the VM back (seen: 12.2 Mbit/s measured).
+	# SQM: 8 streams at 2.5 Mbit/s each = 20 Mbit/s down; 10 Mbit/s up (the
+	# shaper, see shape_line); shaped at 90%. The bounds allow for packet
+	# framing (counted, about 4%).
 	if [ -n "$SPEED_URL" ]; then
 		r=$(vm_ssh 'uci -q get sqm.wan.download; uci -q get sqm.wan.upload' | tr '\n' ' ')
 		# shellcheck disable=SC2086  # two numbers
