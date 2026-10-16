@@ -8,6 +8,7 @@ TZ_NAME TZ_POSIX WAN_PROTO PPPOE_USER PPPOE_PASS LINK_TYPE SQM_DOWN SQM_UP SQM_F
 FAMILY_FILTER ADBLOCK_EXTRA_LISTS BANIP_FEEDS REDLIB_ALLOW
 ENABLE_VPN VPN_IFACE WG_PRIVATE_KEY WG_ADDRESSES WG_DNS WG_PEER_PUBLIC_KEY WG_PRESHARED_KEY
 WG_ENDPOINT_HOST WG_ENDPOINT_PORT WG_ALLOWED_IPS WG_KEEPALIVE VPN_ROUTE_DOMAINS VPN_ROUTE_SUBNETS
+PROTON_AUTO PROTON_COUNTRIES PROTON_API
 ENABLE_MANGADEX ULA_PREFIX
 ENABLE_REMOTE REMOTE_HOST REMOTE_PORT REMOTE_NET REMOTE_SERVER_KEY REMOTE_PEERS'
 
@@ -114,6 +115,14 @@ check_settings() {
 	for k in SQM_DOWN SQM_UP SQM_FALLBACK_DOWN SQM_FALLBACK_UP; do
 		_v=''; eval "_v=\${$k-}"; case $_v in *[!0-9]*|?????????*) echo "$k must be a number (kbit/s, at most 8 digits)" ;; esac
 	done
+	if [ "${PROTON_AUTO-}" = 1 ] && [ "${ENABLE_VPN-}" = 1 ]; then   # unused without the VPN
+		case ${PROTON_COUNTRIES-} in *[!A-Z\ ]*) echo "PROTON_COUNTRIES must be two-letter codes like 'PL CH'" ;; esac
+		# http:// only for the test stand-in (tests/vm.sh): tokens would travel in clear text.
+		case ${PROTON_API:-https://vpn-api.proton.me} in https://*) ;;
+			http://*) [ "${ONECLICK_TEST-}" = 1 ] || echo "PROTON_API must use https://" ;;
+			*) echo "PROTON_API must start with https://" ;; esac
+		case ${PROTON_API-} in *[!A-Za-z0-9:/._-]*) echo "PROTON_API has unexpected characters" ;; esac
+	fi
 	for k in SQM_FALLBACK_DOWN SQM_FALLBACK_UP; do   # kbit/s, not Mbit/s
 		_v=''; eval "_v=\${$k-}"; case $_v in ''|*[!0-9]*|?????????*) ;; *) [ "$_v" -ge 100 ] || echo "$k is in kbit/s and must be at least 100" ;; esac
 	done

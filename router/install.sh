@@ -265,6 +265,21 @@ uci commit network
 pass "time zone ${TZ_NAME:-UTC}, NTP by IP (no DNS needed), packet steering on all CPUs"
 
 # ---------------------------------------------------------------- VPN
+# A cron or boot proton-pick run must not work on the VPN while it changes
+# here: take its lock (released below, before anything is started).
+exec 9>/var/lock/proton-pick.lock
+i=0   # BusyBox flock has no timeout: try every second, for up to 15 minutes
+until flock -n 9; do
+	i=$((i + 1)); [ $i -ge 900 ] && { info "proton-pick was busy for 15 minutes; going on"; break; }
+	sleep 1
+done
+# The server proton-pick switched to (if still listed) survives a re-run.
+PREV_KEY='' PREV_HOST=''
+if [ -n "$VPN" ] && on "${PROTON_AUTO:-0}"; then
+	PREV_KEY=$(uci -q get "network.@wireguard_${VPN}[0].public_key")
+	PREV_HOST=$(uci -q get "network.@wireguard_${VPN}[0].endpoint_host")
+	awk -v k="$PREV_KEY" '$4 == k { f = 1 } END { exit !f }' /etc/proton/servers 2>/dev/null || PREV_KEY='' PREV_HOST=''
+fi
 # VPN interfaces from earlier runs (tagged setup=1) go first, also when the VPN
 # is now off or renamed.
 for i in $(uci -q show network | sed -n "s/^network\.\([^.]*\)\.setup='1'$/\1/p"); do
@@ -283,10 +298,13 @@ if [ -n "$VPN" ]; then
 	uci set "network.$VPN.multipath=off"
 	uci add network "wireguard_$VPN" >/dev/null
 	uci set "network.@wireguard_${VPN}[-1].description=VPN peer"
-	uci set "network.@wireguard_${VPN}[-1].public_key=$WG_PEER_PUBLIC_KEY"
-	uci set "network.@wireguard_${VPN}[-1].endpoint_host=$WG_ENDPOINT_HOST"
+	uci set "network.@wireguard_${VPN}[-1].public_key=${PREV_KEY:-$WG_PEER_PUBLIC_KEY}"
+	uci set "network.@wireguard_${VPN}[-1].endpoint_host=${PREV_HOST:-$WG_ENDPOINT_HOST}"
 	uci set "network.@wireguard_${VPN}[-1].endpoint_port=$WG_ENDPOINT_PORT"
-	uci set "network.@wireguard_${VPN}[-1].persistent_keepalive=${WG_KEEPALIVE:-25}"
+	ka=${WG_KEEPALIVE:-25}
+	# proton-pick tells a dead server by its handshakes: keep the tunnel talking.
+	on "${PROTON_AUTO:-0}" && [ "$ka" -eq 0 ] && ka=25
+	uci set "network.@wireguard_${VPN}[-1].persistent_keepalive=$ka"
 	for a in ${WG_ADDRESSES-}; do uci add_list "network.$VPN.addresses=$a"; done
 	for a in ${WG_DNS-}; do uci add_list "network.$VPN.dns=$a"; done
 	for a in ${WG_ALLOWED_IPS:-0.0.0.0/0 ::/0}; do uci add_list "network.@wireguard_${VPN}[-1].allowed_ips=$a"; done
@@ -316,8 +334,33 @@ if [ -n "$VPN" ]; then
 		for d in ${VPN_ROUTE_DOMAINS-}; do echo "/$d/::"; done > /etc/oneclick-vpn-aaaa
 	fi
 	uci commit pbr
-	pass "WireGuard $VPN to $WG_ENDPOINT_HOST; PBR: ${VPN_ROUTE_DOMAINS:-no domains}${VPN_ROUTE_SUBNETS:+ + IP ranges}"
+	pass "WireGuard $VPN to ${PREV_HOST:-$WG_ENDPOINT_HOST}; PBR: ${VPN_ROUTE_DOMAINS:-no domains}${VPN_ROUTE_SUBNETS:+ + IP ranges}"
 fi
+
+# Proton VPN server choice (proton-pick): session, settings; off = all removed.
+if [ -n "$VPN" ] && on "${PROTON_AUTO:-0}"; then
+	mkdir -p /etc/proton; chmod 700 /etc/proton
+	uid_of() { sed -n "s/^PROTON_UID='\(.*\)'$/\1/p" "$1" 2>/dev/null; }
+	if [ -f "$PRIV/proton-session" ]; then
+		# The same session as the router's is an old copy (the router has
+		# renewed it since): keep the router's. A new login has a new UID.
+		if [ -f /etc/proton/session ] && [ "$(uid_of "$PRIV/proton-session")" = "$(uid_of /etc/proton/session)" ]; then
+			info "kept the router's own Proton session (the laptop's copy is older)"
+		else
+			cp "$PRIV/proton-session" /etc/proton/session; chmod 600 /etc/proton/session
+			rm -f /tmp/proton/session-ended
+			info "new Proton session installed (from ./proton-login.sh)"
+		fi
+	fi
+	printf "IFACE='%s'\nCOUNTRIES='%s'\nSTALE=300\nAPI='%s'\n" "$VPN" "${PROTON_COUNTRIES-}" \
+		"${PROTON_API:-https://vpn-api.proton.me}" > /etc/proton-pick.conf
+	chmod 755 /usr/sbin/proton-pick
+	[ -f /etc/proton/session ] || info "Proton server choice is on but has no session yet: run ./proton-login.sh, then ./setup.sh"
+else
+	rm -rf /etc/proton /etc/proton-pick.conf /usr/sbin/proton-pick /usr/share/proton-pick /tmp/proton
+	sed -i '\#^/usr/sbin/proton-pick$#d; \#^/usr/share/proton-pick/$#d; \#^/etc/proton/$#d; \#^/etc/proton-pick.conf$#d' /etc/sysupgrade.conf
+fi
+exec 9>&-   # proton-pick may run again
 
 # ---------------------------------------------------------------- remote access
 # WireGuard server: devices outside reach the home network and the router's
@@ -539,14 +582,22 @@ fi
 # ---------------------------------------------------------------- jobs, upgrade persistence
 step "Scheduled jobs"
 touch /etc/crontabs/root
-sed -i '/safesearch-hosts\|redlib-block/d' /etc/crontabs/root
-sed -i '/safesearch-hosts/d' /etc/rc.local
+sed -i '/safesearch-hosts\|redlib-block\|proton-pick/d' /etc/crontabs/root
+sed -i '/safesearch-hosts\|proton-pick/d' /etc/rc.local
+if [ -f /etc/proton-pick.conf ]; then
+	echo "*/5 * * * * /usr/sbin/proton-pick check" >> /etc/crontabs/root
+	echo "17 4 * * * /usr/sbin/proton-pick refresh" >> /etc/crontabs/root
+	sed -i 's|^exit 0$|(sleep 90; /usr/sbin/proton-pick refresh) \&\nexit 0|' /etc/rc.local
+fi
 if on "${FAMILY_FILTER:-0}"; then
 	echo "*/30 * * * * /usr/sbin/safesearch-hosts" >> /etc/crontabs/root
 	# Before adblock-lean's 05:00 update, which loads the refreshed Redlib section.
 	echo "50 4 * * * /usr/sbin/redlib-block" >> /etc/crontabs/root
 	sed -i 's|^exit 0$|(sleep 30; /usr/sbin/safesearch-hosts) \&\nexit 0|' /etc/rc.local
 fi
+[ -f /etc/proton-pick.conf ] && for f in /usr/sbin/proton-pick /usr/share/proton-pick/ /etc/proton/ /etc/proton-pick.conf; do
+	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
+done
 for f in /usr/sbin/safesearch-hosts /usr/sbin/redlib-block /etc/redlib-block.allow /etc/init.d/adblock-lean /usr/lib/adblock-lean/ /etc/adblock-lean/ /www/mangadex-safe/ /www/cgi-bin/md; do
 	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 done
@@ -758,6 +809,17 @@ info "after restart: IPv6 $(yes_no "$HAS_V6" 'usable (banIP covers IPv6)' 'not u
 /etc/init.d/banip enable; /etc/init.d/banip restart >/dev/null 2>&1
 if [ -n "$VPN" ]; then
 	/etc/init.d/pbr enable; /etc/init.d/pbr restart >/dev/null 2>&1
+	if [ -f /etc/proton-pick.conf ] && [ -f /etc/proton/session ]; then
+		rm -f /tmp/proton/loads   # a PASS below must come from this refresh
+		/usr/sbin/proton-pick refresh >/dev/null 2>&1
+		if [ -f /tmp/proton/session-ended ]; then
+			fail "Proton ended the session: run ./proton-login.sh, then ./setup.sh"
+		elif [ -s /tmp/proton/loads ]; then
+			pass "Proton server list: $(wc -l < /tmp/proton/loads) servers ${PROTON_COUNTRIES:+in $PROTON_COUNTRIES }(refreshed daily, tunnel checked every 5 min)"
+		else
+			fail "Proton server list could not be fetched (see: logread -e proton-pick)"
+		fi
+	fi
 elif [ -x /etc/init.d/pbr ]; then
 	/etc/init.d/pbr stop >/dev/null 2>&1; /etc/init.d/pbr disable
 fi
