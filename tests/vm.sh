@@ -11,7 +11,7 @@
 # minimal: every option off; checks nothing optional was installed
 #
 # Environment:
-#   OPENWRT_VERSION     release to test (default 25.12.5)
+#   OPENWRT_VERSION     release to test (default 25.12.5; must use apk, so 25.12 or later)
 #   TEST_DNS_UPSTREAM   plain DNS server for dnsproxy inside the VM, for
 #                       networks that block DoH for their own LAN clients
 #                       (the VM is such a client); e.g. 10.0.2.3:53
