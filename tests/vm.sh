@@ -254,8 +254,10 @@ proton_rerun_checks() {
 # user network queues up to the host's TCP send buffer (4 MB per connection)
 # ahead of it and refills that in bursts every few seconds, so the router's
 # byte counter swung between ~6 and ~11 Mbit/s (6 of 16 runs off; with the
-# shaper 0 of 16, each second within 2% of 10). It stays through the install's
-# package installs and "sqm stop"; the SQM it sets up replaces it afterwards.
+# shaper 0 of 16, each second within 2% of 10). It stays through the first
+# run's package installs and "sqm stop", until the SQM that run sets up
+# replaces it, so only the first run's rates are checked (re-runs measure an
+# unshaped line).
 shape_line() {
 	i=0; until vm_ssh true 2>/dev/null; do i=$((i + 1)); [ $i -ge 40 ] && { bad "VM did not come up"; return 1; }; sleep 3; done
 	r=$(vm_ssh 'i=0; until ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || [ $i -ge 30 ]; do sleep 1; i=$((i + 1)); done
@@ -270,14 +272,15 @@ scenario_full() {
 	shape_line
 	run_setup "$P" "$W/full.log"
 	abl_check
-	# SQM: 8 streams at 2.5 Mbit/s each = 20 Mbit/s down; 10 Mbit/s up (the
-	# shaper, see shape_line); shaped at 90%. The bounds allow for packet
-	# framing (counted, about 4%).
+	# SQM: 8 streams at 2.5 Mbit/s each = 20 Mbit/s down, shaped at 90%; the
+	# bounds allow for packet framing (counted, about 4%). Up: the 10 Mbit/s
+	# shaper (see shape_line) counts framing itself, so 90% is ~9000 and the
+	# bounds are tight: without the shaper they fail instead of flaking.
 	if [ -n "$SPEED_URL" ]; then
 		r=$(vm_ssh 'uci -q get sqm.wan.download; uci -q get sqm.wan.upload' | tr '\n' ' ')
 		# shellcheck disable=SC2086  # two numbers
 		set -- $r
-		if grep -q '^PASS  SQM measured' "$W/full.log" && [ "${1:-0}" -ge 14000 ] && [ "${1:-0}" -le 21000 ] && [ "${2:-0}" -ge 7000 ] && [ "${2:-0}" -le 12500 ]; then
+		if grep -q '^PASS  SQM measured' "$W/full.log" && [ "${1:-0}" -ge 14000 ] && [ "${1:-0}" -le 21000 ] && [ "${2:-0}" -ge 8500 ] && [ "${2:-0}" -le 9500 ]; then
 			ok "SQM measured the 20/10 Mbit/s test line: shaping at $r kbit/s"
 		else
 			bad "SQM measurement of the 20/10 Mbit/s test line: $r; $(grep 'SQM' "$W/full.log" | head -3 | tr '\n' ' ')"
