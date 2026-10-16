@@ -130,11 +130,11 @@ P1=$T/priv1
 # Wi-Fi name, Wi-Fi password x2, admin password x2, SSH key path, create key?,
 # time zone, PPPoE?, PPPoE user, PPPoE password x2, link type number,
 # family filtering?, Redlib allow, VPN?, wg path, VPN iface, domains, subnets,
-# MangaDex?, remote access?, public name, port, devices,
+# Proton picks the server?, Proton countries, MangaDex?, remote access?, public name, port, devices,
 # create settings? (first) / save? (last)
 printf '%s\n' y "Home Net" "pa'ss word1" "pa'ss word1" adminpw adminpw "$HOME/.ssh/test_key" y \
 	Europe/Berlin "" y "user@isp" ppppass ppppass 7 y "safereddit.com" y "$T/proton.conf" protonvpn \
-	"archive.org newegg.com" "91.108.4.0/22" y y home.example.org "" "phone tablet" y \
+	"archive.org newegg.com" "91.108.4.0/22" y "pl ch" y y home.example.org "" "phone tablet" y \
 	| ONECLICK_PRIVATE=$P1 "$HERE/setup.sh" --settings-only >"$T/w1.out" 2>&1
 eq "wizard (all on) exit" "$?" 0
 eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config.env")" 600
@@ -156,6 +156,10 @@ eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config
 	eq "w1 vpn" "$ENABLE_VPN|$VPN_IFACE|$WG_ENDPOINT_HOST" "1|protonvpn|198.51.100.7"
 	eq "w1 vpn routes" "$VPN_ROUTE_DOMAINS|$VPN_ROUTE_SUBNETS" "archive.org newegg.com|91.108.4.0/22"
 	eq "w1 mangadex" "$ENABLE_MANGADEX" 1
+	eq "w1 Proton server choice" "$PROTON_AUTO|$PROTON_COUNTRIES" "1|PL CH"
+	PROTON_COUNTRIES='PL; reboot'; eq "bad Proton countries rejected" "$(check_settings | grep -c PROTON_COUNTRIES)" 1
+	PROTON_COUNTRIES=PL PROTON_API='ftp://x'; eq "bad Proton API rejected" "$(check_settings | grep -c PROTON_API)" 1
+	PROTON_API='' ENABLE_VPN=0; eq "Proton server choice is ignored without the VPN" "$(check_settings | grep -c PROTON)" 0
 	eq "w1 remote" "$ENABLE_REMOTE|$REMOTE_HOST|$REMOTE_PORT|$REMOTE_NET" "1|home.example.org|51820|10.77.0.0/24"
 	eq "w1 remote devices" "$(remote_devices)" "phone tablet"
 	eq "w1 remote addresses" "$(printf '%s\n' "$REMOTE_PEERS" | cut -d'|' -f2 | tr '\n' ' ')" "2 3 "

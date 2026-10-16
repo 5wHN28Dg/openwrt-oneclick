@@ -38,9 +38,10 @@ PORT=${VM_SSH_PORT:-2222}
 CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/openwrt-oneclick
 IMG=openwrt-$VER-x86-64-generic-squashfs-combined.img
 W=$(mktemp -d)
-QPID='' SPID=''
+QPID='' SPID='' XPID=''
 SPORT=${SPEED_PORT:-18080}
-cleanup() { [ -n "$QPID" ] && kill "$QPID" 2>/dev/null; [ -n "$SPID" ] && kill "$SPID" 2>/dev/null; rm -rf "$W"; }
+XPORT=${PROTON_PORT:-18181}
+cleanup() { for p in "$QPID" "$SPID" "$XPID"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; rm -rf "$W"; }
 trap cleanup EXIT INT TERM
 fails=0
 ok()  { printf 'ok    %s\n' "$1"; }
@@ -84,6 +85,10 @@ if command -v python3 >/dev/null; then
 	sleep 1
 	if kill -0 "$SPID" 2>/dev/null; then SPEED_URL=http://10.0.2.2:$SPORT; else SPID=''; echo "speed test server did not start (port $SPORT in use?)"; exit 1; fi
 fi
+# Stand-in for Proton's API (tests/protonsrv.py): rotating tokens, fixed list.
+python3 -I "$HERE/tests/protonsrv.py" "$XPORT" & XPID=$!
+sleep 1
+kill -0 "$XPID" 2>/dev/null || { XPID=''; echo "Proton API stand-in did not start (port $XPORT in use?)"; exit 1; }
 wgkey() { head -c 32 /dev/urandom | base64; }
 
 make_private() { # dir full|minimal
@@ -102,6 +107,7 @@ make_private() { # dir full|minimal
 			WG_ADDRESSES=10.66.0.2/32 WG_DNS=10.66.0.1 WG_ENDPOINT_HOST=192.0.2.1 WG_ENDPOINT_PORT=51820
 			WG_ALLOWED_IPS="0.0.0.0/0 ::/0" WG_KEEPALIVE=25
 			VPN_ROUTE_DOMAINS="example.com" VPN_ROUTE_SUBNETS="198.51.100.0/24"
+			PROTON_AUTO=1 PROTON_COUNTRIES="PL CH" PROTON_API=http://10.0.2.2:$XPORT
 			ENABLE_MANGADEX=1
 			ENABLE_REMOTE=1 REMOTE_HOST='' REMOTE_PORT=51820 REMOTE_NET=10.77.0.0/24
 			# 11 devices: re-runs then delete peer sections across [9]/[10]
@@ -112,12 +118,14 @@ dev$i|$i|$(wg_genkey)|$(wg_psk)"; done
 			SPEEDTEST_URL=$SPEED_URL
 		else
 			FAMILY_FILTER=0 ADBLOCK_EXTRA_LISTS='' BANIP_FEEDS='' ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0
+			unset PROTON_AUTO PROTON_COUNTRIES PROTON_API
 			SQM_DOWN=50000 SQM_UP=10000   # fixed rates: nothing is measured
 		fi
 		write_config "$1/config.env"
 	)
 	if [ "$2" = full ]; then
 		printf 'example.net\n' > "$1/blocklist.txt"
+		printf "PROTON_UID='uid-test'\nPROTON_REFRESH='refresh-0'\n" > "$1/proton-session"
 		printf '%s\n' "DEVICES='TV|02:00:00:00:00:01|192.168.1.150'" "CUTOFF_START='21:30:00'" "CUTOFF_STOP='05:30:00'" > "$1/kids.conf"
 	fi
 }
@@ -152,6 +160,43 @@ abl_check() {
 	[ -n "$want" ] && [ "$got" = "$want" ] && ok "adblock-lean is the current release ($got)" || bad "adblock-lean version: got [$got], latest release [$want]"
 	lists=$(vm_ssh 'sed -n "s/^raw_block_lists=//p" /etc/adblock-lean/config')
 	case $lists in *hagezi:pro*) ok "adblock-lean lists from its memory preset: $lists" ;; *) bad "adblock-lean lists: $lists" ;; esac
+}
+
+# Proton server choice after the first run: list, pick by ping, rotation,
+# failover with its rate limit, no tokens in the log.
+proton_checks() {
+	grep -q '^PASS  Proton server list: 3 servers in PL CH' "$W/full.log" && ok "Proton: list fetched (3 usable of 8; disabled, paid, Secure Core, dead and other countries left out)" \
+		|| bad "Proton list report: $(grep -i proton "$W/full.log" | tr '\n' ' ')"
+	r=$(vm_ssh 'awk "{print \$2}" /etc/proton/servers | tr "\n" " "; uci -q get network.@wireguard_testvpn[0].endpoint_host; grep -c "refresh-1" /etc/proton/session; ls -l /etc/proton/session | cut -c1-10')
+	[ "$(echo $r)" = "CH-FREE#2 PL-FREE#5 PL-FREE#9 127.0.0.2 1 -rw-------" ] && ok "Proton: switched off the unlisted server to the one answering ping (CH-FREE#2); rotated token stored (mode 600)" \
+		|| bad "Proton pick/rotation (want 'CH-FREE#2 PL-FREE#5 PL-FREE#9 127.0.0.2 1 -rw-------'): $(echo $r)"
+	[ ! -e "$P/proton-session" ] && ok "Proton: laptop copy of the session removed after handing it over" || bad "Proton: laptop session copy still there"
+	r=$(vm_ssh 'sed -i "s/^STALE=.*/STALE=1/" /etc/proton-pick.conf; proton-pick check
+		uci -q get network.@wireguard_testvpn[0].endpoint_host
+		echo 0 > /tmp/proton/last-switch; proton-pick check
+		uci -q get network.@wireguard_testvpn[0].endpoint_host; wg show testvpn endpoints | cut -f2
+		sed -i "s/^STALE=.*/STALE=180/" /etc/proton-pick.conf' | tr '\n' ' ')
+	[ "$r" = "127.0.0.2 198.51.100.9 198.51.100.9:51820 " ] && ok "Proton: stale tunnel waits out the 5-minute limit, then moves to the least loaded other server (PL-FREE#9)" \
+		|| bad "Proton failover (want '127.0.0.2 198.51.100.9 198.51.100.9:51820'): $r"
+	r=$(vm_ssh 'proton-pick refresh >/dev/null 2>&1; echo $?; grep -c "refresh-2" /etc/proton/session; logread | grep -cE "refresh-[0-9]|access-[0-9]|uid-test"' | tr '\n' ' ')
+	[ "$r" = "0 1 0 " ] && ok "Proton: next refresh uses the rotated token; no tokens in the system log" || bad "Proton refresh/log (want '0 1 0'): $r"
+}
+
+# After the re-run: the chosen server is kept; an ended session keeps the list.
+proton_rerun_checks() {
+	r=$(vm_ssh 'uci -q get network.@wireguard_testvpn[0].endpoint_host')
+	[ "$r" = 198.51.100.9 ] && ok "Proton: re-run kept the server proton-pick chose" || bad "Proton: re-run reset the server to $r"
+	grep -q 'new Proton session installed' "$W/full-rerun.log" && bad "Proton: re-run sent a stale session" || ok "Proton: re-run left the router's own session alone"
+	curl -s "http://127.0.0.1:$XPORT/_end" >/dev/null
+	r=$(vm_ssh 'proton-pick refresh >/dev/null 2>&1; echo $?; proton-pick status | grep -c "session:    ENDED"; wc -l < /etc/proton/servers' | tr '\n' ' ')
+	[ "$r" = "1 1 3 " ] && ok "Proton: ended session reported in status, last list kept" || bad "Proton ended session (want '1 1 3'): $r"
+	# Logging in again (./proton-login.sh) leaves a new session for setup.sh.
+	curl -s "http://127.0.0.1:$XPORT/_new" >/dev/null
+	printf "PROTON_UID='uid-test'\nPROTON_REFRESH='refresh-new'\n" > "$P/proton-session"
+	run_setup "$P" "$W/full-relogin.log"
+	r=$(vm_ssh 'proton-pick status | grep -c "session:    present"')
+	grep -q 'new Proton session installed' "$W/full-relogin.log" && grep -q '^PASS  Proton server list' "$W/full-relogin.log" && [ "$r" = 1 ] && [ ! -e "$P/proton-session" ] \
+		&& ok "Proton: after a new login, setup.sh installs the new session and the list refreshes" || bad "Proton re-login (status present: $r): $(grep -i proton "$W/full-relogin.log" | tr '\n' ' ')"
 }
 
 scenario_full() {
@@ -196,6 +241,7 @@ scenario_full() {
 		ip netns del rc' 2>&1 | tr '\n' ' ')
 	[ "$r" = "dns=192.168.1.1 served own-list-blocks " ] && ok "remote access: through the tunnel manga.lan resolves, the reader loads, own list blocks" \
 		|| bad "remote access through the tunnel (want 'dns=192.168.1.1 served own-list-blocks'): $r"
+	proton_checks
 	r=$(ONECLICK_PRIVATE=$P "$W/kids.sh" 127.0.0.1 "$PORT" 2>&1)
 	case $r in *PASS*) ok "kids.sh: $r" ;; *) bad "kids.sh: $r" ;; esac
 	r=$(ONECLICK_PRIVATE=$P "$W/kids.sh" --remove 127.0.0.1 "$PORT" 2>&1)
@@ -210,6 +256,7 @@ scenario_full() {
 	run_setup "$P" "$W/full-rerun.log"
 	r=$(vm_ssh 'uci -q get firewall.@defaults[0].flow_offloading; uci -q get firewall.@defaults[0].flow_offloading_hw' | tr '\n' ' ')
 	[ "$r" = "1 0 " ] && ok "flow offloading: software on, hardware off" || bad "flow offloading (software hardware): $r"
+	proton_rerun_checks
 
 	# Settings that can't work (tunnel range = the LAN) stop the run before
 	# anything changes: blocking and remote access stay as they were.
@@ -280,6 +327,8 @@ scenario_full() {
 	VM_KEY=$W/key2   # the router now only knows the new key
 	left=$(vm_ssh 'uci show network | grep -c testvpn; uci show firewall | grep -c "name=.testvpn."; uci -q get dhcp.@dnsmasq[0].address | grep -c "::"' | tr '\n' ' ')
 	[ "$left" = "0 0 0 " ] && ok "VPN turned off: interface, zone and IPv6 suppression removed" || bad "VPN leftovers (network firewall aaaa): $left"
+	left=$(vm_ssh 'ls -d /etc/proton /etc/proton-pick.conf /usr/sbin/proton-pick 2>/dev/null; grep -c proton-pick /etc/crontabs/root /etc/rc.local' | tr '\n' ' ')
+	[ "$left" = "/etc/crontabs/root:0 /etc/rc.local:0 " ] && ok "VPN turned off: Proton session, settings and jobs removed" || bad "Proton leftovers: $left"
 	left=$(vm_ssh 'uci show network | grep -c "remote"; uci show firewall | grep -c "remote\|Remote"; wg show remote 2>/dev/null | grep -c peer' | tr '\n' ' ')
 	[ "$left" = "0 0 0 " ] && ok "remote access turned off: interface, peers, lan-zone entry and port rule removed" || bad "remote access leftovers (network firewall peers): $left"
 	oldk=$(cut -d' ' -f2 "$W/key.pub")

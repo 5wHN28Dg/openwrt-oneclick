@@ -107,8 +107,17 @@ wizard() {
 		ask VPN_IFACE "Name for the VPN interface" "${VPN_IFACE:-vpn}"
 		ask VPN_ROUTE_DOMAINS "Domains to send through the VPN, space separated" "${VPN_ROUTE_DOMAINS-}"
 		ask VPN_ROUTE_SUBNETS "IP ranges to send through the VPN, space separated (optional)" "${VPN_ROUTE_SUBNETS-}"
+		say "Proton VPN only: the router can keep the tunnel on a working, fast server by itself"
+		say "(checks every 5 minutes, needs a one-time ./proton-login.sh)."
+		if ask_yn "Is this Proton VPN, and should the router pick the server?" "$(yn "${PROTON_AUTO:-0}")"; then
+			PROTON_AUTO=1
+			ask PROTON_COUNTRIES "Countries to choose from, two-letter codes (Enter = all)" "${PROTON_COUNTRIES-}"
+			PROTON_COUNTRIES=$(printf '%s' "$PROTON_COUNTRIES" | tr 'a-z' 'A-Z')
+		else
+			PROTON_AUTO=0
+		fi
 	else
-		ENABLE_VPN=0
+		ENABLE_VPN=0 PROTON_AUTO=0
 	fi
 	if ask_yn "Install the MangaDex safe-mode reader (opens at http://manga.lan)?" "$(yn "${ENABLE_MANGADEX:-0}")"; then
 		ENABLE_MANGADEX=1
@@ -240,6 +249,12 @@ cp -R "$HERE/router" "$STAGE/b/router"
 ) || exit 1
 link_params "$LINK_TYPE" | awk '{ printf "LINK_LL=%s\nLINK_OVERHEAD=%s\nLINK_MPU=%s\n", $1, $2, $3 }' >> "$STAGE/b/private/config.env"
 for f in blocklist.txt allowlist.txt; do [ -f "$PRIV/$f" ] && cp "$PRIV/$f" "$STAGE/b/private/"; done
+# A Proton session from ./proton-login.sh goes to the router, which renews it
+# from then on (each renewal replaces the token, so the laptop copy goes stale).
+SENT_SESSION=
+if [ "${PROTON_AUTO:-0}" = 1 ] && [ -f "$PRIV/proton-session" ]; then
+	cp "$PRIV/proton-session" "$STAGE/b/private/"; SENT_SESSION=1
+fi
 [ -d "$PRIV/host_keys" ] && cp -R "$PRIV/host_keys" "$STAGE/b/private/host_keys"
 
 say "Copying settings to the router's RAM ..."
@@ -325,6 +340,11 @@ fi
 # Remote access off: its device configs no longer work.
 if [ "${ENABLE_REMOTE-}" != 1 ] && [ "$rc" != 1 ] && [ -d "$PRIV/remote" ]; then
 	rm -f "$PRIV"/remote/*.conf; rmdir "$PRIV/remote" 2>/dev/null
+fi
+
+if [ -n "$SENT_SESSION" ] && [ "$rc" != 1 ]; then
+	rm -f "$PRIV/proton-session"
+	say "The router now holds the Proton session (removed the laptop copy)."
 fi
 
 case $rc in

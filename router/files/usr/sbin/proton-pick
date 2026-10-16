@@ -1,0 +1,180 @@
+#!/bin/sh
+# Keeps a Proton VPN WireGuard tunnel on a working, fast server.
+#
+#   proton-pick refresh   daily: renew the Proton session, fetch the server
+#                         list, then run "check"
+#   proton-pick check     every 5 minutes: if the tunnel has had no handshake
+#                         for $STALE seconds, or its server is no longer
+#                         listed, switch to the best listed server
+#   proton-pick status    what it is doing
+#
+# Best server: for each country, the least-loaded server; of those, the one
+# with the lowest ping from here (load breaks ties and decides when nothing
+# answers ping). Your WireGuard key works on every Proton server, so a switch
+# is only a change of peer (wg set) plus the same in /etc/config/network, so
+# a reboot keeps it. No restart, so policy routing is not disturbed.
+#
+# Files: /etc/proton/session (UID + refresh token, secret; rewritten when
+# Proton rotates the token, about once a day), /etc/proton/servers (the list,
+# rewritten only when it changes), /tmp/proton/ (RAM: loads, access token,
+# last switch). Settings: /etc/proton-pick.conf (IFACE, COUNTRIES, STALE, API).
+
+IFACE=protonvpn COUNTRIES='' STALE=180 API=https://vpn-api.proton.me
+# shellcheck source=/dev/null
+[ -f /etc/proton-pick.conf ] && . /etc/proton-pick.conf
+SESSION=/etc/proton/session
+LIST=/etc/proton/servers
+RUN=/tmp/proton
+PARSE=/usr/share/proton-pick/parse.uc
+mkdir -p "$RUN"; chmod 700 "$RUN"
+log() { logger -t proton-pick "$*"; [ -t 1 ] && echo "$*"; return 0; }
+
+# --- Proton API ----------------------------------------------------------------
+# The API host is on common block lists (including this router's), so it is
+# resolved through dnsproxy directly; tokens go in a header file, never argv.
+api_init() {
+	RESOLVE=
+	host=${API#*://}; host=${host%%/*}
+	case $API in https://*)
+		ip=$(nslookup -type=a "$host" 127.0.0.1:5354 2>/dev/null |
+			awk '/^Non-authoritative/ { f = 1 } f && /^Address: / { print $2; exit }')
+		[ -n "$ip" ] || { log "cannot resolve $host"; return 1; }
+		RESOLVE="--resolve $host:443:$ip" ;;
+	esac
+	(umask 077; printf '%s\n' "x-pm-uid: $PROTON_UID" 'x-pm-appversion: Other' \
+		'Accept: application/vnd.protonmail.v1+json' > "$RUN/headers")
+}
+api() { # PATH OUTFILE [curl args...] -> prints the HTTP status
+	p=$1 o=$2; shift 2
+	# shellcheck disable=SC2086
+	curl -s --max-time 60 $RESOLVE -H @"$RUN/headers" -o "$o" -w '%{http_code}' "$@" "$API$p"
+}
+
+refresh() {
+	[ -f "$SESSION" ] || { log "no Proton session; run ./proton-login.sh on the laptop, then ./setup.sh"; return 1; }
+	# shellcheck source=/dev/null
+	. "$SESSION"
+	api_init || return 1
+	(umask 077; printf '{"ResponseType":"token","GrantType":"refresh_token","RefreshToken":"%s","RedirectURI":"http://protonmail.ch"}' \
+		"$PROTON_REFRESH" > "$RUN/body")
+	code=$(api /auth/refresh "$RUN/auth.json" -H 'Content-Type: application/json' --data-binary @"$RUN/body")
+	rm -f "$RUN/body"
+	case $code in
+	200) ;;
+	400|401|422)
+		log "Proton ended the session (HTTP $code); keeping the last server list. Run ./proton-login.sh on the laptop, then ./setup.sh"
+		: > "$RUN/session-ended"; rm -f "$RUN/auth.json" "$RUN/headers"; return 1 ;;
+	*)	log "session renewal failed (HTTP ${code:-none}); will retry"; rm -f "$RUN/auth.json" "$RUN/headers"; return 1 ;;
+	esac
+	access=$(jsonfilter -i "$RUN/auth.json" -e '@.AccessToken')
+	new=$(jsonfilter -i "$RUN/auth.json" -e '@.RefreshToken')
+	rm -f "$RUN/auth.json" "$RUN/session-ended"
+	if [ -n "$new" ] && [ "$new" != "$PROTON_REFRESH" ]; then   # Proton rotates it: keep the new one
+		(umask 077; printf "# Proton VPN session (secret)\nPROTON_UID='%s'\nPROTON_REFRESH='%s'\n" \
+			"$PROTON_UID" "$new" > "$SESSION.tmp") && mv "$SESSION.tmp" "$SESSION"
+	fi
+	echo "Authorization: Bearer $access" >> "$RUN/headers"
+
+	code=$(api /vpn/v2 "$RUN/vpn.json")
+	tier=$(jsonfilter -i "$RUN/vpn.json" -e '@.VPN.MaxTier' 2>/dev/null); rm -f "$RUN/vpn.json"
+	[ "$code" = 200 ] && [ -n "$tier" ] || { log "account info failed (HTTP $code)"; rm -f "$RUN/headers"; return 1; }
+	code=$(api '/vpn/v1/logicals?SecureCoreFilter=all&WithState=true' "$RUN/logicals.json" --compressed)
+	rm -f "$RUN/headers"
+	if [ "$code" != 200 ]; then log "server list failed (HTTP $code)"; rm -f "$RUN/logicals.json"; return 1; fi
+	ucode "$PARSE" "$RUN/logicals.json" "$tier" "$COUNTRIES" > "$RUN/loads.new"
+	rm -f "$RUN/logicals.json"
+	[ -s "$RUN/loads.new" ] || { log "server list had no usable servers; keeping the last one"; rm -f "$RUN/loads.new"; return 1; }
+	mv "$RUN/loads.new" "$RUN/loads"
+	# Flash copy without loads, written only when servers come or go.
+	awk '{ print $1, $3, $4, $5 }' "$RUN/loads" | sort > "$RUN/servers"
+	mkdir -p /etc/proton; chmod 700 /etc/proton
+	cmp -s "$RUN/servers" "$LIST" || cp "$RUN/servers" "$LIST"
+	rm -f "$RUN/servers"
+	log "server list: $(wc -l < "$RUN/loads") servers (plan tier $tier)"
+}
+
+# --- tunnel ----------------------------------------------------------------------
+current() { wg show "$IFACE" endpoints 2>/dev/null | awk 'NR == 1 { print $1 }'; }
+handshake_age() {
+	t=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk 'NR == 1 { print $2 }')
+	if [ "${t:-0}" -gt 0 ]; then echo $(( $(date +%s) - t )); return; fi
+	# Never had one: count from when the interface came up.
+	up=$(ifstatus "$IFACE" 2>/dev/null | jsonfilter -e '@.uptime' 2>/dev/null)
+	echo "${up:-0}"
+}
+listed() { [ -f "$LIST" ] && awk -v k="$1" '$4 == k { f = 1 } END { exit !f }' "$LIST"; }
+name_of() { awk -v k="$1" '$4 == k { print $2 }' "$LIST" 2>/dev/null; }
+
+# best EXCLUDE-KEY -> "NAME IP KEY why"
+best() {
+	src=$RUN/loads; [ -s "$src" ] || src=$LIST
+	# Least loaded per country ($RUN/loads: CC LOAD NAME IP KEY; flash list has no loads).
+	if [ "$src" = "$LIST" ]; then
+		awk -v x="$1" '$4 != x && !seen[$1]++ { print $1, 100, $2, $3, $4 }' "$LIST"
+	else
+		sort -k1,1 -k2,2n "$src" | awk -v x="$1" '$5 != x && !seen[$1]++'
+	fi > "$RUN/cands"
+	: > "$RUN/rtt"
+	while read -r _ load name ip key; do
+		( r=$(ping -c 3 -W 2 "$ip" 2>/dev/null | awk -F/ '/round-trip/ { print int($4 + 0.5) }')
+		  echo "${r:-99999} $load $name $ip $key" >> "$RUN/rtt" ) &
+	done < "$RUN/cands"
+	wait
+	sort -n -k1,1 -k2,2n "$RUN/rtt" | awk 'NR == 1 { why = ($1 == 99999) ? "no ping answers, lowest load " $2 "%" : $1 " ms, load " $2 "%"; print $3, $4, $5, why }'
+	rm -f "$RUN/cands" "$RUN/rtt"
+}
+
+switch_to() { # NAME IP KEY WHY REASON
+	old=$(current)
+	peer=$(uci -q show network | sed -n "s/^network\.\(@wireguard_$IFACE\[0\]\)=.*/\1/p")
+	[ -n "$peer" ] || { log "no WireGuard peer for $IFACE in /etc/config/network"; return 1; }
+	port=$(uci -q get "network.$peer.endpoint_port"); port=${port:-51820}
+	ka=$(uci -q get "network.$peer.persistent_keepalive"); ka=${ka:-25}
+	allowed=$(uci -q get "network.$peer.allowed_ips" | tr ' ' ',')
+	[ -n "$old" ] && wg set "$IFACE" peer "$old" remove
+	wg set "$IFACE" peer "$3" endpoint "$2:$port" allowed-ips "${allowed:-0.0.0.0/0,::/0}" persistent-keepalive "$ka"
+	uci set "network.$peer.public_key=$3"
+	uci set "network.$peer.endpoint_host=$2"
+	uci set "network.$peer.description=Proton $1"
+	uci commit network
+	date +%s > "$RUN/last-switch"
+	log "switched to $1 ($2, $4) because $5"
+}
+
+check() {
+	[ -s "$LIST" ] || { log "no server list yet"; return 0; }
+	ifstatus "$IFACE" >/dev/null 2>&1 || return 0
+	key=$(current); age=$(handshake_age)
+	if [ -n "$key" ] && ! listed "$key"; then
+		reason="its server is no longer listed (disabled or removed)"
+	elif [ "${age:-0}" -gt "$STALE" ]; then
+		reason="no handshake for ${age}s"
+	else
+		return 0
+	fi
+	# Give a new server time to answer before moving on again.
+	last=$(cat "$RUN/last-switch" 2>/dev/null || echo 0)
+	[ $(( $(date +%s) - last )) -lt 300 ] && return 0
+	# shellcheck disable=SC2046  # NAME IP KEY why... as words
+	set -- $(best "$key")
+	[ $# -ge 3 ] || { log "no other server to switch to"; return 1; }
+	n=$1 ip=$2 k=$3; shift 3
+	switch_to "$n" "$ip" "$k" "$*" "$reason"
+}
+
+status() {
+	key=$(current)
+	echo "interface:  $IFACE"
+	echo "server:     $(name_of "$key") ($(wg show "$IFACE" endpoints 2>/dev/null | awk '{ print $2 }'))${key:+$(listed "$key" || echo ' NOT LISTED')}"
+	echo "handshake:  $(handshake_age)s ago (switch after ${STALE}s)"
+	echo "list:       $(wc -l < "$LIST" 2>/dev/null || echo 0) servers on flash, loads from $( [ -s "$RUN/loads" ] && date -r "$RUN/loads" '+%F %R' || echo 'not fetched since boot')"
+	echo "session:    $( [ -f "$RUN/session-ended" ] && echo 'ENDED: run ./proton-login.sh, then ./setup.sh' || { [ -f "$SESSION" ] && echo present || echo missing; })"
+	echo "countries:  ${COUNTRIES:-all}"
+}
+
+case ${1-} in
+	refresh) refresh; rc=$?; check; exit $rc ;;
+	check) check ;;
+	status) status ;;
+	*) echo "usage: $0 refresh|check|status" >&2; exit 2 ;;
+esac

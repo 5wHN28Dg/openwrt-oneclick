@@ -136,6 +136,47 @@ Devices outside need to find your home:
   192.168.1.x), the device can't tell the two apart: give your router's LAN an
   uncommon range in LuCI (e.g. 192.168.47.1) if you use remote access a lot.
 
+## Proton VPN server choice
+
+With Proton VPN as the VPN, the router can keep the tunnel on a working, fast
+server by itself, like the "fastest server" button in Proton's apps. Answer
+yes to "Is this Proton VPN, and should the router pick the server?", then log
+in once:
+
+```
+python3 -m venv .venv && .venv/bin/pip install 'git+https://github.com/ProtonVPN/python-proton-core.git@9bd4662ddde2d439e4e8c900f0431e23958bd512'
+./proton-login.sh      # password, CAPTCHA in your browser, 2FA code
+./setup.sh             # hands the session to the router
+```
+
+Proton's own client library does the login (it is not on PyPI under its own
+name, so it is installed from Proton's repository at a fixed version). Your
+password goes only to Proton; the router gets the session, which it renews
+itself from then on, and the laptop copy is deleted.
+
+On the router, `proton-pick` (in `/usr/sbin`):
+
+- once a day fetches Proton's server list and keeps the servers your plan can
+  use (no Secure Core or Tor), in the countries you chose or all of them;
+- every 5 minutes reads how long ago the tunnel last had a handshake. If that
+  is more than 3 minutes, or its server dropped off the list, it switches:
+  for each country the least loaded server, then whichever of those answers
+  ping fastest from your router (on load alone if none answer). Your
+  WireGuard key works on every Proton server, so a switch only changes the
+  peer: nothing restarts and routing is not disturbed. At most one switch per
+  5 minutes, so a new server gets time to answer.
+
+Why ping and not distance: from the network this was built on, the nearest
+country (Romania) answered in 125 ms and two farther ones in 87-89 ms.
+
+Cost: about 0.4 MB downloaded and 0.3 s of CPU once a day; the check is a
+file read. Flash is written when Proton renews the session (about once a
+day, ~150 bytes), when the list of servers changes, and on a switch.
+`proton-pick status` shows the current server, handshake age and session. If
+Proton ever ends the session, the router keeps switching within the last
+list and the status and system log say to run `./proton-login.sh` and
+`./setup.sh` again.
+
 ## Packet steering
 
 When a packet arrives, the CPU core that gets the network card's interrupt
@@ -201,6 +242,8 @@ own install instructions do; the setup trusts that project.
 - IPv6 routing through the VPN (provider config with an IPv6 address) is not
   covered by the automated tests, which have no IPv6 internet.
 - Redlib blocking covers the instances in the public list, not unlisted ones.
+- Proton server choice uses Proton's API as its own apps do, but this tool is not
+  made or endorsed by Proton; a login may ask for a CAPTCHA.
 - Remote access is IPv4 inside the tunnel, and dynamic DNS is not set up on
   the router (give a name you keep updated elsewhere, or use the router's address).
 - adblock-lean's preset sizes its limits for its own lists. Family filtering
