@@ -159,19 +159,23 @@ On the router, `proton-pick` (in `/usr/sbin`):
 - once a day fetches Proton's server list and keeps the servers your plan can
   use (no Secure Core or Tor), in the countries you chose or all of them;
 - every 5 minutes reads how long ago the tunnel last had a handshake. If that
-  is more than 3 minutes, or its server dropped off the list, it switches:
-  for each country the least loaded server, then whichever of those answers
-  ping fastest from your router (on load alone if none answer). Your
-  WireGuard key works on every Proton server, so a switch only changes the
-  peer: nothing restarts and routing is not disturbed. At most one switch per
-  5 minutes, so a new server gets time to answer.
+  is more than 5 minutes, or its server dropped off the list, and the
+  internet line itself works, it switches: for each country the least loaded
+  server, then whichever of those answers ping fastest from your router (on
+  load alone if none answer). Your WireGuard key works on every Proton
+  server, so a switch only changes the peer: nothing restarts and routing is
+  not disturbed. The new server is saved (so a reboot keeps it) only once it
+  has answered a handshake. If none answers (the key was revoked, or your
+  provider blocks WireGuard), each server is tried once and then it waits for
+  the next day's list instead of switching back and forth.
 
 Why ping and not distance: from the network this was built on, the nearest
 country (Romania) answered in 125 ms and two farther ones in 87-89 ms.
 
 Cost: about 0.4 MB downloaded and 0.3 s of CPU once a day; the check is a
 file read. Flash is written when Proton renews the session (about once a
-day, ~150 bytes), when the list of servers changes, and on a switch.
+day, ~150 bytes), when the list of servers changes, and when a new server
+has proven itself; never while the line or the servers are down.
 `proton-pick status` shows the current server, handshake age and session. If
 Proton ever ends the session, the router keeps switching within the last
 list and the status and system log say to run `./proton-login.sh` and

@@ -87,7 +87,9 @@ if command -v python3 >/dev/null; then
 	if kill -0 "$SPID" 2>/dev/null; then SPEED_URL=http://10.0.2.2:$SPORT; else SPID=''; echo "speed test server did not start (port $SPORT in use?)"; exit 1; fi
 fi
 # Stand-in for Proton's API (tests/protonsrv.py): rotating tokens, fixed list.
-python3 -I "$HERE/tests/protonsrv.py" "$XPORT" & XPID=$!
+# A real WireGuard server for the list (run in the VM, see proton_checks).
+SRV_PRIV=$(wg_genkey) && SRV_PUB=$(wg_pubkey "$SRV_PRIV") || { echo "cannot make WireGuard keys with openssl"; exit 1; }
+python3 -I "$HERE/tests/protonsrv.py" "$XPORT" "$SRV_PUB" & XPID=$!
 sleep 1
 kill -0 "$XPID" 2>/dev/null || { XPID=''; echo "Proton API stand-in did not start (port $XPORT in use?)"; exit 1; }
 wgkey() { head -c 32 /dev/urandom | base64; }
@@ -163,29 +165,59 @@ abl_check() {
 	case $lists in *hagezi:pro*) ok "adblock-lean lists from its memory preset: $lists" ;; *) bad "adblock-lean lists: $lists" ;; esac
 }
 
-# Proton server choice after the first run: list, pick by ping, rotation,
-# failover with its rate limit, no tokens in the log.
+# Proton server choice after the first run: list, pick, a real handshake
+# before anything is saved, no switching while the line is down, every server
+# tried once when none answers, token rotation, one run at a time.
 proton_checks() {
 	grep -q '^PASS  Proton server list: 3 servers in PL CH' "$W/full.log" && ok "Proton: list fetched (3 usable of 8; disabled, paid, Secure Core, dead and other countries left out)" \
 		|| bad "Proton list report: $(grep -i proton "$W/full.log" | tr '\n' ' ')"
-	r=$(vm_ssh 'awk "{print \$2}" /etc/proton/servers | tr "\n" " "; uci -q get network.@wireguard_testvpn[0].endpoint_host; grep -c "refresh-1" /etc/proton/session; ls -l /etc/proton/session | cut -c1-10')
-	[ "$(echo $r)" = "CH-FREE#2 PL-FREE#5 PL-FREE#9 127.0.0.2 1 -rw-------" ] && ok "Proton: switched off the unlisted server to the one answering ping (CH-FREE#2); rotated token stored (mode 600)" \
-		|| bad "Proton pick/rotation (want 'CH-FREE#2 PL-FREE#5 PL-FREE#9 127.0.0.2 1 -rw-------'): $(echo $r)"
+	# 10.99.0.2 doesn't exist yet: nothing answers ping, so the least loaded
+	# server is taken, in the kernel only (it never answered, so not saved).
+	r=$(vm_ssh 'awk "{print \$2}" /etc/proton/servers | tr "\n" " "; wg show testvpn endpoints | cut -f2
+		uci -q get network.@wireguard_testvpn[0].endpoint_host; grep -c "refresh-1" /etc/proton/session; ls -l /etc/proton/session | cut -c1-10')
+	[ "$(echo $r)" = "CH-FREE#2 PL-FREE#5 PL-FREE#9 198.51.100.9:51820 192.0.2.1 1 -rw-------" ] \
+		&& ok "Proton: left the unlisted server for the least loaded (no ping answers yet), not saved before a handshake; rotated token stored (mode 600)" \
+		|| bad "Proton first pick (want 'CH-FREE#2 PL-FREE#5 PL-FREE#9 198.51.100.9:51820 192.0.2.1 1 -rw-------'): $(echo $r)"
 	[ ! -e "$P/proton-session" ] && ok "Proton: laptop copy of the session removed after handing it over" || bad "Proton: laptop session copy still there"
-	r=$(vm_ssh 'sed -i "s/^STALE=.*/STALE=1/" /etc/proton-pick.conf; proton-pick check
-		uci -q get network.@wireguard_testvpn[0].endpoint_host
-		echo 0 > /tmp/proton/last-switch; proton-pick check
-		uci -q get network.@wireguard_testvpn[0].endpoint_host; wg show testvpn endpoints | cut -f2
-		sed -i "s/^STALE=.*/STALE=180/" /etc/proton-pick.conf' | tr '\n' ' ')
-	[ "$r" = "127.0.0.2 198.51.100.9 198.51.100.9:51820 " ] && ok "Proton: stale tunnel waits out the 5-minute limit, then moves to the least loaded other server (PL-FREE#9)" \
-		|| bad "Proton failover (want '127.0.0.2 198.51.100.9 198.51.100.9:51820'): $r"
-	r=$(vm_ssh 'proton-pick refresh >/dev/null 2>&1; echo $?; grep -c "refresh-2" /etc/proton/session; logread | grep -cE "refresh-[0-9]|access-[0-9]|uid-test"' | tr '\n' ' ')
-	[ "$r" = "0 1 0 " ] && ok "Proton: next refresh uses the rotated token; no tokens in the system log" || bad "Proton refresh/log (want '0 1 0'): $r"
-	# A dead internet line makes every server look dead: no switching (and no flash writes) then.
-	r=$(vm_ssh 'ifdown wan; sleep 2; sed -i "s/^STALE=.*/STALE=1/" /etc/proton-pick.conf; echo 0 > /tmp/proton/last-switch
-		proton-pick check; uci -q get network.@wireguard_testvpn[0].endpoint_host; logread | grep -c "internet line is down"
-		sed -i "s/^STALE=.*/STALE=180/" /etc/proton-pick.conf; ifup wan; i=0; until ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || [ $i -ge 40 ]; do sleep 1; i=$((i+1)); done' | tr '\n' ' ')
-	[ "$r" = "198.51.100.9 1 " ] && ok "Proton: no switching while the internet line is down" || bad "Proton with the line down (want '198.51.100.9 1'): $r"
+	# A real WireGuard server for "CH-FREE#2" in a network namespace.
+	r=$(printf '%s\n' "$SRV_PRIV" | vm_ssh 'apk add ip-full kmod-veth >/dev/null 2>&1 || exit 1
+		cat > /tmp/srv.key; ip netns add srv; ip link add v0 type veth peer name v1; ip link set v1 netns srv
+		ip addr add 10.99.0.1/24 dev v0; ip link set v0 up
+		ip -n srv addr add 10.99.0.2/24 dev v1; ip -n srv link set v1 up; ip -n srv link set lo up
+		ip -n srv link add wgs type wireguard
+		ip netns exec srv wg set wgs private-key /tmp/srv.key listen-port 51820 peer "$(wg show testvpn public-key)" allowed-ips 10.66.0.2/32
+		rm -f /tmp/srv.key; ip -n srv addr add 10.66.0.1/24 dev wgs; ip -n srv link set wgs up
+		ping -c1 -W2 10.99.0.2 >/dev/null && echo up')
+	[ "$r" = up ] || bad "test WireGuard server in the VM not set up: $r"
+	# Stale tunnel, 5-minute limit passed: CH-FREE#2 now answers ping and wins,
+	# the handshake is real, and only then is it saved.
+	r=$(vm_ssh 'sed -i "s/^STALE=.*/STALE=1/" /etc/proton-pick.conf; echo 0 > /tmp/proton/last-switch; proton-pick check
+		wg show testvpn endpoints | cut -f2
+		i=0; until [ "$(wg show testvpn latest-handshakes | cut -f2)" != 0 ] || [ $i -ge 15 ]; do ping -I testvpn -c1 -W1 10.66.0.1 >/dev/null 2>&1; i=$((i+1)); done
+		sed -i "s/^STALE=.*/STALE=300/" /etc/proton-pick.conf; proton-pick check
+		uci -q get network.@wireguard_testvpn[0].endpoint_host; uci -q get network.@wireguard_testvpn[0].description; logread | grep -c "answers; saved"' | tr '\n' '|')
+	[ "$r" = "10.99.0.2:51820|10.99.0.2|Proton CH-FREE#2|1|" ] && ok "Proton: moved to the server answering ping fastest, real handshake, then saved (and only then)" \
+		|| bad "Proton real switch (want '10.99.0.2:51820|10.99.0.2|Proton CH-FREE#2|1|'): $r"
+	# The internet line down (its checks blocked): a stale tunnel is not switched.
+	r=$(vm_ssh 'nft add table inet pptest; nft add chain inet pptest o "{ type filter hook output priority -10; }"
+		nft add rule inet pptest o ip daddr "{ 1.1.1.1, 8.8.8.8 }" drop; nft add rule inet pptest o ip6 daddr 2606:4700:4700::1111 drop
+		ip netns exec srv ip link set wgs down
+		sleep 3   # let the last handshake age past STALE=1
+		sed -i "s/^STALE=.*/STALE=1/" /etc/proton-pick.conf; echo 0 > /tmp/proton/last-switch; proton-pick check
+		wg show testvpn endpoints | cut -f2; logread | grep -c "internet line is down"; nft delete table inet pptest' | tr '\n' ' ')
+	[ "$r" = "10.99.0.2:51820 1 " ] && ok "Proton: no switching while the internet line is down" || bad "Proton with the line down (want '10.99.0.2:51820 1'): $r"
+	# No server answers (the real one is down, the others don't exist): each is
+	# tried once, then it waits for the next list. Nothing is written to flash.
+	r=$(vm_ssh 'for i in 1 2 3 4; do echo 0 > /tmp/proton/last-switch; proton-pick check >/dev/null 2>&1; wg show testvpn endpoints | cut -f2; done
+		logread | grep -c "no listed server answered"; uci -q get network.@wireguard_testvpn[0].endpoint_host
+		sed -i "s/^STALE=.*/STALE=300/" /etc/proton-pick.conf; ip netns exec srv ip link set wgs up' | tr '\n' ' ')
+	[ "$r" = "198.51.100.9:51820 198.51.100.5:51820 198.51.100.5:51820 198.51.100.5:51820 1 10.99.0.2 " ] \
+		&& ok "Proton: with no server answering, each is tried once, then it waits; nothing written to flash" \
+		|| bad "Proton when nothing answers (want '198.51.100.9:51820 198.51.100.5:51820 198.51.100.5:51820 198.51.100.5:51820 1 10.99.0.2'): $r"
+	r=$(vm_ssh 'proton-pick refresh >/dev/null 2>&1; echo $?; grep -c "refresh-2" /etc/proton/session; [ -e /tmp/proton/exhausted ] && echo waiting
+		logread | grep -cE "refresh-[0-9]|access-[0-9]|uid-test"' | tr '\n' ' ')
+	[ "$r" = "0 1 0 " ] && ok "Proton: next refresh uses the rotated token and gives every server a new chance; no tokens in the system log" \
+		|| bad "Proton refresh/log (want '0 1 0'): $r"
 	# Two runs at once (cron + boot + by hand): one waits for the other.
 	r=$(vm_ssh 'proton-pick refresh >/tmp/a 2>&1 & proton-pick refresh >/tmp/b 2>&1; wait
 		[ -f /tmp/proton/session-ended ] && echo ended; grep -c "refresh-4" /etc/proton/session' | tr '\n' ' ')
@@ -193,20 +225,24 @@ proton_checks() {
 		|| bad "Proton concurrent refreshes (want '1'): $r"
 }
 
-# After the re-run: the chosen server is kept; an ended session keeps the list.
+# After the re-run (which was sent a stale copy of the session): the router
+# kept its own; the chosen server is kept; bad tokens refused; an ended
+# session keeps the list; a new login is installed.
 proton_rerun_checks() {
 	r=$(vm_ssh 'uci -q get network.@wireguard_testvpn[0].endpoint_host')
-	[ "$r" = 198.51.100.9 ] && ok "Proton: re-run kept the server proton-pick chose" || bad "Proton: re-run reset the server to $r"
-	grep -q 'new Proton session installed' "$W/full-rerun.log" && bad "Proton: re-run sent a stale session" || ok "Proton: re-run left the router's own session alone"
+	[ "$r" = 10.99.0.2 ] && ok "Proton: re-run kept the server proton-pick chose" || bad "Proton: re-run reset the server to $r"
+	grep -q "kept the router's own Proton session" "$W/full-rerun.log" && grep -q '^PASS  Proton server list' "$W/full-rerun.log" && [ ! -e "$P/proton-session" ] \
+		&& ok "Proton: a stale laptop copy of the session is refused; the router's newer session keeps working" \
+		|| bad "Proton stale copy: $(grep -i proton "$W/full-rerun.log" | tr '\n' ' ')"
 	curl -s "http://127.0.0.1:$XPORT/_evil" >/dev/null
-	r=$(vm_ssh 'proton-pick refresh >/dev/null 2>&1; echo $?; grep -c "PWNED" /etc/proton/session; [ -e /tmp/PWNED ] && echo pwned; logread | grep -c "unexpected tokens"' | tr '\n' ' ')
+	r=$(vm_ssh 'proton-pick refresh >/dev/null 2>&1; echo $?; grep -c "PWNED" /etc/proton/session; [ -e /tmp/PWNED ] && echo pwned; logread | grep -c "no usable tokens"' | tr '\n' ' ')
 	[ "$r" = "1 0 1 " ] && ok "Proton: a token with shell quotes is refused, never stored or run" || bad "Proton evil token (want '1 0 1'): $r"
 	curl -s "http://127.0.0.1:$XPORT/_end" >/dev/null
 	r=$(vm_ssh 'proton-pick refresh >/dev/null 2>&1; echo $?; proton-pick status | grep -c "session:    ENDED"; wc -l < /etc/proton/servers' | tr '\n' ' ')
 	[ "$r" = "1 1 3 " ] && ok "Proton: ended session reported in status, last list kept" || bad "Proton ended session (want '1 1 3'): $r"
-	# Logging in again (./proton-login.sh) leaves a new session for setup.sh.
+	# Logging in again (./proton-login.sh) gives a new session for setup.sh.
 	curl -s "http://127.0.0.1:$XPORT/_new" >/dev/null
-	printf "PROTON_UID='uid-test'\nPROTON_REFRESH='refresh-new'\n" > "$P/proton-session"
+	printf "PROTON_UID='uid-new'\nPROTON_REFRESH='refresh-new'\n" > "$P/proton-session"
 	run_setup "$P" "$W/full-relogin.log"
 	r=$(vm_ssh 'proton-pick status | grep -c "session:    present"')
 	grep -q 'new Proton session installed' "$W/full-relogin.log" && grep -q '^PASS  Proton server list' "$W/full-relogin.log" && [ "$r" = 1 ] && [ ! -e "$P/proton-session" ] \
@@ -267,6 +303,7 @@ scenario_full() {
 	[ "$a" = "::" ] && ok "VPN domain has no IPv6 answer (VPN has no IPv6)" || bad "VPN domain AAAA: $a"
 	# Hardware flow offloading switched on by hand goes back to software (it bypasses SQM).
 	vm_ssh 'uci set firewall.@defaults[0].flow_offloading_hw=1; uci commit firewall'
+	printf "PROTON_UID='uid-test'\nPROTON_REFRESH='refresh-0'\n" > "$P/proton-session"   # an old copy
 	run_setup "$P" "$W/full-rerun.log"
 	r=$(vm_ssh 'uci -q get firewall.@defaults[0].flow_offloading; uci -q get firewall.@defaults[0].flow_offloading_hw' | tr '\n' ' ')
 	[ "$r" = "1 0 " ] && ok "flow offloading: software on, hardware off" || bad "flow offloading (software hardware): $r"

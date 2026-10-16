@@ -75,6 +75,20 @@ if session.needs_twofa and not session.provide_2fa(input("2FA code: ").strip()):
 state = session.__getstate__()
 uid, access, refresh = state["UID"], state["AccessToken"], state["RefreshToken"]
 del state
+# Save the session first: a failed list fetch must not cost a new login.
+priv = args.private
+os.makedirs(priv, mode=0o700, exist_ok=True)
+old = os.umask(0o077)
+try:
+    tmp = os.path.join(priv, "proton-session.tmp")
+    with open(tmp, "w") as f:
+        f.write("# Proton VPN session for the router (UID + refresh token). Secret.\n")
+        f.write(f"PROTON_UID='{uid}'\nPROTON_REFRESH='{refresh}'\n")
+    os.replace(tmp, os.path.join(priv, "proton-session"))
+finally:
+    os.umask(old)
+say("Saved private/proton-session (the session for the router).")
+
 h = {"x-pm-uid": uid, "Authorization": f"Bearer {access}", "x-pm-appversion": APPVERSION,
      "Accept": "application/vnd.protonmail.v1+json"}
 
@@ -95,23 +109,16 @@ for s in r.json()["LogicalServers"]:
             break
 rows.sort()
 
-priv = args.private
-os.makedirs(priv, mode=0o700, exist_ok=True)
 old = os.umask(0o077)
 try:
     with open(os.path.join(priv, "proton-servers.txt"), "w") as f:
         for _, load, cc, name, ip, key in rows:
             f.write(f"{cc} {load} {name} {ip} {key}\n")
-    tmp = os.path.join(priv, "proton-session.tmp")
-    with open(tmp, "w") as f:
-        f.write("# Proton VPN session for the router (UID + refresh token). Secret.\n")
-        f.write(f"PROTON_UID='{uid}'\nPROTON_REFRESH='{refresh}'\n")
-    os.replace(tmp, os.path.join(priv, "proton-session"))
 finally:
     os.umask(old)
 
 say(f"\nPlan tier {tier}. {len(rows)} usable servers in {' '.join(want)} (by country, then load; the router picks by ping):")
 for _, load, cc, name, ip, _key in rows[:12]:
     say(f"  {cc}  {name:<12} load {load:>3}%  {ip}")
-say(f"\nSaved private/proton-session (session for the router) and private/proton-servers.txt.")
+say("\nSaved private/proton-servers.txt.")
 say("Not logged out: the router continues this session.")

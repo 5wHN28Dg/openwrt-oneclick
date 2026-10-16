@@ -5,48 +5,57 @@
 #                         list, then run "check"
 #   proton-pick check     every 5 minutes: if the tunnel has had no handshake
 #                         for $STALE seconds, or its server is no longer
-#                         listed, switch to the best listed server
+#                         listed, move to the best server not tried yet
 #   proton-pick status    what it is doing
 #
 # Best server: for each country, the least-loaded server; of those, the one
 # with the lowest ping from here (load breaks ties and decides when nothing
 # answers ping). Your WireGuard key works on every Proton server, so a switch
-# is only a change of peer (wg set) plus the same in /etc/config/network, so
-# a reboot keeps it. No restart, so policy routing is not disturbed.
+# only changes the peer (wg set): nothing restarts and policy routing is not
+# disturbed. The new server is written to /etc/config/network (so a reboot
+# keeps it) only once it has answered a handshake, so a failure that no
+# server can fix (key revoked, UDP blocked) costs no flash writes: every
+# server is tried once, then it waits for the next list.
 #
 # Files: /etc/proton/session (UID + refresh token, secret; rewritten when
 # Proton rotates the token, about once a day), /etc/proton/servers (the list,
-# rewritten only when it changes), /tmp/proton/ (RAM: loads, access token,
-# last switch). Settings: /etc/proton-pick.conf (IFACE, COUNTRIES, STALE, API).
+# rewritten only when servers come or go), /tmp/proton/ (RAM: loads, keys of
+# every listed machine, servers tried, last switch).
+# Settings: /etc/proton-pick.conf (IFACE, COUNTRIES, STALE, API).
 
-IFACE=protonvpn COUNTRIES='' STALE=180 API=https://vpn-api.proton.me
+umask 077
+IFACE=protonvpn COUNTRIES='' STALE=300 API=https://vpn-api.proton.me
 # shellcheck source=/dev/null
 [ -f /etc/proton-pick.conf ] && . /etc/proton-pick.conf
 SESSION=/etc/proton/session
 LIST=/etc/proton/servers
 RUN=/tmp/proton
 PARSE=/usr/share/proton-pick/parse.uc
-mkdir -p "$RUN"; chmod 700 "$RUN"
-T=$RUN/tmp.$$   # this run's temporary files
 log() { logger -t proton-pick "$*"; [ -t 1 ] && echo "$*"; return 0; }
 
-# One run at a time (cron, boot and manual runs can meet). A lock left by a
-# run that died is noticed through its PID and taken over.
+# /tmp is shared: use the working directory only if root owns it and it is a
+# real directory (another user could create it first and read the tokens).
+[ -L "$RUN" ] && rm -f "$RUN"
+[ -d "$RUN" ] && [ "$(ls -ld "$RUN" | awk '{ print $3 }')" != root ] && rm -rf "$RUN"
+mkdir -p "$RUN" && chmod 700 "$RUN"
+[ "$(ls -ld "$RUN" | awk '{ print $3 }')" = root ] || { log "$RUN is not root's; stopping"; exit 1; }
+T=$RUN/tmp.$$   # this run's temporary files
+
+# One run at a time (cron, boot, manual runs and setup can meet). A kernel
+# lock: released by itself when a run ends or dies.
 lock() {
-	i=0
-	until mkdir "$RUN/lock" 2>/dev/null; do
-		p=$(cat "$RUN/lock/pid" 2>/dev/null)
-		if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$RUN/lock"; continue; fi
-		i=$((i + 1)); [ $i -ge 180 ] && { log "another proton-pick run is still busy; giving up"; exit 1; }
+	exec 9>/var/lock/proton-pick.lock
+	i=0   # BusyBox flock has no timeout: try every second, for up to 15 minutes
+	until flock -n 9; do
+		i=$((i + 1)); [ $i -ge 900 ] && { log "another proton-pick run is still busy; giving up"; exit 1; }
 		sleep 1
 	done
-	echo $$ > "$RUN/lock/pid"
-	trap 'rm -rf "$RUN/lock" "$T".*' EXIT
+	trap 'rm -f "$T".*' EXIT
 	trap 'exit 1' INT TERM
 }
 
-# Tokens go into files that are read back by the shell and into HTTP headers:
-# accept only the characters Proton's tokens are made of.
+# Tokens go into files the shell reads back and into HTTP headers: accept only
+# the characters Proton's tokens are made of.
 token_ok() { case $1 in ''|*[!A-Za-z0-9._~+/=-]*) return 1 ;; esac; }
 
 # --- Proton API ----------------------------------------------------------------
@@ -61,8 +70,8 @@ api_init() {
 		[ -n "$ip" ] || { log "cannot resolve $host"; return 1; }
 		RESOLVE="--resolve $host:443:$ip" ;;
 	esac
-	(umask 077; printf '%s\n' "x-pm-uid: $PROTON_UID" 'x-pm-appversion: Other' \
-		'Accept: application/vnd.protonmail.v1+json' > "$T.headers")
+	printf '%s\n' "x-pm-uid: $PROTON_UID" 'x-pm-appversion: Other' \
+		'Accept: application/vnd.protonmail.v1+json' > "$T.headers" || { log "cannot write to $RUN (full?)"; return 1; }
 }
 api() { # PATH OUTFILE [curl args...] -> prints the HTTP status
 	p=$1 o=$2; shift 2
@@ -71,13 +80,14 @@ api() { # PATH OUTFILE [curl args...] -> prints the HTTP status
 }
 
 refresh() {
+	rm -f "$RUN/tried" "$RUN/exhausted"   # a new list: every server gets a new chance
 	[ -f "$SESSION" ] || { log "no Proton session; run ./proton-login.sh on the laptop, then ./setup.sh"; return 1; }
 	# shellcheck source=/dev/null
 	. "$SESSION"
 	token_ok "$PROTON_UID" && token_ok "$PROTON_REFRESH" || { log "the session file is damaged; run ./proton-login.sh, then ./setup.sh"; return 1; }
 	api_init || return 1
-	(umask 077; printf '{"ResponseType":"token","GrantType":"refresh_token","RefreshToken":"%s","RedirectURI":"http://protonmail.ch"}' \
-		"$PROTON_REFRESH" > "$T.body")
+	printf '{"ResponseType":"token","GrantType":"refresh_token","RefreshToken":"%s","RedirectURI":"http://protonmail.ch"}' \
+		"$PROTON_REFRESH" > "$T.body" && [ -s "$T.body" ] || { log "cannot write to $RUN (full?)"; return 1; }
 	code=$(api /auth/refresh "$T.auth" -H 'Content-Type: application/json' --data-binary @"$T.body")
 	case $code in
 	200) ;;
@@ -86,13 +96,15 @@ refresh() {
 		: > "$RUN/session-ended"; return 1 ;;
 	*)	log "session renewal failed (HTTP ${code:-none}); will retry"; return 1 ;;
 	esac
-	access=$(jsonfilter -i "$T.auth" -e '@.AccessToken')
-	new=$(jsonfilter -i "$T.auth" -e '@.RefreshToken')
+	access=$(jsonfilter -i "$T.auth" -e '@.AccessToken' 2>/dev/null)
+	new=$(jsonfilter -i "$T.auth" -e '@.RefreshToken' 2>/dev/null)
 	rm -f "$RUN/session-ended"
-	token_ok "$access" && token_ok "$new" || { log "Proton's answer had unexpected tokens; keeping the current session"; return 1; }
-	if [ "$new" != "$PROTON_REFRESH" ]; then   # Proton rotates it: keep the new one
-		(umask 077; printf "# Proton VPN session (secret)\nPROTON_UID='%s'\nPROTON_REFRESH='%s'\n" \
-			"$PROTON_UID" "$new" > "$SESSION.tmp") && mv "$SESSION.tmp" "$SESSION"
+	token_ok "$access" && token_ok "$new" || {
+		log "Proton's answer had no usable tokens; keeping the current session (if the next renewal fails, run ./proton-login.sh)"
+		return 1; }
+	if [ "$new" != "$PROTON_REFRESH" ]; then   # Proton rotates it: keep the new one at once
+		printf "# Proton VPN session (secret)\nPROTON_UID='%s'\nPROTON_REFRESH='%s'\n" "$PROTON_UID" "$new" > "$SESSION.tmp" &&
+			mv "$SESSION.tmp" "$SESSION" && sync || { log "could not store the renewed session"; return 1; }
 	fi
 	echo "Authorization: Bearer $access" >> "$T.headers"
 
@@ -101,10 +113,12 @@ refresh() {
 	case $code:$tier in 200:[0-9]*) ;; *) log "account info failed (HTTP $code)"; return 1 ;; esac
 	code=$(api '/vpn/v1/logicals?SecureCoreFilter=all&WithState=true' "$T.list" --compressed)
 	if [ "$code" != 200 ]; then log "server list failed (HTTP $code)"; return 1; fi
-	ucode "$PARSE" "$T.list" "$tier" "$COUNTRIES" > "$T.loads"
+	ucode "$PARSE" "$T.list" "$tier" "$COUNTRIES" > "$T.all"
 	rm -f "$T.list"
-	[ -s "$T.loads" ] || { log "server list had no usable servers; keeping the last one"; return 1; }
-	mv "$T.loads" "$RUN/loads"
+	[ -s "$T.all" ] || { log "server list had no usable servers; keeping the last one"; return 1; }
+	# Every enabled machine (for "still listed"), and the first of each server (to choose from).
+	awk '{ print $3, $5 }' "$T.all" > "$RUN/keys"
+	awk '!seen[$3]++' "$T.all" > "$RUN/loads"
 	# Flash copy without loads, written only when servers come or go.
 	awk '{ print $1, $3, $4, $5 }' "$RUN/loads" | sort > "$T.servers"
 	mkdir -p /etc/proton; chmod 700 /etc/proton
@@ -125,35 +139,43 @@ handshake_age() {
 	[ "$since" -lt "$up" ] && up=$since
 	echo "$up"
 }
-# The WAN itself answers (then a stale tunnel is the server's fault, not the line's).
+# The internet line itself works (then a dead tunnel is the server's fault).
+# Ping first; HTTPS for lines that drop ping.
 wan_up() {
 	ping -4 -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 || ping -4 -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 ||
-		ping -6 -c 1 -W 3 2606:4700:4700::1111 >/dev/null 2>&1
+		ping -6 -c 1 -W 3 2606:4700:4700::1111 >/dev/null 2>&1 ||
+		curl -s -o /dev/null --max-time 8 https://1.1.1.1/ 2>/dev/null ||
+		curl -s -o /dev/null --max-time 8 'https://[2606:4700:4700::1111]/' 2>/dev/null
 }
-listed() { [ -f "$LIST" ] && awk -v k="$1" '$4 == k { f = 1 } END { exit !f }' "$LIST"; }
-name_of() { awk -v k="$1" '$4 == k { print $2 }' "$LIST" 2>/dev/null; }
+keys_file() { if [ -s "$RUN/keys" ]; then echo "$RUN/keys"; else echo "$LIST"; fi; }
+listed() { f=$(keys_file); [ -f "$f" ] && awk -v k="$1" '$NF == k { f = 1 } END { exit !f }' "$f"; }
+name_of() { awk -v k="$1" '$NF == k { print (NF == 2) ? $1 : $2; exit }' "$(keys_file)" 2>/dev/null; }
 
-# best EXCLUDE-KEY -> "NAME IP KEY why"
+# best -> "NAME IP KEY why" for the best server not tried since the last good
+# handshake (the current one counts as tried); nothing when none is left.
 best() {
 	src=$RUN/loads; [ -s "$src" ] || src=$LIST
-	# Least loaded per country ($RUN/loads: CC LOAD NAME IP KEY; flash list has no loads).
-	if [ "$src" = "$LIST" ]; then
-		awk -v x="$1" '$4 != x && !seen[$1]++ { print $1, 100, $2, $3, $4 }' "$LIST"
+	if [ "$src" = "$LIST" ]; then   # flash list: no loads
+		awk '{ print $1, 100, $2, $3, $4 }' "$LIST"
 	else
-		sort -k1,1 -k2,2n "$src" | awk -v x="$1" '$5 != x && !seen[$1]++'
-	fi > "$T.cands"
+		sort -k1,1 -k2,2n "$src"
+	fi | awk -v t=" $(tr '\n' ' ' < "$RUN/tried") " 'index(t, " " $5 " ") == 0 && !seen[$1]++' > "$T.cands"
 	: > "$T.rtt"
-	while read -r _ load name ip key; do
+	n=0
+	while read -r _ load name ip key; do   # 10 pings at a time
 		( r=$(ping -c 3 -W 2 "$ip" 2>/dev/null | awk -F/ '/round-trip/ { print int($4 + 0.5) }')
 		  echo "${r:-99999} $load $name $ip $key" >> "$T.rtt" ) &
+		n=$((n + 1)); [ $((n % 10)) -eq 0 ] && wait
 	done < "$T.cands"
 	wait
 	sort -n -k1,1 -k2,2n "$T.rtt" | awk 'NR == 1 { why = ($1 == 99999) ? "no ping answers, lowest load " $2 "%" : $1 " ms, load " $2 "%"; print $3, $4, $5, why }'
 }
 
-switch_to() { # NAME IP KEY WHY REASON
+peer_section() { uci -q show network | sed -n "s/^network\.\(@wireguard_$IFACE\[0\]\)=.*/\1/p"; }
+
+switch_to() { # NAME IP KEY WHY REASON  (in the kernel only; saved once it works)
 	old=$(current)
-	peer=$(uci -q show network | sed -n "s/^network\.\(@wireguard_$IFACE\[0\]\)=.*/\1/p")
+	peer=$(peer_section)
 	[ -n "$peer" ] || { log "no WireGuard peer for $IFACE in /etc/config/network"; return 1; }
 	port=$(uci -q get "network.$peer.endpoint_port"); port=${port:-51820}
 	ka=$(uci -q get "network.$peer.persistent_keepalive"); [ "${ka:-0}" -gt 0 ] || ka=25
@@ -161,39 +183,60 @@ switch_to() { # NAME IP KEY WHY REASON
 	psk=$(uci -q get "network.$peer.preshared_key")
 	[ -n "$old" ] && wg set "$IFACE" peer "$old" remove
 	if [ -n "$psk" ]; then
-		(umask 077; echo "$psk" > "$T.psk")
+		echo "$psk" > "$T.psk"
 		wg set "$IFACE" peer "$3" preshared-key "$T.psk" endpoint "$2:$port" allowed-ips "${allowed:-0.0.0.0/0,::/0}" persistent-keepalive "$ka"
 	else
 		wg set "$IFACE" peer "$3" endpoint "$2:$port" allowed-ips "${allowed:-0.0.0.0/0,::/0}" persistent-keepalive "$ka"
 	fi
-	uci set "network.$peer.public_key=$3"
-	uci set "network.$peer.endpoint_host=$2"
-	uci set "network.$peer.description=Proton $1"
-	uci commit network
+	echo "$3" >> "$RUN/tried"
+	echo "$1 $2 $3" > "$RUN/pending"
 	date +%s > "$RUN/last-switch"
 	log "switched to $1 ($2, $4) because $5"
+}
+
+# The tunnel answers: forget what was tried, and save a new server to flash.
+confirmed() {
+	rm -f "$RUN/tried" "$RUN/exhausted"
+	[ -s "$RUN/pending" ] || return 0
+	read -r n ip k < "$RUN/pending"; rm -f "$RUN/pending"
+	[ "$k" = "$(current)" ] || return 0
+	peer=$(peer_section); [ -n "$peer" ] || return 0
+	[ "$(uci -q get "network.$peer.public_key")" = "$k" ] && return 0
+	uci set "network.$peer.public_key=$k"
+	uci set "network.$peer.endpoint_host=$ip"
+	uci set "network.$peer.description=Proton $n"
+	uci commit network
+	log "$n answers; saved it as the tunnel's server"
 }
 
 check() {
 	[ -s "$LIST" ] || { log "no server list yet"; return 0; }
 	ifstatus "$IFACE" >/dev/null 2>&1 || return 0
+	touch "$RUN/tried"
 	key=$(current); age=$(handshake_age)
 	if [ -n "$key" ] && ! listed "$key"; then
 		reason="its server is no longer listed (disabled or removed)"
 	elif [ "${age:-0}" -gt "$STALE" ]; then
 		reason="no handshake for ${age}s"
 	else
+		t=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk 'NR == 1 { print $2 }')
+		[ "${t:-0}" -gt 0 ] && confirmed
 		return 0
 	fi
 	# Give a new server time to answer before moving on again.
 	last=$(cat "$RUN/last-switch" 2>/dev/null || echo 0)
 	[ $(( $(date +%s) - last )) -lt 300 ] && return 0
-	# A dead line makes every server look dead: wait for the line instead of
-	# switching (and writing flash) over and over.
+	[ -f "$RUN/exhausted" ] && return 0
+	# A dead line makes every server look dead: wait for the line instead.
 	wan_up || { log "tunnel stale but the internet line is down; not switching"; return 0; }
+	[ -n "$key" ] && echo "$key" >> "$RUN/tried"
 	# shellcheck disable=SC2046  # NAME IP KEY why... as words
-	set -- $(best "$key")
-	[ $# -ge 3 ] || { log "no other server to switch to"; return 1; }
+	set -- $(best)
+	if [ $# -lt 3 ]; then
+		: > "$RUN/exhausted"
+		log "no listed server answered a handshake (WireGuard key revoked? UDP blocked by the provider?); waiting for the next server list"
+		return 1
+	fi
 	n=$1 ip=$2 k=$3; shift 3
 	switch_to "$n" "$ip" "$k" "$*" "$reason"
 }
@@ -201,10 +244,11 @@ check() {
 status() {
 	key=$(current)
 	echo "interface:  $IFACE"
-	echo "server:     $(name_of "$key") ($(wg show "$IFACE" endpoints 2>/dev/null | awk '{ print $2 }'))${key:+$(listed "$key" || echo ' NOT LISTED')}"
+	echo "server:     $(name_of "$key") ($(wg show "$IFACE" endpoints 2>/dev/null | awk 'NR == 1 { print $2 }'))${key:+$(listed "$key" || echo ' NOT LISTED')}$( [ -s "$RUN/pending" ] && echo ', not saved until it answers')"
 	echo "handshake:  $(handshake_age)s ago (switch after ${STALE}s)"
 	echo "list:       $(wc -l < "$LIST" 2>/dev/null || echo 0) servers on flash, loads from $( [ -s "$RUN/loads" ] && date -r "$RUN/loads" '+%F %R' || echo 'not fetched since boot')"
 	echo "session:    $( [ -f "$RUN/session-ended" ] && echo 'ENDED: run ./proton-login.sh, then ./setup.sh' || { [ -f "$SESSION" ] && echo present || echo missing; })"
+	[ -f "$RUN/exhausted" ] && echo "waiting:    every listed server was tried without a handshake; next try after the next list"
 	echo "countries:  ${COUNTRIES:-all}"
 }
 
