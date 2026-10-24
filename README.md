@@ -113,6 +113,10 @@ the latency check loads the line (about 11 s, or 18 s on cable).
 
 ## Remote access
 
+New to this? [docs/remote-access.md](docs/remote-access.md) walks through
+it from zero: checking your connection, the provider's box, a DuckDNS name,
+and getting the configs onto your phone and laptop.
+
 The router listens for WireGuard on UDP 51820 (changeable) and puts tunnel
 devices (10.77.0.0/24 unless you set `REMOTE_NET`) in the LAN zone. The keys
 are made on your computer with OpenSSL and kept in `private/config.env`, so a
