@@ -86,6 +86,11 @@ if [ -n "$REDLIB" ]; then
 	if [ "$REDLIB_IP" = "$LAN_IP" ] || { [ $last -ge $((net + start)) ] && [ $last -lt $((net + start + limit)) ]; } || [ -n "$leased" ]; then
 		echo "Redlib's address $REDLIB_IP is the router's, in the DHCP pool or a fixed lease; make the pool end before it (LuCI: Network > Interfaces > lan > DHCP Server)"; exit 1
 	fi
+	# Not ours yet: a device (a second access point, a modem) may have set it itself.
+	if ! ip -4 addr show | grep -q " $REDLIB_IP/" \
+		&& { ping -c 1 -W 1 "$REDLIB_IP" >/dev/null 2>&1 || ip neigh show "$REDLIB_IP" | grep -q lladdr; }; then
+		echo "a device on the LAN already uses $REDLIB_IP, the address Redlib would take; give that device another address"; exit 1
+	fi
 fi
 
 # curl: SQM speed test (streamed upload); gawk, sed, coreutils-sort: adblock-lean's
@@ -219,22 +224,26 @@ put_tree "$ROUTER/files"
 if on "${ENABLE_MANGADEX:-0}"; then put_tree "$ROUTER/vendor/safe-otaku"; chmod 755 /www/cgi-bin/md; fi
 # Redlib: its own user (created before the firewall rule that names its number).
 # Turned off since an earlier run: everything goes, the rule before the user.
-REDLIB_FILES='/etc/init.d/redlib /usr/sbin/redlib-update /etc/nftables.d/30-oneclick-redlib-dns.nft /etc/redlib.conf'
+REDLIB_NFT=/etc/nftables.d/30-oneclick-redlib-dns.nft
+REDLIB_FILES="/etc/init.d/redlib /usr/sbin/redlib-update $REDLIB_NFT /etc/redlib.conf"
 if [ -n "$REDLIB" ]; then
 	# OpenWrt's helpers (in a subshell: they read variables this script's set -u rejects)
 	( set +u; . /lib/functions.sh
 	  user_exists redlib || user_add redlib '' "$(group_add_next redlib)" Redlib /var/empty /bin/false )
 	put_tree "$ROUTER/redlib"
 	chmod 755 /etc/init.d/redlib /usr/sbin/redlib-update
-	# A rule without a number would stop the whole firewall from loading.
+	# The DNS rule goes by the user's number: it must be a number, and only
+	# redlib's (an unfinished or wrong rule would stop the firewall loading,
+	# or let another program's DNS skip the block lists).
 	uid=$(id -u redlib 2>/dev/null)
-	case $uid in ''|*[!0-9]*) rm -f /etc/nftables.d/30-oneclick-redlib-dns.nft; die "could not create the redlib user" ;; esac
-	sed -i "s/REDLIB_UID/$uid/" /etc/nftables.d/30-oneclick-redlib-dns.nft
+	case $uid in ''|*[!0-9]*) rm -f $REDLIB_NFT; die "could not create the redlib user" ;; esac
+	[ "$(awk -F: -v u="$uid" '$3 == u' /etc/passwd | wc -l)" = 1 ] || { rm -f $REDLIB_NFT; die "another user shares the redlib user's number $uid"; }
+	sed "s/REDLIB_UID/$uid/" "$ROUTER/redlib-dns.nft" > $REDLIB_NFT.tmp && mv $REDLIB_NFT.tmp $REDLIB_NFT
 	SFW=off; on "${FAMILY_FILTER:-0}" && SFW=on
 	printf 'ADDRESS=%s\nSFW=%s\n' "$REDLIB_IP" "$SFW" > /etc/redlib.conf
 elif [ -e /etc/init.d/redlib ] || grep -q '^redlib:' /etc/passwd; then
 	/etc/init.d/redlib stop >/dev/null 2>&1; /etc/init.d/redlib disable >/dev/null 2>&1
-	rm -f $REDLIB_FILES /usr/sbin/redlib /usr/sbin/redlib.old /usr/sbin/redlib.new /etc/redlib.version /etc/redlib.rejected
+	rm -f $REDLIB_FILES $REDLIB_NFT.tmp /usr/sbin/redlib /usr/sbin/redlib.old /usr/sbin/redlib.new /etc/redlib.version /etc/redlib.rejected
 	sed -i '/^redlib:/d' /etc/passwd /etc/shadow /etc/group
 	for f in $REDLIB_FILES; do sed -i "\#^$f\$#d" /etc/sysupgrade.conf; done
 fi

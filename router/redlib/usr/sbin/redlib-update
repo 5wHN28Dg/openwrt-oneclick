@@ -1,27 +1,60 @@
 #!/bin/sh
 # Installs or updates Redlib from its GitHub releases, set up by
-# openwrt-oneclick. Takes the newest release that is at least 3 days old (a
-# broken release has usually been replaced by then) and checks the download
-# against the SHA-256 GitHub publishes for it. If the new version doesn't
-# answer after a restart, the old one is put back. Run daily by cron and by
-# the setup. A release that fails that check is remembered and not tried
-# again. It also (re)starts Redlib whenever it isn't running: after a firmware
-# upgrade (the service comes back disabled) or when procd gave up on it.
-# Exit 0: installed or up to date; 1: failed (old version kept).
+# openwrt-oneclick. Run daily by cron and by the setup.
+#
+# - Takes the newest release that is at least 3 days old (a broken release
+#   has usually been replaced by then) and checks the download against the
+#   SHA-256 GitHub publishes for it.
+# - Installs it if it runs on this router (tried as the redlib user, never
+#   as root).
+# - Redlib only answers once Reddit has given it a token, so "not answering"
+#   can be Reddit's doing. The previous version is put back (and the release
+#   remembered as bad) only if the previous version was answering a moment
+#   before: then Reddit was fine and the new release is at fault.
+# - Every run makes sure Redlib runs: after a firmware upgrade the service
+#   comes back disabled, and procd gives up after repeated crashes.
+# - Checks that no other user shares the redlib user's number, since the DNS
+#   rule (/etc/nftables.d/30-oneclick-redlib-dns.nft) goes by that number.
+# Exit 0: installed or up to date; 1: failed (installed version kept).
 
 BIN=/usr/sbin/redlib
 VERSION=/etc/redlib.version
 REJECTED=/etc/redlib.rejected
+NFT=/etc/nftables.d/30-oneclick-redlib-dns.nft
 API=${REDLIB_RELEASES_API:-'https://api.github.com/repos/redlib-org/redlib/releases?per_page=10'}   # tests: tests/vm.sh
 WAIT_DAYS=3
 TGZ=/tmp/redlib-update.tgz
 
 say() { echo "redlib-update: $1"; logger -t redlib-update "$1"; }
-fail() { say "$1"; rm -f "$TGZ" "$BIN.new"; exit 1; }
-start() { # make sure it runs (and starts at boot)
+running() { # make sure it runs (and starts at boot)
+	[ -x $BIN ] || return 0
 	/etc/init.d/redlib enable
-	pidof redlib >/dev/null || /etc/init.d/redlib start
+	pidof redlib >/dev/null || /etc/init.d/redlib restart >/dev/null 2>&1
 }
+done_() { rm -f "$TGZ" "$BIN.new"; running; lock -u /var/lock/redlib-update; }
+fail() { say "$1"; done_; exit 1; }
+. /etc/redlib.conf
+answers() { # SECONDS: does Redlib answer within that time?
+	n=0
+	while :; do
+		uclient-fetch -qO /dev/null "http://$ADDRESS:8080/settings" 2>/dev/null && return 0
+		n=$((n + 1)); [ $n -ge "$1" ] && return 1
+		sleep 1
+	done
+}
+
+lock /var/lock/redlib-update   # the setup's run and the nightly one never overlap
+# Killed between the two renames of an earlier run: the previous version is there.
+[ ! -e $BIN ] && [ -x $BIN.old ] && mv $BIN.old $BIN
+
+# Only the redlib user's DNS may skip the block lists.
+uid=$(id -u redlib 2>/dev/null)
+if [ -z "$uid" ] || [ "$(awk -F: -v u="$uid" '$3 == u' /etc/passwd | wc -l)" != 1 ]; then
+	rm -f $NFT; fw4 reload >/dev/null 2>&1
+	/etc/init.d/redlib stop >/dev/null 2>&1
+	say "the redlib user is missing or shares its number with another user: Redlib stopped and its DNS rule removed; run ./setup.sh"
+	lock -u /var/lock/redlib-update; exit 1
+fi
 
 case $(uname -m) in
 	aarch64) T=aarch64-unknown-linux-musl ;;
@@ -35,7 +68,7 @@ cutoff=$(( $(date +%s) - WAIT_DAYS * 86400 ))
 i=0 tag='' url='' sum=''
 while [ $i -lt 10 ]; do
 	t=$(echo "$J" | jsonfilter -e "@[$i].tag_name") || break
-	if [ "$t" = "$(cat $REJECTED 2>/dev/null)" ]; then i=$((i + 1)); continue; fi
+	if grep -qxF "$t" $REJECTED 2>/dev/null; then i=$((i + 1)); continue; fi
 	pub=$(echo "$J" | jsonfilter -e "@[$i].published_at" | tr T ' ' | tr -d Z)
 	if [ "$(echo "$J" | jsonfilter -e "@[$i].draft" -e "@[$i].prerelease" | tr '\n' ' ')" = "false false " ] \
 		&& [ -n "$pub" ] && [ "$(date -u -d "$pub" +%s 2>/dev/null || echo 9999999999)" -le $cutoff ]; then
@@ -49,7 +82,7 @@ done
 [ -n "$tag" ] || fail "no release at least $WAIT_DAYS days old with a published SHA-256"
 case $tag in *[!A-Za-z0-9._-]*) fail "unexpected release name" ;; esac
 if [ -x $BIN ] && [ "$(cat $VERSION 2>/dev/null)" = "$tag" ]; then
-	start; say "$tag is current"; exit 0
+	say "$tag is current"; done_; exit 0
 fi
 
 # 11 MB unpacked: make sure the flash has room for it next to the old one.
@@ -63,30 +96,25 @@ chmod 755 $BIN.new
 # Run as the redlib user even for this check: downloaded code never runs as root.
 start-stop-daemon -S -c redlib -x $BIN.new -- --version >/dev/null 2>&1 || fail "$tag does not run on this router; not installed"
 
+was_up=''; [ -x $BIN ] && answers 1 && was_up=1
 [ -x $BIN ] && mv $BIN $BIN.old
 mv $BIN.new $BIN
 /etc/init.d/redlib enable
 /etc/init.d/redlib restart >/dev/null 2>&1
-. /etc/redlib.conf
-answers() {
-	i=0
-	while [ $i -lt 15 ]; do
-		uclient-fetch -qO /dev/null "http://$ADDRESS:8080/settings" 2>/dev/null && return 0
-		sleep 1; i=$((i + 1))
-	done
-	return 1
-}
-if answers; then
-	rm -f $BIN.old $REJECTED
+if answers 30; then
+	rm -f $BIN.old
 	echo "$tag" > $VERSION
 	say "installed $tag"
-	exit 0
+	done_; exit 0
 fi
-echo "$tag" > $REJECTED
-if [ -x $BIN.old ]; then
+if [ -n "$was_up" ] && [ -x $BIN.old ]; then
 	mv $BIN.old $BIN
+	echo "$tag" >> $REJECTED
 	/etc/init.d/redlib restart >/dev/null 2>&1
-	fail "$tag did not answer after starting; put the previous version back and won't try $tag again"
+	fail "$tag did not answer while the previous version did; put that back and won't try $tag again"
 fi
-rm -f $BIN
-fail "$tag did not answer after starting; removed and won't try $tag again"
+# Nothing to compare with: keep the new version, Reddit may be the reason.
+rm -f $BIN.old
+echo "$tag" > $VERSION
+say "installed $tag; not answering yet (Redlib needs Reddit to answer before it starts)"
+done_

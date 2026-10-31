@@ -87,6 +87,13 @@ ssh -p "$PORT" -i "$SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
 	-o UserKnownHostsFile="$KNOWN" -o StrictHostKeyChecking="$STRICT" "root@$HOST" \
 	"REMOVE=$(shq "$REMOVE") DEVICES=$(shq "$DEVICES") START=$(shq "$CUTOFF_START") STOP=$(shq "$CUTOFF_STOP") sh -s" <<'EOF'
 set -eu
+# Redlib's own address on the router can't also be a kid's device's.
+if [ -z "$REMOVE" ] && [ -f /etc/redlib.conf ]; then
+	a=$(sed -n 's/^ADDRESS=//p' /etc/redlib.conf)
+	if [ -n "$a" ] && printf '%s\n' "$DEVICES" | cut -d'|' -f3 | grep -qxF "$a"; then
+		echo "FAIL  kids: $a is the router's address for Redlib (reddit.lan); give that device another one in kids.conf"; exit 1
+	fi
+fi
 for cfg in dhcp firewall; do
 	for s in $(uci -q show $cfg | sed -n "s/^$cfg\.\([^.]*\)\.kids='1'$/\1/p" | sort -t'[' -k2 -n -r); do uci delete "$cfg.$s"; done
 done

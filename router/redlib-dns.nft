@@ -1,6 +1,7 @@
 # openwrt-oneclick: Redlib has to reach Reddit, which the block list may block
 # for everyone else. DNS lookups of user "redlib" (and only that user's; its
-# number replaces REDLIB_UID at install) go straight to dnsproxy, the
+# number replaces REDLIB_UID when install.sh writes this to
+# /etc/nftables.d/30-oneclick-redlib-dns.nft) go straight to dnsproxy, the
 # encrypted resolver behind dnsmasq's block lists.
 chain oneclick_redlib_dns {
 	type nat hook output priority dstnat; policy accept;

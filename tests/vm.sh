@@ -93,16 +93,22 @@ SRV_PRIV=$(wg_genkey) && SRV_PUB=$(wg_pubkey "$SRV_PRIV") || { echo "cannot make
 python3 -I "$HERE/tests/protonsrv.py" "$XPORT" "$SRV_PUB" & XPID=$!
 sleep 1
 kill -0 "$XPID" 2>/dev/null || { XPID=''; echo "Proton API stand-in did not start (port $XPORT in use?)"; exit 1; }
-# Stand-in for Redlib's release list (redlib-update's failure paths): a
-# release only a day old, and an old enough one whose SHA-256 doesn't match.
-mkdir -p "$W/rel"
-rel() { # file age-days digest
-	printf '[{"tag_name":"v9.9.9","published_at":"%s","draft":false,"prerelease":false,"assets":[{"name":"redlib-x86_64-unknown-linux-musl.tar.gz","browser_download_url":"http://10.0.2.2:%s/redlib.tgz","digest":"sha256:%s"}]}]\n' \
-		"$(date -u -d "-$2 days" +%Y-%m-%dT%H:%M:%SZ)" "$RPORT" "$3" > "$W/rel/$1"
+# Stand-in for Redlib's release list (redlib-update's decisions): a release
+# only a day old, one whose SHA-256 doesn't match, and "releases" that run
+# but never answer (fake.tgz), as v9.9.9 and v9.9.8.
+mkdir -p "$W/rel/fake"
+rel() { # file age-days digest tag archive
+	printf '[{"tag_name":"%s","published_at":"%s","draft":false,"prerelease":false,"assets":[{"name":"redlib-x86_64-unknown-linux-musl.tar.gz","browser_download_url":"http://10.0.2.2:%s/%s","digest":"sha256:%s"}]}]\n' \
+		"$4" "$(date -u -d "-$2 days" +%Y-%m-%dT%H:%M:%SZ)" "$RPORT" "$5" "$3" > "$W/rel/$1"
 }
-rel too-new.json 1 "$(printf '0%.0s' $(seq 64))"
-rel bad-sum.json 10 "$(printf '0%.0s' $(seq 64))"
 printf 'not a release\n' | gzip > "$W/rel/redlib.tgz"
+printf '#!/bin/sh\n[ "$1" = --version ] && { echo "redlib 9.9.9"; exit 0; }\nexec sleep 600\n' > "$W/rel/fake/redlib"
+chmod 755 "$W/rel/fake/redlib"; tar -C "$W/rel/fake" -czf "$W/rel/fake.tgz" redlib
+zeros=$(printf '0%.0s' $(seq 64)) fake=$(sha256sum "$W/rel/fake.tgz" | cut -d' ' -f1)
+rel too-new.json 1 "$zeros" v9.9.9 redlib.tgz
+rel bad-sum.json 10 "$zeros" v9.9.9 redlib.tgz
+rel silent.json 10 "$fake" v9.9.9 fake.tgz
+rel silent-too.json 10 "$fake" v9.9.8 fake.tgz
 python3 -I -m http.server -b 127.0.0.1 -d "$W/rel" "$RPORT" >/dev/null 2>&1 & RPID=$!
 sleep 1
 kill -0 "$RPID" 2>/dev/null || { RPID=''; echo "release list stand-in did not start (port $RPORT in use?)"; exit 1; }
@@ -304,14 +310,23 @@ redlib_checks() {
 		/etc/init.d/redlib enabled && echo enabled; pidof redlib >/dev/null && echo running' 2>&1 | tr '\n' ' ')
 	[ "$r" = "enabled running " ] && ok "Redlib: stopped and disabled (as after a firmware upgrade), the nightly update starts it again" \
 		|| bad "Redlib not restarted by the update (want 'enabled running'): $r"
-	for c in too-new bad-sum; do
-		r=$(vm_ssh "v=\$(cat /etc/redlib.version); REDLIB_RELEASES_API=http://10.0.2.2:$RPORT/$c.json /usr/sbin/redlib-update; echo rc=\$?; [ \"\$(cat /etc/redlib.version)\" = \"\$v\" ] && [ -x /usr/sbin/redlib ] && pidof redlib >/dev/null && echo kept" 2>&1 | tr '\n' ' ')
+	for c in too-new bad-sum silent silent; do
+		r=$(vm_ssh "v=\$(cat /etc/redlib.version); REDLIB_RELEASES_API=http://10.0.2.2:$RPORT/$c.json /usr/sbin/redlib-update; echo rc=\$?; [ \"\$(cat /etc/redlib.version)\" = \"\$v\" ] && { i=0; until uclient-fetch -qO- http://192.168.1.254:8080/settings 2>/dev/null | grep -q Redlib || [ \$i -ge 30 ]; do sleep 1; i=\$((i + 1)); done; [ \$i -lt 30 ]; } && echo kept" 2>&1 | tr '\n' ' ')
 		case $c:$r in
 			too-new:*"no release at least 3 days old"*"rc=1 kept "*) ok "Redlib update: a release under 3 days old is not taken, the running one stays" ;;
 			bad-sum:*"does not match GitHub's SHA-256"*"rc=1 kept "*) ok "Redlib update: a download that doesn't match its SHA-256 is refused, the running one stays" ;;
+			silent:*"put that back"*"rc=1 kept "*) ok "Redlib update: a release that doesn't answer while the old one did is rolled back" ;;
+			silent:*"no release at least 3 days old"*"rc=1 kept "*) ok "Redlib update: a rolled-back release is not tried again" ;;
 			*) bad "Redlib update ($c): $r" ;;
 		esac
 	done
+	# Not answering before the update either (as when Reddit refuses Redlib):
+	# the new release stays, nothing is deleted. Then the real one comes back.
+	r=$(vm_ssh "/etc/init.d/redlib stop; REDLIB_RELEASES_API=http://10.0.2.2:$RPORT/silent-too.json /usr/sbin/redlib-update; echo rc=\$?
+		echo v=\$(cat /etc/redlib.version); [ -x /usr/sbin/redlib ] && echo present
+		rm -f /etc/redlib.rejected; /usr/sbin/redlib-update >/dev/null 2>&1; { i=0; until uclient-fetch -qO- http://192.168.1.254:8080/settings 2>/dev/null | grep -q Redlib || [ \$i -ge 30 ]; do sleep 1; i=\$((i + 1)); done; [ \$i -lt 30 ]; } && echo real-back" 2>&1 | tr '\n' ' ')
+	case $r in *"not answering yet"*"rc=0 v=v9.9.8 present real-back "*) ok "Redlib update: when nothing answered before, a new release is kept, not deleted (then the real one is reinstalled)" ;;
+		*) bad "Redlib update without a working version to compare: $r" ;; esac
 }
 
 scenario_full() {
@@ -361,6 +376,13 @@ scenario_full() {
 	redlib_checks
 	r=$(ONECLICK_PRIVATE=$P "$W/kids.sh" 127.0.0.1 "$PORT" 2>&1)
 	case $r in *PASS*) ok "kids.sh: $r" ;; *) bad "kids.sh: $r" ;; esac
+	# A kid's device can't be given Redlib's address; the rules in place stay.
+	cp -R "$P" "$W/p-kids254"
+	printf '%s\n' "DEVICES='TV|02:00:00:00:00:01|192.168.1.254'" "CUTOFF_START='21:30:00'" "CUTOFF_STOP='05:30:00'" > "$W/p-kids254/kids.conf"
+	r=$(ONECLICK_PRIVATE=$W/p-kids254 "$W/kids.sh" 127.0.0.1 "$PORT" 2>&1)
+	n=$(vm_ssh 'uci show firewall | grep -c "name=.kids time restriction."')
+	case $r in *"address for Redlib"*) [ "$n" = 1 ] && ok "kids.sh refuses Redlib's address for a device; existing rules stay" || bad "kids.sh 254: rules after refusal: $n" ;;
+		*) bad "kids.sh accepted Redlib's address: $r" ;; esac
 	r=$(ONECLICK_PRIVATE=$P "$W/kids.sh" --remove 127.0.0.1 "$PORT" 2>&1)
 	[ "$(vm_ssh 'uci show firewall | grep -c "kids time restriction"')" = 0 ] && ok "kids.sh --remove: $r" || bad "kids.sh --remove left rules: $r"
 	ONECLICK_PRIVATE=$P "$W/kids.sh" 127.0.0.1 "$PORT" >/dev/null 2>&1
@@ -421,8 +443,8 @@ scenario_full() {
 	k=$(vm_ssh "nft list ruleset | grep 'kids time restriction'")
 	case $k in *"ether saddr"*) case $k in *"ip saddr"*) bad "kids rule still needs an IP match" ;; *) ok "kids rule matches by MAC only" ;; esac ;; *) bad "kids rule missing: $k" ;; esac
 	k=$(vm_ssh "nft list ruleset | grep 'kids router pages'")
-	case $k in *"ether saddr"*"dport { 80, 443, 8080 }"*|*"ether saddr"*"dport"*"8080"*) ok "kids: the router's own pages (reddit.lan, manga.lan, LuCI) are cut off too" ;;
-		*) bad "kids router-pages rule: $k" ;; esac
+	case $k in *"ether saddr"*) case $k in *"dport { 80, 443, 8080 }"*) ok "kids: the router's own pages (reddit.lan, manga.lan, LuCI) are cut off too" ;;
+		*) bad "kids router-pages rule ports: $k" ;; esac ;; *) bad "kids router-pages rule: $k" ;; esac
 
 	# A router that presents a different SSH key than the saved one is refused
 	# when nobody is there to confirm it (settings must not go to an impostor).
