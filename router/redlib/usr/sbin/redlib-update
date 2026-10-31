@@ -1,0 +1,80 @@
+#!/bin/sh
+# Installs or updates Redlib from its GitHub releases, set up by
+# openwrt-oneclick. Takes the newest release that is at least 3 days old (a
+# broken release has usually been replaced by then) and checks the download
+# against the SHA-256 GitHub publishes for it. If the new version doesn't
+# answer after a restart, the old one is put back. Run daily by cron and by
+# the setup. Exit 0: installed or up to date; 1: failed (old version kept).
+
+BIN=/usr/sbin/redlib
+VERSION=/etc/redlib.version
+API=${REDLIB_RELEASES_API:-'https://api.github.com/repos/redlib-org/redlib/releases?per_page=10'}   # tests: tests/vm.sh
+WAIT_DAYS=3
+TGZ=/tmp/redlib-update.tgz
+
+say() { echo "redlib-update: $1"; logger -t redlib-update "$1"; }
+fail() { say "$1"; rm -f "$TGZ" "$BIN.new"; exit 1; }
+
+case $(uname -m) in
+	aarch64) T=aarch64-unknown-linux-musl ;;
+	armv7l) T=armv7-unknown-linux-musleabihf ;;
+	x86_64) T=x86_64-unknown-linux-musl ;;
+	*) fail "no Redlib build for this CPU ($(uname -m))" ;;
+esac
+
+J=$(uclient-fetch -qO- "$API") || fail "can't reach GitHub"
+cutoff=$(( $(date +%s) - WAIT_DAYS * 86400 ))
+i=0 tag='' url='' sum=''
+while [ $i -lt 10 ]; do
+	t=$(echo "$J" | jsonfilter -e "@[$i].tag_name") || break
+	pub=$(echo "$J" | jsonfilter -e "@[$i].published_at" | tr T ' ' | tr -d Z)
+	if [ "$(echo "$J" | jsonfilter -e "@[$i].draft" -e "@[$i].prerelease" | tr '\n' ' ')" = "false false " ] \
+		&& [ -n "$pub" ] && [ "$(date -u -d "$pub" +%s 2>/dev/null || echo 9999999999)" -le $cutoff ]; then
+		url=$(echo "$J" | jsonfilter -e "@[$i].assets[@.name='redlib-$T.tar.gz'].browser_download_url")
+		sum=$(echo "$J" | jsonfilter -e "@[$i].assets[@.name='redlib-$T.tar.gz'].digest")
+		# Releases without a published SHA-256 are skipped, not trusted.
+		case $sum in sha256:*) tag=$t; sum=${sum#sha256:}; break ;; esac
+	fi
+	i=$((i + 1))
+done
+[ -n "$tag" ] || fail "no release at least $WAIT_DAYS days old with a published SHA-256"
+case $tag in *[!A-Za-z0-9._-]*) fail "unexpected release name" ;; esac
+if [ -x $BIN ] && [ "$(cat $VERSION 2>/dev/null)" = "$tag" ]; then
+	say "$tag is current"; exit 0
+fi
+
+# 11 MB unpacked: make sure the flash has room for it next to the old one.
+free_kb=$(df -k /overlay 2>/dev/null | awk 'NR == 2 { print $4 }')
+[ "${free_kb:-0}" -gt 16000 ] || fail "not enough flash space (${free_kb:-?} KB free, 16 MB needed)"
+uclient-fetch -qO "$TGZ" "$url" || fail "download of $tag failed"
+[ "$(sha256sum "$TGZ" | cut -d' ' -f1)" = "$sum" ] || fail "$tag does not match GitHub's SHA-256; not installed"
+tar -xzOf "$TGZ" redlib > $BIN.new || fail "could not unpack $tag"
+rm -f "$TGZ"
+chmod 755 $BIN.new
+$BIN.new --version >/dev/null 2>&1 || fail "$tag does not run on this router; not installed"
+
+[ -x $BIN ] && mv $BIN $BIN.old
+mv $BIN.new $BIN
+/etc/init.d/redlib enabled && /etc/init.d/redlib restart
+. /etc/redlib.conf
+answers() {
+	i=0
+	while [ $i -lt 15 ]; do
+		uclient-fetch -qO /dev/null "http://$ADDRESS:8080/settings" 2>/dev/null && return 0
+		sleep 1; i=$((i + 1))
+	done
+	return 1
+}
+if ! /etc/init.d/redlib enabled || answers; then
+	rm -f $BIN.old
+	echo "$tag" > $VERSION
+	say "installed $tag"
+	exit 0
+fi
+if [ -x $BIN.old ]; then
+	mv $BIN.old $BIN
+	/etc/init.d/redlib restart
+	fail "$tag did not answer after starting; put the previous version back"
+fi
+rm -f $BIN
+fail "$tag did not answer after starting; removed"

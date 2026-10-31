@@ -9,7 +9,7 @@ FAMILY_FILTER ADBLOCK_EXTRA_LISTS BANIP_FEEDS REDLIB_ALLOW
 ENABLE_VPN VPN_IFACE WG_PRIVATE_KEY WG_ADDRESSES WG_DNS WG_PEER_PUBLIC_KEY WG_PRESHARED_KEY
 WG_ENDPOINT_HOST WG_ENDPOINT_PORT WG_ALLOWED_IPS WG_KEEPALIVE VPN_ROUTE_DOMAINS VPN_ROUTE_SUBNETS
 PROTON_AUTO PROTON_COUNTRIES PROTON_API
-ENABLE_MANGADEX ULA_PREFIX
+ENABLE_MANGADEX ENABLE_REDLIB ULA_PREFIX
 ENABLE_REMOTE REMOTE_HOST REMOTE_PORT REMOTE_NET REMOTE_SERVER_KEY REMOTE_PEERS'
 
 # Link types from https://openwrt.org/docs/guide-user/network/traffic-shaping/sqm
@@ -82,7 +82,7 @@ country_for_tz() {
 
 # Interface names the VPN must never take (they would replace core interfaces
 # or the remote-access interface).
-RESERVED_IFACES='lan wan wan6 wan_6 loopback remote'
+RESERVED_IFACES='lan wan wan6 wan_6 loopback remote redlib'
 
 # check_settings -> complaints about required settings, one per line (empty = fine)
 check_settings() {

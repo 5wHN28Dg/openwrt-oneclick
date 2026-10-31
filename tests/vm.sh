@@ -38,11 +38,12 @@ PORT=${VM_SSH_PORT:-2222}
 CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/openwrt-oneclick
 IMG=openwrt-$VER-x86-64-generic-squashfs-combined.img
 W=$(mktemp -d)
-QPID='' SPID='' XPID=''
+QPID='' SPID='' XPID='' RPID=''
 export ONECLICK_TEST=1   # allows the plain-http Proton API stand-in
 SPORT=${SPEED_PORT:-18080}
 XPORT=${PROTON_PORT:-18181}
-cleanup() { for p in "$QPID" "$SPID" "$XPID"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; rm -rf "$W"; }
+RPORT=${RELEASES_PORT:-18282}
+cleanup() { for p in "$QPID" "$SPID" "$XPID" "$RPID"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; rm -rf "$W"; }
 trap cleanup EXIT INT TERM
 fails=0
 ok()  { printf 'ok    %s\n' "$1"; }
@@ -92,6 +93,19 @@ SRV_PRIV=$(wg_genkey) && SRV_PUB=$(wg_pubkey "$SRV_PRIV") || { echo "cannot make
 python3 -I "$HERE/tests/protonsrv.py" "$XPORT" "$SRV_PUB" & XPID=$!
 sleep 1
 kill -0 "$XPID" 2>/dev/null || { XPID=''; echo "Proton API stand-in did not start (port $XPORT in use?)"; exit 1; }
+# Stand-in for Redlib's release list (redlib-update's failure paths): a
+# release only a day old, and an old enough one whose SHA-256 doesn't match.
+mkdir -p "$W/rel"
+rel() { # file age-days digest
+	printf '[{"tag_name":"v9.9.9","published_at":"%s","draft":false,"prerelease":false,"assets":[{"name":"redlib-x86_64-unknown-linux-musl.tar.gz","browser_download_url":"http://10.0.2.2:%s/redlib.tgz","digest":"sha256:%s"}]}]\n' \
+		"$(date -u -d "-$2 days" +%Y-%m-%dT%H:%M:%SZ)" "$RPORT" "$3" > "$W/rel/$1"
+}
+rel too-new.json 1 "$(printf '0%.0s' $(seq 64))"
+rel bad-sum.json 10 "$(printf '0%.0s' $(seq 64))"
+printf 'not a release\n' | gzip > "$W/rel/redlib.tgz"
+python3 -I -m http.server -b 127.0.0.1 -d "$W/rel" "$RPORT" >/dev/null 2>&1 & RPID=$!
+sleep 1
+kill -0 "$RPID" 2>/dev/null || { RPID=''; echo "release list stand-in did not start (port $RPORT in use?)"; exit 1; }
 wgkey() { head -c 32 /dev/urandom | base64; }
 
 make_private() { # dir full|minimal
@@ -111,7 +125,7 @@ make_private() { # dir full|minimal
 			WG_ALLOWED_IPS="0.0.0.0/0 ::/0" WG_KEEPALIVE=25
 			VPN_ROUTE_DOMAINS="example.com" VPN_ROUTE_SUBNETS="198.51.100.0/24"
 			PROTON_AUTO=1 PROTON_COUNTRIES="PL CH" PROTON_API=http://10.0.2.2:$XPORT
-			ENABLE_MANGADEX=1
+			ENABLE_MANGADEX=1 ENABLE_REDLIB=1
 			ENABLE_REMOTE=1 REMOTE_HOST='' REMOTE_PORT=51820 REMOTE_NET=10.77.0.0/24
 			# 11 devices: re-runs then delete peer sections across [9]/[10]
 			REMOTE_SERVER_KEY=$(wg_genkey) REMOTE_PEERS="phone|2|$(wg_genkey)|$(wg_psk)
@@ -120,7 +134,7 @@ laptop|3|$(wg_genkey)|$(wg_psk)"
 dev$i|$i|$(wg_genkey)|$(wg_psk)"; done
 			SPEEDTEST_URL=$SPEED_URL
 		else
-			FAMILY_FILTER=0 ADBLOCK_EXTRA_LISTS='' BANIP_FEEDS='' ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0
+			FAMILY_FILTER=0 ADBLOCK_EXTRA_LISTS='' BANIP_FEEDS='' ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0 ENABLE_REDLIB=0
 			unset PROTON_AUTO PROTON_COUNTRIES PROTON_API
 			SQM_DOWN=50000 SQM_UP=10000   # fixed rates: nothing is measured
 		fi
@@ -266,6 +280,34 @@ shape_line() {
 	case $r in *"tbf"*"rate 10Mbit"*) ;; *) bad "test line shaper not set up: $r" ;; esac
 }
 
+# Redlib: a device on the LAN (a network namespace on the LAN bridge) finds
+# reddit.lan and gets Redlib through port 80; only Redlib's user gets past the
+# block list; the updater keeps the running version when a release is too new
+# or doesn't match its SHA-256. (Reddit itself is not needed.)
+redlib_checks() {
+	r=$(vm_ssh 'apk add kmod-veth ip-full >/dev/null 2>&1 || exit 1
+		ip link add veth0 type veth peer name veth1; ip link set veth0 master br-lan up
+		ip netns add lc; ip link set veth1 netns lc; ip -n lc link set lo up; ip -n lc link set veth1 up
+		ip -n lc addr add 192.168.1.60/24 dev veth1
+		a=$(ip netns exec lc nslookup reddit.lan 192.168.1.1 2>/dev/null | awk "/^Address: /{print \$2}" | tail -1)
+		ip netns exec lc uclient-fetch -T 10 -qO- "http://$a/settings" 2>/dev/null | grep -q "Redlib" && echo "served-at-$a"
+		ip netns exec lc uclient-fetch -T 3 -qO /dev/null http://192.168.1.1:8080/settings 2>/dev/null && echo "8080-open"
+		ip netns del lc; ip link del veth0 2>/dev/null
+		start-stop-daemon -S -c redlib -x /usr/bin/nslookup -- example.net 2>/dev/null | awk "/^Name:/{n=1} n && /^Address/" | grep -q . && echo redlib-resolves
+		start-stop-daemon -S -c nobody -x /usr/bin/nslookup -- example.net 2>/dev/null | awk "/^Name:/{n=1} n && /^Address/" | grep -q . && echo nobody-resolves
+		true' 2>&1 | tr '\n' ' ')
+	[ "$r" = "served-at-192.168.1.254 redlib-resolves " ] && ok "Redlib: reddit.lan serves it on port 80 to LAN devices; only its user gets past the block list" \
+		|| bad "Redlib from the LAN (want 'served-at-192.168.1.254 redlib-resolves'): $r"
+	for c in too-new bad-sum; do
+		r=$(vm_ssh "v=\$(cat /etc/redlib.version); REDLIB_RELEASES_API=http://10.0.2.2:$RPORT/$c.json /usr/sbin/redlib-update; echo rc=\$?; [ \"\$(cat /etc/redlib.version)\" = \"\$v\" ] && [ -x /usr/sbin/redlib ] && pidof redlib >/dev/null && echo kept" 2>&1 | tr '\n' ' ')
+		case $c:$r in
+			too-new:*"no release at least 3 days old"*"rc=1 kept "*) ok "Redlib update: a release under 3 days old is not taken, the running one stays" ;;
+			bad-sum:*"does not match GitHub's SHA-256"*"rc=1 kept "*) ok "Redlib update: a download that doesn't match its SHA-256 is refused, the running one stays" ;;
+			*) bad "Redlib update ($c): $r" ;;
+		esac
+	done
+}
+
 scenario_full() {
 	echo "== full: every option on"
 	start_vm; P=$W/p-full; make_private "$P" full
@@ -310,6 +352,7 @@ scenario_full() {
 	[ "$r" = "dns=192.168.1.1 served own-list-blocks " ] && ok "remote access: through the tunnel manga.lan resolves, the reader loads, own list blocks" \
 		|| bad "remote access through the tunnel (want 'dns=192.168.1.1 served own-list-blocks'): $r"
 	proton_checks
+	redlib_checks
 	r=$(ONECLICK_PRIVATE=$P "$W/kids.sh" 127.0.0.1 "$PORT" 2>&1)
 	case $r in *PASS*) ok "kids.sh: $r" ;; *) bad "kids.sh: $r" ;; esac
 	r=$(ONECLICK_PRIVATE=$P "$W/kids.sh" --remove 127.0.0.1 "$PORT" 2>&1)
@@ -388,7 +431,7 @@ scenario_full() {
 	# shellcheck disable=SC2034  # write_config reads the settings through eval
 	(
 		. "$P/config.env"
-		ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0
+		ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0 ENABLE_REDLIB=0
 		SSH_KEY_OLD=$SSH_KEY SSH_PUBKEYS_OLD=$SSH_PUBKEYS SSH_KEY=$W/key2 SSH_PUBKEYS=$(cat "$W/key2.pub")
 		write_config "$P/config.env"
 	)
@@ -398,6 +441,18 @@ scenario_full() {
 	VM_KEY=$W/key2   # the router now only knows the new key
 	left=$(vm_ssh 'uci show network | grep -c testvpn; uci show firewall | grep -c "name=.testvpn."; uci -q get dhcp.@dnsmasq[0].address | grep -c "::"' | tr '\n' ' ')
 	[ "$left" = "0 0 0 " ] && ok "VPN turned off: interface, zone and IPv6 suppression removed" || bad "VPN leftovers (network firewall aaaa): $left"
+	left=$(vm_ssh 'pidof redlib >/dev/null && echo process
+		for f in /usr/sbin/redlib /usr/sbin/redlib-update /etc/init.d/redlib /etc/redlib.conf /etc/redlib.version /etc/nftables.d/30-oneclick-redlib-dns.nft; do [ -e $f ] && echo $f; done
+		grep -q "^redlib:" /etc/passwd /etc/group /etc/shadow && echo user
+		uci -q get network.redlib >/dev/null && echo address
+		uci show firewall | grep -q "name=.Redlib." && echo redirect
+		nft list chain inet fw4 oneclick_redlib_dns >/dev/null 2>&1 && echo dns-rule
+		grep -q redlib-update /etc/crontabs/root && echo cron
+		grep -qE "^/(etc/init.d/redlib|usr/sbin/redlib-update|etc/redlib.conf|etc/nftables.d/30-oneclick-redlib-dns.nft)$" /etc/sysupgrade.conf && echo sysupgrade
+		uci show dhcp | grep -q "name=.reddit.lan." && echo reddit.lan
+		ip -4 addr | grep -q "192.168.1.254" && echo ip
+		true' | tr '\n' ' ')
+	[ -z "$left" ] && ok "Redlib turned off: program, files, user, address, rules, cron and name removed" || bad "Redlib leftovers: $left"
 	left=$(vm_ssh 'ls -d /etc/proton /etc/proton-pick.conf /usr/sbin/proton-pick 2>/dev/null; grep -c proton /etc/crontabs/root /etc/rc.local /etc/sysupgrade.conf' | tr '\n' ' ')
 	[ "$left" = "/etc/crontabs/root:0 /etc/rc.local:0 /etc/sysupgrade.conf:0 " ] && ok "VPN turned off: Proton session, settings and jobs removed" || bad "Proton leftovers: $left"
 	left=$(vm_ssh 'uci show network | grep -c "remote"; uci show firewall | grep -c "remote\|Remote"; wg show remote 2>/dev/null | grep -c peer' | tr '\n' ' ')
@@ -434,6 +489,7 @@ scenario_minimal() {
 		nft list ruleset | grep -q Block-WireGuard-LAN && echo "vpn-protocol blocks"
 		grep -q "nsfw" /etc/adblock-lean/config && echo "nsfw list"
 		uci -q get network.remote >/dev/null && echo "remote interface"
+		[ -e /etc/init.d/redlib ] && echo "redlib"
 		apk info -e bind-dig >/dev/null 2>&1 && echo "bind-dig"
 		apk info -e openssl-util >/dev/null 2>&1 && echo "openssl-util"
 		true')

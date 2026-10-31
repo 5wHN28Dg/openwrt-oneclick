@@ -30,7 +30,7 @@ VPN=
 if on "${ENABLE_VPN:-0}"; then
 	VPN=${VPN_IFACE:-vpn}
 	case $VPN in *[!a-z0-9_]*|'') echo "VPN_IFACE must be lowercase letters, digits or _"; exit 1 ;; esac
-	RESERVED=' lan wan wan6 wan_6 loopback remote '
+	RESERVED=' lan wan wan6 wan_6 loopback remote redlib '
 	case $RESERVED in *" $VPN "*) echo "VPN_IFACE '$VPN' is reserved"; exit 1 ;; esac
 	if uci -q get "network.$VPN" >/dev/null && [ "$(uci -q get "network.$VPN.setup")" != 1 ]; then
 		echo "VPN_IFACE '$VPN' is an existing interface not made by this tool; pick another name"; exit 1
@@ -39,24 +39,52 @@ fi
 LAN_IP=$(uci get network.lan.ipaddr | cut -d/ -f1)
 LAN_ZONE=$(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='lan'$/\1/p" | head -1)
 
-# Remote access: everything that can stop it is checked before anything changes.
-REMOTE=; on "${ENABLE_REMOTE:-0}" && REMOTE=1
 ip2int() { # a.b.c.d -> integer
 	echo "$1" | { IFS=. read -r a b c d; echo $(( (a << 24) + (b << 16) + (c << 8) + d )); }
 }
+int2ip() { # integer -> a.b.c.d
+	echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"
+}
+lan_st=$(ubus call network.interface.lan status)
+lan_sub=$(echo "$lan_st" | jsonfilter -e '@["ipv4-address"][0].address')/$(echo "$lan_st" | jsonfilter -e '@["ipv4-address"][0].mask')
+case $lan_sub in /*|*/) lan_sub=$LAN_IP/24 ;; esac
+
+# Remote access: everything that can stop it is checked before anything changes.
+REMOTE=; on "${ENABLE_REMOTE:-0}" && REMOTE=1
 if [ -n "$REMOTE" ]; then
 	if uci -q get network.remote >/dev/null && [ "$(uci -q get network.remote.setup_remote)" != 1 ]; then
 		echo "an interface 'remote' exists that this tool did not make; rename it first"; exit 1
 	fi
 	[ -n "$LAN_ZONE" ] || { echo "no firewall zone named lan, needed for remote access"; exit 1; }
-	lan_st=$(ubus call network.interface.lan status)
-	lan_sub=$(echo "$lan_st" | jsonfilter -e '@["ipv4-address"][0].address')/$(echo "$lan_st" | jsonfilter -e '@["ipv4-address"][0].mask')
-	case $lan_sub in /*|*/) lan_sub=$LAN_IP/24 ;; esac
 	# The tunnel range must not overlap the LAN (compare at the shorter prefix).
 	p=${lan_sub#*/}; [ "$p" -gt 24 ] && p=24
 	m=$(( (0xffffffff << (32 - p)) & 0xffffffff ))
 	if [ $(( $(ip2int "${lan_sub%/*}") & m )) -eq $(( $(ip2int "${REMOTE_NET%/*}") & m )) ]; then
 		echo "REMOTE_NET $REMOTE_NET overlaps the LAN $lan_sub; pick another range (./setup.sh --reconfigure)"; exit 1
+	fi
+fi
+
+# Redlib gets the last address of the LAN as its own (reddit.lan), so it can
+# serve on port 80 next to LuCI. Checked before anything changes: it must not
+# be the router's address, in the DHCP pool or a fixed lease.
+REDLIB=''; on "${ENABLE_REDLIB:-0}" && REDLIB=1
+REDLIB_IP=''
+if [ -n "$REDLIB" ]; then
+	if uci -q get network.redlib >/dev/null && [ "$(uci -q get network.redlib.setup_redlib)" != 1 ]; then
+		echo "an interface 'redlib' exists that this tool did not make; rename it first"; exit 1
+	fi
+	p=${lan_sub#*/}
+	[ "$p" -le 30 ] || { echo "the LAN $lan_sub is too small for Redlib's own address"; exit 1; }
+	net=$(( $(ip2int "${lan_sub%/*}") & ((0xffffffff << (32 - p)) & 0xffffffff) ))
+	last=$(( net + (1 << (32 - p)) - 2 ))
+	REDLIB_IP=$(int2ip $last)
+	start=$(uci -q get dhcp.lan.start || echo 100) limit=$(uci -q get dhcp.lan.limit || echo 150)
+	leased=''   # a fixed lease ("host" entry) on that address
+	for s in $(uci -q show dhcp | sed -n "s/^dhcp\.\([^.]*\)=host$/\1/p"); do
+		[ "$(uci -q get "dhcp.$s.ip")" = "$REDLIB_IP" ] && leased=1
+	done
+	if [ "$REDLIB_IP" = "$LAN_IP" ] || { [ $last -ge $((net + start)) ] && [ $last -lt $((net + start + limit)) ]; } || [ -n "$leased" ]; then
+		echo "Redlib's address $REDLIB_IP is the router's, in the DHCP pool or a fixed lease; make the pool end before it (LuCI: Network > Interfaces > lan > DHCP Server)"; exit 1
 	fi
 fi
 
@@ -189,6 +217,24 @@ pass "adblock-lean $ABL_VER from github.com/lynxthecat/adblock-lean; lists for t
 step "Files"
 put_tree "$ROUTER/files"
 if on "${ENABLE_MANGADEX:-0}"; then put_tree "$ROUTER/vendor/safe-otaku"; chmod 755 /www/cgi-bin/md; fi
+# Redlib: its own user (created before the firewall rule that names its number).
+# Turned off since an earlier run: everything goes, the rule before the user.
+REDLIB_FILES='/etc/init.d/redlib /usr/sbin/redlib-update /etc/nftables.d/30-oneclick-redlib-dns.nft /etc/redlib.conf'
+if [ -n "$REDLIB" ]; then
+	# OpenWrt's helpers (in a subshell: they read variables this script's set -u rejects)
+	( set +u; . /lib/functions.sh
+	  user_exists redlib || user_add redlib '' "$(group_add_next redlib)" Redlib /var/empty /bin/false )
+	put_tree "$ROUTER/redlib"
+	chmod 755 /etc/init.d/redlib /usr/sbin/redlib-update
+	sed -i "s/REDLIB_UID/$(id -u redlib)/" /etc/nftables.d/30-oneclick-redlib-dns.nft
+	SFW=off; on "${FAMILY_FILTER:-0}" && SFW=on
+	printf 'ADDRESS=%s\nSFW=%s\n' "$REDLIB_IP" "$SFW" > /etc/redlib.conf
+elif [ -e /etc/init.d/redlib ] || grep -q '^redlib:' /etc/passwd; then
+	/etc/init.d/redlib stop >/dev/null 2>&1; /etc/init.d/redlib disable >/dev/null 2>&1
+	rm -f $REDLIB_FILES /usr/sbin/redlib /usr/sbin/redlib.old /usr/sbin/redlib.new /etc/redlib.version
+	sed -i '/^redlib:/d' /etc/passwd /etc/shadow /etc/group
+	for f in $REDLIB_FILES; do sed -i "\#^$f\$#d" /etc/sysupgrade.conf; done
+fi
 chmod 755 /usr/sbin/safesearch-hosts /usr/sbin/redlib-block
 
 # adblock-lean local lists: own entries + project sections
@@ -399,6 +445,24 @@ if [ -n "$REMOTE" ]; then
 	pass "WireGuard server on UDP $REMOTE_PORT, $REMOTE_N devices in $REMOTE_NET, reaching $lan_sub"
 fi
 
+# ---------------------------------------------------------------- Redlib address
+# A /32 address on the LAN bridge: devices reach it directly, and DHCP keeps
+# handing out the router's main address (dnsmasq only uses addresses whose
+# network contains the pool).
+if [ "$(uci -q get network.redlib.setup_redlib)" = 1 ]; then
+	uci delete network.redlib; uci commit network
+fi
+if [ -n "$REDLIB" ]; then
+	uci batch >/dev/null <<-EOF
+		set network.redlib=interface
+		set network.redlib.setup_redlib='1'
+		set network.redlib.device='$(uci get network.lan.device)'
+		set network.redlib.proto='static'
+		set network.redlib.ipaddr='$REDLIB_IP/32'
+	EOF
+	uci commit network
+fi
+
 # ---------------------------------------------------------------- firewall
 step "Firewall"
 # Remove what this script added before, so re-runs don't duplicate.
@@ -477,6 +541,22 @@ if [ -n "$REMOTE" ]; then
 		set firewall.@rule[-1].target='ACCEPT'
 	EOF
 fi
+if [ -n "$REDLIB" ]; then
+	# Port 80 on Redlib's address goes to 8080, where it listens as "redlib"
+	# (an unprivileged user can't open port 80 itself).
+	uci batch >/dev/null <<-EOF
+		add firewall redirect
+		set firewall.@redirect[-1].setup='1'
+		set firewall.@redirect[-1].name='Redlib'
+		set firewall.@redirect[-1].src='lan'
+		set firewall.@redirect[-1].proto='tcp'
+		set firewall.@redirect[-1].src_dip='$REDLIB_IP'
+		set firewall.@redirect[-1].src_dport='80'
+		set firewall.@redirect[-1].dest_ip='$REDLIB_IP'
+		set firewall.@redirect[-1].dest_port='8080'
+		set firewall.@redirect[-1].target='DNAT'
+	EOF
+fi
 uci commit firewall
 pass "software flow offloading (hardware offloading off: it bypasses SQM), DNS hijack${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo ', DoT and VPN-protocol blocks')}${VPN:+, $VPN zone}${REMOTE:+, remote access in the lan zone}"
 
@@ -528,6 +608,7 @@ if on "${FAMILY_FILTER:-0}"; then
 	for d in yandex.com yandex.ru yandex.by yandex.kz yandex.ua; do domain "$d" 213.180.193.56; done
 fi
 on "${ENABLE_MANGADEX:-0}" && domain manga.lan "$LAN_IP"
+[ -n "$REDLIB" ] && domain reddit.lan "$REDLIB_IP"
 uci commit dhcp
 on "${FAMILY_FILTER:-0}" || rm -f /tmp/hosts/safesearch
 /etc/init.d/dnsmasq restart >/dev/null 2>&1
@@ -582,7 +663,9 @@ fi
 # ---------------------------------------------------------------- jobs, upgrade persistence
 step "Scheduled jobs"
 touch /etc/crontabs/root
-sed -i '/safesearch-hosts\|redlib-block\|proton-pick/d' /etc/crontabs/root
+sed -i '/safesearch-hosts\|redlib-block\|redlib-update\|proton-pick/d' /etc/crontabs/root
+# Redlib updates at 03:40, apart from adblock-lean's 05:00 run (both need memory).
+[ -n "$REDLIB" ] && echo "40 3 * * * /usr/sbin/redlib-update" >> /etc/crontabs/root
 sed -i '/safesearch-hosts\|proton-pick/d' /etc/rc.local
 if [ -f /etc/proton-pick.conf ]; then
 	echo "*/5 * * * * /usr/sbin/proton-pick check" >> /etc/crontabs/root
@@ -595,6 +678,11 @@ if on "${FAMILY_FILTER:-0}"; then
 	echo "50 4 * * * /usr/sbin/redlib-block" >> /etc/crontabs/root
 	sed -i 's|^exit 0$|(sleep 30; /usr/sbin/safesearch-hosts) \&\nexit 0|' /etc/rc.local
 fi
+# Not the Redlib program (11 MB in every upgrade backup): the updater
+# reinstalls it the night after a firmware upgrade.
+[ -n "$REDLIB" ] && for f in $REDLIB_FILES; do
+	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
+done
 [ -f /etc/proton-pick.conf ] && for f in /usr/sbin/proton-pick /usr/share/proton-pick/ /etc/proton/ /etc/proton-pick.conf; do
 	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 done
@@ -805,6 +893,16 @@ uci commit banip
 info "after restart: IPv6 $(yes_no "$HAS_V6" 'usable (banIP covers IPv6)' 'not usable')"
 /etc/init.d/firewall restart >/dev/null 2>&1
 /etc/init.d/uhttpd restart
+if [ -n "$REDLIB" ]; then
+	/etc/init.d/redlib enable
+	if /usr/sbin/redlib-update >/tmp/setup-redlib.log 2>&1; then
+		/etc/init.d/redlib restart   # also when it was current: settings may have changed
+		pass "Redlib $(cat /etc/redlib.version) at http://reddit.lan ($REDLIB_IP), adult content $( [ "$SFW" = on ] && echo 'locked off' || echo 'off by default'); updates daily 03:40 to releases 3+ days old"
+	else
+		/etc/init.d/redlib restart
+		fail "Redlib: $(tail -1 /tmp/setup-redlib.log)${REDLIB_IP:+; retried daily at 03:40}"
+	fi
+fi
 /etc/init.d/cron enable; /etc/init.d/cron restart
 /etc/init.d/banip enable; /etc/init.d/banip restart >/dev/null 2>&1
 if [ -n "$VPN" ]; then
@@ -862,7 +960,10 @@ fi
 if on "${FAMILY_FILTER:-0}"; then
 	check "family list: mangadex.org blocked" "blocked mangadex.org"
 	check "family allowlist: api.mangadex.org resolves" "[ -n \"\$(resolve api.mangadex.org)\" ]"
-	check "Redlib: listed instance redlib.catsarch.com blocked" "blocked redlib.catsarch.com"
+	# An instance from the list itself (the list changes; a fixed name went stale).
+	ri=$(awk '/^# >>> redlib$/{s=1; next} /^# <<< redlib$/{s=0} s' /etc/adblock-lean/blocklist | grep -vxF -f /etc/redlib-block.allow | head -1)
+	if [ -n "$ri" ]; then check "Redlib: listed instance $ri blocked" "blocked $ri"
+	else fail "Redlib: no listed instance in the block list"; fi
 	for h in ${REDLIB_ALLOW-}; do check "Redlib: $h allowed" "[ -n \"\$(resolve \"\$h\")\" ]"; done
 	check "safe search: www.google.com -> forcesafesearch" "[ \"\$(resolve www.google.com)\" = 216.239.38.120 ]"
 	check "safe search: duckduckgo.com pinned" "grep -q ' duckduckgo.com' /tmp/hosts/safesearch"
@@ -875,6 +976,20 @@ if on "${ENABLE_MANGADEX:-0}"; then
 	check "MangaDex app served" "wget -qO- http://127.0.0.1/mangadex-safe/ | grep -qi '<html'"
 	check "MangaDex CGI returns data" "wget -qO- 'http://127.0.0.1/cgi-bin/md/api/manga?limit=1' | grep -q '\"data\"'"
 	check "MangaDex CGI refuses /manga/random" "! wget -qO- http://127.0.0.1/cgi-bin/md/api/manga/random"
+fi
+if [ -n "$REDLIB" ] && [ -x /usr/sbin/redlib ]; then
+	i=0; until uclient-fetch -qO /dev/null "http://$REDLIB_IP:8080/settings" 2>/dev/null || [ $i -ge 15 ]; do sleep 1; i=$((i + 1)); done
+	rpid=$(pidof redlib)
+	check "Redlib runs as its own user, first to go if memory runs out" "[ -n '$rpid' ] && [ \"\$(awk '/^Uid:/ { print \$2 }' /proc/$rpid/status)\" = \"\$(id -u redlib)\" ] && [ \"\$(cat /proc/$rpid/oom_score_adj)\" = 1000 ]"
+	check "Redlib answers on $REDLIB_IP" "uclient-fetch -qO- http://$REDLIB_IP:8080/settings | grep -q 'Redlib'"
+	check "reddit.lan -> $REDLIB_IP" "[ \"\$(resolve reddit.lan)\" = $REDLIB_IP ]"
+	check "Redlib: port 80 mapped, its DNS skips the block lists" "nft list chain inet fw4 dstnat_lan | grep -q '$REDLIB_IP.*dnat' && nft list chain inet fw4 oneclick_redlib_dns | grep -q 'redirect to :5354'"
+	[ -n "$rpid" ] && info "Redlib uses $(awk '/^VmRSS/ { printf "%d MB", $2 / 1024 }' /proc/$rpid/status) of memory"
+	if uclient-fetch -T 30 -qO /dev/null "http://$REDLIB_IP:8080/r/popular" 2>/dev/null; then
+		info "Redlib fetched a page from Reddit"
+	else
+		info "Redlib could not fetch a page from Reddit right now (Reddit may be refusing it; see http://reddit.lan)"
+	fi
 fi
 if [ -n "$VPN" ]; then
 	i=0; while [ $i -lt 10 ] && [ "$(wg show "$VPN" latest-handshakes 2>/dev/null | awk '{print $2}')" = 0 ]; do sleep 3; i=$((i + 1)); done

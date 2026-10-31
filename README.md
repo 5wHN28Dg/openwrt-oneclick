@@ -40,6 +40,7 @@ Optional (asked on the first run):
 | Family filtering | Safe search forced on Google (all its country domains, from Google's own list), Bing, DuckDuckGo, Brave, Startpage and Yandex (refreshed every 30 minutes); Hagezi NSFW, "no safe search" and DoH/VPN/proxy bypass lists; anime/manga NSFW sites from [safe-otaku](https://github.com/5wHN28Dg/safe-otaku); every [listed Redlib instance](https://github.com/redlib-org/redlib-instances) except the ones you allow (refreshed daily); DoT and common VPN protocols blocked from the LAN; banIP `doh` and `vpn` feeds. |
 | VPN for chosen sites | Any WireGuard provider (Proton VPN, Mullvad, ...): give it the provider's `.conf` file. Only the domains and IP ranges you list go through the VPN (policy-based routing with `pbr`). IPv6 to those domains never goes around the VPN: it is routed through the VPN when the provider's config has an IPv6 address, otherwise their IPv6 answers are suppressed so devices use IPv4 through the VPN. |
 | MangaDex safe-mode reader | The [safe-otaku](https://github.com/5wHN28Dg/safe-otaku) reader at `http://manga.lan`. |
+| Private Redlib | [Redlib](https://github.com/redlib-org/redlib) (Reddit without ads, tracking or the app) at `http://reddit.lan`, for the LAN and remote-access devices. Adult content is off, and locked while family filtering is on. If your own block list blocks Reddit, devices stay blocked: only Redlib fetches it. See [Redlib](#redlib). |
 | Remote access | Reach your home network and `manga.lan` from anywhere through a WireGuard tunnel to the router. Each device you name (e.g. `phone laptop`) gets its own key; its config file lands in `private/remote/` for the WireGuard app (`qrencode -t ansiutf8 < private/remote/phone.conf` shows it as a QR code for phones). Only the tunnel and your home network go through it, and the device uses the router's DNS, so blocking and family filtering apply. See [Remote access](#remote-access) for what your line needs. |
 
 Separately, `./kids.sh` gives chosen devices fixed addresses and turns their
@@ -240,6 +241,26 @@ own install instructions do; the setup trusts that project.
   real router. If your own network blocks DNS-over-HTTPS for its devices, run
   it with `TEST_DNS_UPSTREAM=10.0.2.3:53`.
 
+## Redlib
+
+What it costs and why each part is there:
+
+| Part | Why |
+|---|---|
+| The program: 11 MB of flash on your router's CPU type, about 10 MB of RAM when idle (measured on the test VM) | Redlib's own build for the router's CPU, from its GitHub releases. Not kept in firmware-upgrade backups (they live in RAM during the upgrade); the updater puts it back the night after. |
+| Its own address (the last one of the LAN, e.g. `192.168.1.254`) and `reddit.lan` | So it can serve on port 80 next to LuCI. DHCP keeps handing out the router's main address. The setup stops if that address is in the DHCP pool or a fixed lease. |
+| A firewall rule, port 80 → 8080 on that address | Redlib runs as its own user, not root, and such a user can't open port 80. |
+| A firewall rule for its DNS | That user's lookups go to the encrypted resolver behind the block lists, so a Reddit block in your list keeps applying to every device but not to Redlib. |
+| First to go when memory runs out | The kernel kills Redlib before anything else (DNS, the firewall), and it restarts. |
+| `redlib-update`, daily at 03:40 | Takes the newest release that is at least 3 days old (broken releases have been replaced within a day), checks it against the SHA-256 GitHub publishes for the file, and puts the previous version back if the new one doesn't answer. |
+
+Redlib reads Reddit without logging in, and works only as long as Reddit
+allows that. Reddit announced in October 2026 that it is moving to a
+logged-in-only site, starting with tests outside the U.S.; whether Redlib
+survives that is open ([issue #609](https://github.com/redlib-org/redlib/issues/609)).
+If it stops working, `./setup.sh --reconfigure` with Redlib off removes all of
+the above.
+
 ## Limits
 
 - Not configured: static WAN addresses, VLAN-tagged WAN (some DSL/fibre
@@ -250,6 +271,8 @@ own install instructions do; the setup trusts that project.
 - IPv6 routing through the VPN (provider config with an IPv6 address) is not
   covered by the automated tests, which have no IPv6 internet.
 - Redlib blocking covers the instances in the public list, not unlisted ones.
+- The private Redlib follows official releases, which can be months apart:
+  a fix for a Reddit change may wait in Redlib's code until the next one.
 - Proton server choice uses Proton's API as its own apps do, but this tool is not
   made or endorsed by Proton; a login may ask for a CAPTCHA.
 - Remote access is IPv4 inside the tunnel, and dynamic DNS is not set up on
