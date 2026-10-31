@@ -124,6 +124,15 @@ wizard() {
 	else
 		ENABLE_MANGADEX=0
 	fi
+	say ""
+	say "Redlib: read Reddit without ads, tracking or the app, at http://reddit.lan."
+	say "  Adult content stays off (locked with family filtering). If your block list"
+	say "  blocks Reddit, devices stay blocked; only Redlib on the router fetches it."
+	if ask_yn "Run a private Redlib on the router?" "$(yn "${ENABLE_REDLIB:-0}")"; then
+		ENABLE_REDLIB=1
+	else
+		ENABLE_REDLIB=0
+	fi
 
 	say ""
 	say "Remote access: reach your home network (and manga.lan) from anywhere through"

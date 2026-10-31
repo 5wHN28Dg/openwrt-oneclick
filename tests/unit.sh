@@ -130,11 +130,11 @@ P1=$T/priv1
 # Wi-Fi name, Wi-Fi password x2, admin password x2, SSH key path, create key?,
 # time zone, PPPoE?, PPPoE user, PPPoE password x2, link type number,
 # family filtering?, Redlib allow, VPN?, wg path, VPN iface, domains, subnets,
-# Proton picks the server?, Proton countries, MangaDex?, remote access?, public name, port, devices,
+# Proton picks the server?, Proton countries, MangaDex?, Redlib?, remote access?, public name, port, devices,
 # create settings? (first) / save? (last)
 printf '%s\n' y "Home Net" "pa'ss word1" "pa'ss word1" adminpw adminpw "$HOME/.ssh/test_key" y \
 	Europe/Berlin "" y "user@isp" ppppass ppppass 7 y "safereddit.com" y "$T/proton.conf" protonvpn \
-	"archive.org newegg.com" "91.108.4.0/22" y "pl ch" y y home.example.org "" "phone tablet" y \
+	"archive.org newegg.com" "91.108.4.0/22" y "pl ch" y y y home.example.org "" "phone tablet" y \
 	| ONECLICK_PRIVATE=$P1 "$HERE/setup.sh" --settings-only >"$T/w1.out" 2>&1
 eq "wizard (all on) exit" "$?" 0
 eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config.env")" 600
@@ -156,6 +156,7 @@ eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config
 	eq "w1 vpn" "$ENABLE_VPN|$VPN_IFACE|$WG_ENDPOINT_HOST" "1|protonvpn|198.51.100.7"
 	eq "w1 vpn routes" "$VPN_ROUTE_DOMAINS|$VPN_ROUTE_SUBNETS" "archive.org newegg.com|91.108.4.0/22"
 	eq "w1 mangadex" "$ENABLE_MANGADEX" 1
+	eq "w1 redlib" "$ENABLE_REDLIB" 1
 	eq "w1 Proton server choice" "$PROTON_AUTO|$PROTON_COUNTRIES" "1|PL CH"
 	PROTON_COUNTRIES='PL; reboot'; eq "bad Proton countries rejected" "$(check_settings | grep -c PROTON_COUNTRIES)" 1
 	PROTON_COUNTRIES=PL PROTON_API='ftp://x'; eq "bad Proton API rejected" "$(check_settings | grep -c PROTON_API)" 1
@@ -172,7 +173,7 @@ fails=$((fails + $(grep -c '^FAIL' "$T/w1.res"))); n=$((n + $(wc -l < "$T/w1.res
 P2=$T/priv2
 # Everything optional off; existing key; save.
 printf '%s\n' y "Flat" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" \
-	UTC us n 9 n n n n y \
+	UTC us n 9 n n n n n y \
 	| ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w2.out" 2>&1
 eq "wizard (all off) exit" "$?" 0
 (
@@ -183,13 +184,14 @@ eq "wizard (all off) exit" "$?" 0
 	eq "w2 family off" "$FAMILY_FILTER|$ADBLOCK_EXTRA_LISTS|$BANIP_FEEDS|$REDLIB_ALLOW" "0|||"
 	eq "w2 vpn off" "$ENABLE_VPN" 0
 	eq "w2 mangadex off" "$ENABLE_MANGADEX" 0
+	eq "w2 redlib off" "$ENABLE_REDLIB" 0
 	eq "w2 remote off" "$ENABLE_REMOTE|${REMOTE_PEERS-}" "0|"
 ) | tee "$T/w2.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/w2.res"))); n=$((n + $(wc -l < "$T/w2.res")))
 
 # Declining to save keeps nothing on disk.
 P3=$T/priv3
-printf '%s\n' y "X" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n n \
+printf '%s\n' y "X" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n n n \
 	| ONECLICK_PRIVATE=$P3 "$HERE/setup.sh" --settings-only >"$T/w3.out" 2>&1
 eq "decline save: exit" "$?" 0
 eq "decline save: nothing written" "$(ls -A "$P3" 2>/dev/null)" ""
@@ -205,11 +207,11 @@ eq "missing link type asked and saved" "$(. "$P2/config.env"; echo "$LINK_TYPE")
 ADBLOCK_EXTRA_LISTS="oisd:big" BANIP_FEEDS="tiktok"
 write_config "$P2/config.env"
 # reconfigure: keep Wi-Fi, keep admin pw, key path, tz, pppoe n, link (keep), family y, redlib, vpn n, mangadex n, remote n
-printf '%s\n' "" n n "" "" "" n "" y "" n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w5.out" 2>&1
+printf '%s\n' "" n n "" "" "" n "" y "" n n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w5.out" 2>&1
 eq "family on later: exit" "$?" 0
 eq "family on later: lists" "$(. "$P2/config.env"; echo "$ADBLOCK_EXTRA_LISTS")" "oisd:big hagezi:nsfw hagezi:nosafesearch hagezi:doh-vpn-proxy-bypass"
 eq "family on later: feeds" "$(. "$P2/config.env"; echo "$BANIP_FEEDS")" "tiktok doh vpn"
-printf '%s\n' "" n n "" "" "" n "" n n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w6.out" 2>&1
+printf '%s\n' "" n n "" "" "" n "" n n n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w6.out" 2>&1
 eq "family off later: lists" "$(. "$P2/config.env"; echo "$ADBLOCK_EXTRA_LISTS")" "oisd:big"
 eq "family off later: feeds" "$(. "$P2/config.env"; echo "$BANIP_FEEDS")" "tiktok"
 
@@ -235,7 +237,7 @@ eq "interrupt saves nothing" "$(ls -A "$T/priv-int" 2>/dev/null)" ""
 	REDLIB_ALLOW=ok.example; eq "valid settings pass" "$(check_settings)" ""
 ) | tee "$T/v.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/v.res"))); n=$((n + $(wc -l < "$T/v.res")))
-printf '%s\n' y "X" "short" "short" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n y \
+printf '%s\n' y "X" "short" "short" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n n y \
 	| ONECLICK_PRIVATE=$T/priv-short "$HERE/setup.sh" --settings-only >"$T/short.out" 2>&1
 rc=$?
 if [ "$rc" -ne 0 ] && grep -q "WIFI_KEY must be" "$T/short.out" && [ -z "$(ls -A "$T/priv-short" 2>/dev/null)" ]; then ok "wizard refuses a short Wi-Fi key, saves nothing"; else bad "wizard refuses a short Wi-Fi key (rc $rc)"; fi
@@ -274,7 +276,7 @@ eq "country for Asia/Baghdad" "$(country_for_tz Asia/Baghdad)" IQ
 
 # --- changing the SSH key keeps the old one for the next login --------------------
 ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/new_key"
-printf '%s\n' "" n n "$HOME/.ssh/new_key" "" "" n "" n n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/k.out" 2>&1
+printf '%s\n' "" n n "$HOME/.ssh/new_key" "" "" n "" n n n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/k.out" 2>&1
 (
 	. "$P2/config.env"
 	eq "new key saved" "$SSH_KEY" "$HOME/.ssh/new_key"
@@ -296,13 +298,13 @@ eq "old ADBLOCK_LISTS: base lists dropped, additions kept" "$(. "$P2/config.env"
 
 # --- remote access ------------------------------------------------------------------
 # Turned on later with a name, then "-" goes back to the router's own address.
-printf '%s\n' "" n n "" "" "" n "" n n n y home.example.org "" "tv" | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/r1.out" 2>&1
+printf '%s\n' "" n n "" "" "" n "" n n n n y home.example.org "" "tv" | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/r1.out" 2>&1
 eq "remote on later" "$(. "$P2/config.env"; echo "$ENABLE_REMOTE|$REMOTE_HOST|$(remote_devices)")" "1|home.example.org|tv"
-printf '%s\n' "" n n "" "" "" n "" n n n y - "" "" | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/r2.out" 2>&1
+printf '%s\n' "" n n "" "" "" n "" n n n n y - "" "" | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/r2.out" 2>&1
 eq "remote host cleared with -" "$(. "$P2/config.env"; echo "$REMOTE_HOST|$(remote_devices)")" "|tv"
 # A * in the device list is a name (then refused), not the files here.
 mkdir -p "$T/globdir/afile.d" "$T/globdir/bfile"
-printf '%s\n' "" n n "" "" "" n "" n n n y "" "" "tv *" | (cd "$T/globdir" && ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only) >"$T/r3.out" 2>&1
+printf '%s\n' "" n n "" "" "" n "" n n n n y "" "" "tv *" | (cd "$T/globdir" && ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only) >"$T/r3.out" 2>&1
 case $(. "$P2/config.env"; remote_devices) in *bfile*) bad "device list * expanded to file names" ;; *) ok "device list * not expanded to file names" ;; esac
 # RFC 7748 X25519 test vector (Alice): private 77076d0a..., public 8520f009...
 eq "WireGuard public key from private (RFC 7748)" "$(wg_pubkey dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=)" "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo="
@@ -356,6 +358,7 @@ $(printf '%s\n' "$REMOTE_PEERS" | head -1)"; eq "repeated remote device rejected
 	REMOTE_PEERS="a b|2|k|p"; eq "bad remote device line rejected" "$(check_settings | grep -c REMOTE_PEERS)" 1
 	REMOTE_PEERS=; eq "remote on without devices rejected" "$(check_settings | grep -c REMOTE_PEERS)" 1
 	VPN_IFACE=remote; eq "VPN_IFACE 'remote' rejected" "$(check_settings | grep -c VPN_IFACE)" 1
+	VPN_IFACE=redlib; eq "VPN_IFACE 'redlib' rejected" "$(check_settings | grep -c VPN_IFACE)" 1
 	REMOTE_HOST=home.example.org:51820; eq "remote host with a port rejected" "$(check_settings | grep -c REMOTE_HOST)" 1
 	REMOTE_HOST=2001:db8::1; eq "remote host IPv6 address accepted" "$(check_settings | grep -c REMOTE_HOST)" 0
 	REMOTE_HOST='' REMOTE_PEERS="living-room-ipad|2|$(wg_genkey)|$(wg_psk)"; eq "device name over 15 characters rejected" "$(check_settings | grep -c REMOTE_PEERS)" 1
