@@ -95,15 +95,26 @@ if [ -n "$REMOVE" ] || [ -z "$(printf '%s' "$DEVICES" | tr -d ' \n')" ]; then
 	/etc/init.d/dnsmasq reload >/dev/null 2>&1; /etc/init.d/firewall reload >/dev/null 2>&1
 	echo "PASS  kids: rules removed"; exit 0
 fi
+# Two rules: the internet, and the router's own web pages (reddit.lan,
+# manga.lan, LuCI), which are served by the router itself and so are not
+# covered by a rule for traffic passing through it. DNS and DHCP stay up.
+net=$(uci add firewall rule) www=$(uci add firewall rule)
 uci batch >/dev/null <<-B
-	add firewall rule
-	set firewall.@rule[-1].kids='1'
-	set firewall.@rule[-1].name='kids time restriction'
-	set firewall.@rule[-1].src='lan'
-	set firewall.@rule[-1].dest='*'
-	set firewall.@rule[-1].target='REJECT'
-	set firewall.@rule[-1].start_time='$START'
-	set firewall.@rule[-1].stop_time='$STOP'
+	set firewall.$net.kids='1'
+	set firewall.$net.name='kids time restriction'
+	set firewall.$net.src='lan'
+	set firewall.$net.dest='*'
+	set firewall.$net.target='REJECT'
+	set firewall.$net.start_time='$START'
+	set firewall.$net.stop_time='$STOP'
+	set firewall.$www.kids='1'
+	set firewall.$www.name='kids router pages'
+	set firewall.$www.src='lan'
+	set firewall.$www.proto='tcp'
+	set firewall.$www.dest_port='80 443 8080'
+	set firewall.$www.target='REJECT'
+	set firewall.$www.start_time='$START'
+	set firewall.$www.stop_time='$STOP'
 B
 printf '%s\n' "$DEVICES" | while IFS='|' read -r name mac ip; do
 	[ -n "$name" ] || continue
@@ -113,7 +124,8 @@ printf '%s\n' "$DEVICES" | while IFS='|' read -r name mac ip; do
 		set dhcp.@host[-1].name='$name'
 		set dhcp.@host[-1].ip='$ip'
 		add_list dhcp.@host[-1].mac='$mac'
-		add_list firewall.@rule[-1].src_mac='$mac'
+		add_list firewall.$net.src_mac='$mac'
+		add_list firewall.$www.src_mac='$mac'
 	B
 done
 uci commit dhcp; uci commit firewall
@@ -122,7 +134,7 @@ uci commit dhcp; uci commit firewall
 n=$(nft list ruleset | grep -c 'kids time restriction' || true)
 h=$(uci -q show dhcp | grep -c "\.kids='1'" || true)
 if [ "$n" -gt 0 ] && [ "$h" -gt 0 ]; then
-	echo "PASS  kids: $h fixed addresses, internet off $START-$STOP (nft rules: $n)"
+	echo "PASS  kids: $h fixed addresses, internet and the router's pages off $START-$STOP (nft rules: $n)"
 else
 	echo "FAIL  kids rules not active (nft rules: $n, hosts: $h)"; exit 1
 fi

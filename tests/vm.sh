@@ -298,6 +298,12 @@ redlib_checks() {
 		true' 2>&1 | tr '\n' ' ')
 	[ "$r" = "served-at-192.168.1.254 redlib-resolves " ] && ok "Redlib: reddit.lan serves it on port 80 to LAN devices; only its user gets past the block list" \
 		|| bad "Redlib from the LAN (want 'served-at-192.168.1.254 redlib-resolves'): $r"
+	# After a firmware upgrade the service comes back disabled (and procd may
+	# give up after repeated memory kills): the nightly run starts it again.
+	r=$(vm_ssh '/etc/init.d/redlib stop; /etc/init.d/redlib disable; /usr/sbin/redlib-update >/dev/null 2>&1; sleep 2
+		/etc/init.d/redlib enabled && echo enabled; pidof redlib >/dev/null && echo running' 2>&1 | tr '\n' ' ')
+	[ "$r" = "enabled running " ] && ok "Redlib: stopped and disabled (as after a firmware upgrade), the nightly update starts it again" \
+		|| bad "Redlib not restarted by the update (want 'enabled running'): $r"
 	for c in too-new bad-sum; do
 		r=$(vm_ssh "v=\$(cat /etc/redlib.version); REDLIB_RELEASES_API=http://10.0.2.2:$RPORT/$c.json /usr/sbin/redlib-update; echo rc=\$?; [ \"\$(cat /etc/redlib.version)\" = \"\$v\" ] && [ -x /usr/sbin/redlib ] && pidof redlib >/dev/null && echo kept" 2>&1 | tr '\n' ' ')
 		case $c:$r in
@@ -414,6 +420,9 @@ scenario_full() {
 		&& ok "VPN zone clamps MSS (mtu_fix)" || bad "VPN zone lacks mtu_fix"
 	k=$(vm_ssh "nft list ruleset | grep 'kids time restriction'")
 	case $k in *"ether saddr"*) case $k in *"ip saddr"*) bad "kids rule still needs an IP match" ;; *) ok "kids rule matches by MAC only" ;; esac ;; *) bad "kids rule missing: $k" ;; esac
+	k=$(vm_ssh "nft list ruleset | grep 'kids router pages'")
+	case $k in *"ether saddr"*"dport { 80, 443, 8080 }"*|*"ether saddr"*"dport"*"8080"*) ok "kids: the router's own pages (reddit.lan, manga.lan, LuCI) are cut off too" ;;
+		*) bad "kids router-pages rule: $k" ;; esac
 
 	# A router that presents a different SSH key than the saved one is refused
 	# when nobody is there to confirm it (settings must not go to an impostor).

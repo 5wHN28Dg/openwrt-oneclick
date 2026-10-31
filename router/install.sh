@@ -226,12 +226,15 @@ if [ -n "$REDLIB" ]; then
 	  user_exists redlib || user_add redlib '' "$(group_add_next redlib)" Redlib /var/empty /bin/false )
 	put_tree "$ROUTER/redlib"
 	chmod 755 /etc/init.d/redlib /usr/sbin/redlib-update
-	sed -i "s/REDLIB_UID/$(id -u redlib)/" /etc/nftables.d/30-oneclick-redlib-dns.nft
+	# A rule without a number would stop the whole firewall from loading.
+	uid=$(id -u redlib 2>/dev/null)
+	case $uid in ''|*[!0-9]*) rm -f /etc/nftables.d/30-oneclick-redlib-dns.nft; die "could not create the redlib user" ;; esac
+	sed -i "s/REDLIB_UID/$uid/" /etc/nftables.d/30-oneclick-redlib-dns.nft
 	SFW=off; on "${FAMILY_FILTER:-0}" && SFW=on
 	printf 'ADDRESS=%s\nSFW=%s\n' "$REDLIB_IP" "$SFW" > /etc/redlib.conf
 elif [ -e /etc/init.d/redlib ] || grep -q '^redlib:' /etc/passwd; then
 	/etc/init.d/redlib stop >/dev/null 2>&1; /etc/init.d/redlib disable >/dev/null 2>&1
-	rm -f $REDLIB_FILES /usr/sbin/redlib /usr/sbin/redlib.old /usr/sbin/redlib.new /etc/redlib.version
+	rm -f $REDLIB_FILES /usr/sbin/redlib /usr/sbin/redlib.old /usr/sbin/redlib.new /etc/redlib.version /etc/redlib.rejected
 	sed -i '/^redlib:/d' /etc/passwd /etc/shadow /etc/group
 	for f in $REDLIB_FILES; do sed -i "\#^$f\$#d" /etc/sysupgrade.conf; done
 fi
@@ -898,9 +901,12 @@ if [ -n "$REDLIB" ]; then
 	if /usr/sbin/redlib-update >/tmp/setup-redlib.log 2>&1; then
 		/etc/init.d/redlib restart   # also when it was current: settings may have changed
 		pass "Redlib $(cat /etc/redlib.version) at http://reddit.lan ($REDLIB_IP), adult content $( [ "$SFW" = on ] && echo 'locked off' || echo 'off by default'); updates daily 03:40 to releases 3+ days old"
-	else
+	elif [ -x /usr/sbin/redlib ]; then
+		# The installed one keeps running; only the update check failed.
 		/etc/init.d/redlib restart
-		fail "Redlib: $(tail -1 /tmp/setup-redlib.log)${REDLIB_IP:+; retried daily at 03:40}"
+		info "Redlib $(cat /etc/redlib.version 2>/dev/null) kept at http://reddit.lan: $(tail -1 /tmp/setup-redlib.log); checked again daily at 03:40"
+	else
+		fail "Redlib not installed: $(tail -1 /tmp/setup-redlib.log); tried again daily at 03:40"
 	fi
 fi
 /etc/init.d/cron enable; /etc/init.d/cron restart
