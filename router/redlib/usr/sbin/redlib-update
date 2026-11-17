@@ -26,9 +26,15 @@ WAIT_DAYS=3
 TGZ=/tmp/redlib-update.tgz
 
 say() { echo "redlib-update: $1"; logger -t redlib-update "$1"; }
-fetch() { # URL FILE: three tries, connections to GitHub sometimes time out
+fetch() { # URL FILE: three tries, connections to GitHub sometimes time out.
+	# curl (installed by the setup) first: uclient-fetch can't reach github.com
+	# on some networks where curl can.
 	for n in 1 2 3; do
-		uclient-fetch -q -T 30 -O "$2" "$1" 2>/dev/null && return 0
+		if command -v curl >/dev/null; then
+			curl -sfL -m 120 -o "$2" "$1" 2>/dev/null && return 0
+		else
+			uclient-fetch -q -T 30 -O "$2" "$1" 2>/dev/null && return 0
+		fi
 		rm -f "$2"; [ $n -lt 3 ] && sleep 10
 	done
 	return 1

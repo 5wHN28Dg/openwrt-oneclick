@@ -67,6 +67,7 @@ if [ -n "${1-}" ]; then
 	cp "$1" "$TMP.raw" || exit 1
 elif ! { [ -n "$iface" ] && command -v curl >/dev/null \
 		&& curl -sf -m 30 --interface "$iface" -o "$TMP.raw" "$URL" 2>/dev/null; } \
+	&& ! curl -4 -sf -m 30 -o "$TMP.raw" "$URL" 2>/dev/null \
 	&& ! uclient-fetch -4 -q -T 30 -O "$TMP.raw" "$URL" 2>/dev/null; then
 	say "download failed (through ${iface:-the VPN} and directly), keeping the previous list"; exit 1
 fi
