@@ -1,0 +1,51 @@
+#!/bin/sh
+# Puts back what a firmware upgrade doesn't carry over. An upgrade keeps the
+# files listed in /etc/sysupgrade.conf, but:
+# - the manga.lan redirect lives in /www/index.html, which belongs to LuCI:
+#   the new firmware brings LuCI's own copy;
+# - adblock-lean and Redlib come back switched off (an upgrade restores the
+#   start-at-boot links of packages only). adblock-lean would stay off until
+#   its 05:00 job, Redlib (its 11 MB program is left out of the backup) until
+#   its 03:40 update.
+#
+#   oneclick-after-upgrade boot    from /etc/rc.local: all of it, on the
+#                                  first boot of a new firmware only
+#   oneclick-after-upgrade manga   the manga.lan redirect only (install.sh)
+#   oneclick-after-upgrade mark    note this firmware as done (install.sh)
+#
+# The firmware it last ran on is in /etc/oneclick-firmware, left out of
+# /etc/sysupgrade.conf on purpose: a new firmware starts without it.
+
+MARK=/etc/oneclick-firmware
+say() { echo "oneclick-after-upgrade: $1"; logger -t oneclick-after-upgrade "$1" 2>/dev/null; }
+firmware() { (. /etc/openwrt_release; echo "$DISTRIB_REVISION"); }
+
+manga() { # only where the MangaDex app is installed
+	[ -d /www/mangadex-safe ] || return 0
+	grep -q 'safe-otaku: manga.lan' /www/index.html && return 0
+	sed -i 's|<head>|<head>\n\t\t<script>/* safe-otaku: manga.lan opens the MangaDex safe app */ if (location.hostname === "manga.lan") location.replace("/mangadex-safe/");</script>|' /www/index.html
+	say "manga.lan redirect put back"
+}
+
+case ${1-} in
+	manga) manga; exit 0 ;;
+	mark) firmware > "$MARK"; exit 0 ;;
+	boot) ;;
+	*) echo "usage: $0 boot|manga|mark" >&2; exit 2 ;;
+esac
+
+fw=$(firmware)
+[ "$(cat "$MARK" 2>/dev/null)" = "$fw" ] && exit 0
+manga
+# One after the other: both need memory (as their nightly jobs are apart).
+if [ -x /etc/init.d/adblock-lean ] && ! /etc/init.d/adblock-lean enabled; then
+	/etc/init.d/adblock-lean enable
+	/etc/init.d/adblock-lean start >/dev/null 2>&1 && say "adblock-lean switched on again" \
+		|| say "adblock-lean switched on again; its start failed, its 05:00 job tries again"
+fi
+# The updater installs the program, switches Redlib on and starts it.
+if [ -x /usr/sbin/redlib-update ] && [ ! -x /usr/sbin/redlib ]; then
+	/usr/sbin/redlib-update >/dev/null 2>&1 && say "Redlib reinstalled" \
+		|| say "Redlib reinstall failed; its 03:40 update tries again"
+fi
+echo "$fw" > "$MARK"

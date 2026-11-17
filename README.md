@@ -231,6 +231,15 @@ go in `ADBLOCK_EXTRA_LISTS` (family filtering adds its lists there).
 adblock-lean is downloaded from GitHub and run as root on the router, like its
 own install instructions do; the setup trusts that project.
 
+Firmware upgrades (LuCI's Attended Sysupgrade or `owut`, which build the new
+firmware with your installed packages) keep everything the setup made: its
+files are listed in `/etc/sysupgrade.conf`. A minute after the first boot of
+the new firmware, `oneclick-after-upgrade` (started from `/etc/rc.local`)
+puts back what an upgrade can't keep: the `manga.lan` redirect in LuCI's
+start page, adblock-lean switched on, and the Redlib program (left out of the
+backup: 11 MB). A plain sysupgrade with a stock image loses the packages
+(pbr, dnsmasq-full, microsocks, ...): run `setup.sh` again after one.
+
 ## Tests
 
 - `tests/lint.sh`: [ShellCheck](https://www.shellcheck.net) on every script
@@ -250,7 +259,7 @@ What it costs and why each part is there:
 
 | Part | Why |
 |---|---|
-| The program: 11 MB of flash on your router's CPU type, about 10 MB of RAM when idle (measured on the test VM) | Redlib's own build for the router's CPU, from its GitHub releases. Not kept in firmware-upgrade backups (they live in RAM during the upgrade); the updater puts it back, and starts Redlib again, the night after. |
+| The program: 11 MB of flash on your router's CPU type, about 10 MB of RAM when idle (measured on the test VM) | Redlib's own build for the router's CPU, from its GitHub releases. Not kept in firmware-upgrade backups (they live in RAM during the upgrade); the updater puts it back and starts Redlib again a minute after the first boot of the new firmware. |
 | Its own address (the last one of the LAN, e.g. `192.168.1.254`) and `reddit.lan` | So it can serve on port 80 next to LuCI. DHCP keeps handing out the router's main address. The setup stops if that address is in the DHCP pool or a fixed lease. |
 | A firewall rule, port 80 → 8080 on that address | Redlib runs as its own user, not root, and such a user can't open port 80. |
 | A firewall rule for its DNS | That user's lookups go to the encrypted resolver behind the block lists, so a Reddit block in your list keeps applying to every device but not to Redlib. |
