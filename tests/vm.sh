@@ -411,6 +411,47 @@ telegram_proxy_checks() {
 	fi
 }
 
+# A firmware upgrade keeps the files in /etc/sysupgrade.conf, and switches
+# on only the packages' services. Checked: the upgrade backup would hold the
+# setup's files. Then what an upgrade drops is dropped by hand (LuCI's
+# index.html with the manga.lan redirect, adblock-lean and Redlib switched
+# off, the Redlib program, the firmware mark); after a reboot it's all back.
+upgrade_checks() {
+	r=$(vm_ssh 'sysupgrade -l > /tmp/keep
+		for f in /usr/sbin/oneclick-after-upgrade /etc/safesearch/google.domains /etc/init.d/adblock-lean /etc/init.d/redlib \
+			/usr/sbin/redlib-update /usr/sbin/telegram-ranges /etc/rc.local /etc/oneclick-vpn-aaaa.applied /etc/crontabs/root \
+			/etc/redlib.conf /etc/nftables.d/30-oneclick-redlib-dns.nft /etc/nftables.d/31-oneclick-telegram-proxy.nft \
+			/usr/sbin/safesearch-hosts /usr/sbin/redlib-block /etc/redlib-block.allow /etc/banip/banip.custom.feeds \
+			$(find /etc/adblock-lean /usr/lib/adblock-lean /www/mangadex-safe /www/cgi-bin/md /etc/proton /usr/share/proton-pick \
+				/usr/sbin/proton-pick /etc/proton-pick.conf -type f 2>/dev/null); do
+			grep -qxF "$f" /tmp/keep || echo "not-kept:$f"
+		done
+		grep -qxF /etc/oneclick-firmware /tmp/keep && echo mark-kept
+		grep -c "oneclick-after-upgrade boot" /etc/rc.local' 2>&1 | tr '\n' ' ')
+	[ "$r" = "1 " ] && ok "firmware upgrade: the backup keeps the setup's files; rc.local starts the after-upgrade fixes" \
+		|| bad "firmware upgrade keep list (want '1'): $r"
+	vm_ssh '/etc/init.d/redlib stop; /etc/init.d/redlib disable; /etc/init.d/adblock-lean stop; /etc/init.d/adblock-lean disable
+		rm -f /usr/sbin/redlib /etc/redlib.version /etc/oneclick-firmware; sed -i "/safe-otaku: manga.lan/d" /www/index.html
+		reboot' >/dev/null 2>&1
+	sleep 20; i=0 r=''
+	while [ $i -lt 60 ]; do
+		r=$(vm_ssh 'grep -q "safe-otaku: manga.lan" /www/index.html && echo redirect
+			/etc/init.d/adblock-lean enabled && /etc/init.d/adblock-lean status >/dev/null 2>&1 && echo adblock
+			/etc/init.d/redlib enabled && pidof redlib >/dev/null && echo redlib
+			[ "$(cat /etc/oneclick-firmware 2>/dev/null)" = "$(. /etc/openwrt_release; echo "$DISTRIB_REVISION")" ] && echo marked
+			true' 2>/dev/null | tr '\n' ' ')
+		[ "$r" = "redirect adblock redlib marked " ] && break
+		sleep 10; i=$((i + 1))
+	done
+	[ "$r" = "redirect adblock redlib marked " ] && ok "firmware upgrade (simulated): after the reboot manga.lan redirect, adblock-lean and Redlib are back" \
+		|| bad "after the simulated upgrade (want 'redirect adblock redlib marked'; Redlib comes from GitHub, whose API allows 60 calls an hour): $r"
+	# On later boots of the same firmware it changes nothing: adblock-lean
+	# switched off by hand stays off.
+	r=$(vm_ssh '/etc/init.d/adblock-lean disable; /usr/sbin/oneclick-after-upgrade boot; /etc/init.d/adblock-lean enabled && echo re-enabled
+		/etc/init.d/adblock-lean enable; true' 2>&1 | tr '\n' ' ')
+	[ -z "$r" ] && ok "after-upgrade fixes run once per firmware: a service switched off by hand stays off" || bad "after-upgrade on a later boot: $r"
+}
+
 scenario_full() {
 	echo "== full: every option on"
 	start_vm; P=$W/p-full; make_private "$P" full
@@ -458,6 +499,7 @@ scenario_full() {
 	redlib_checks
 	telegram_checks
 	telegram_proxy_checks
+	upgrade_checks
 	# Family filtering with no Redlib instance allowed still blocks them all
 	# (BusyBox's grep -vxF -f dropped every line when the allow list was empty).
 	r=$(vm_ssh 'cp /etc/redlib-block.allow /tmp/allow.bak; : > /etc/redlib-block.allow; /usr/sbin/redlib-block

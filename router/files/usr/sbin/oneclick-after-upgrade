@@ -1,0 +1,68 @@
+#!/bin/sh
+# Puts back what a firmware upgrade doesn't carry over. An upgrade keeps the
+# files listed in /etc/sysupgrade.conf, but:
+# - the manga.lan redirect lives in /www/index.html, which belongs to LuCI:
+#   the new firmware brings LuCI's own copy;
+# - adblock-lean and Redlib come back switched off (an upgrade restores the
+#   start-at-boot links of packages only). adblock-lean would stay off until
+#   its 05:00 job, Redlib (its 11 MB program is left out of the backup) until
+#   its 03:40 update.
+#
+#   oneclick-after-upgrade boot    from /etc/rc.local, at every boot
+#   oneclick-after-upgrade manga   the manga.lan redirect only (install.sh)
+#   oneclick-after-upgrade mark    note this firmware as done (install.sh)
+#
+# At boot the redirect and Redlib's program are checked every time (cheap,
+# and so also put back after an upgrade that kept this firmware's number).
+# adblock-lean is switched on only on the first boot of a new firmware:
+# switched off by hand later, it stays off. The firmware it last did that
+# for is in /etc/oneclick-firmware, left out of /etc/sysupgrade.conf on
+# purpose, so a new firmware starts without it.
+# Downloads retry for a while: the internet (or the VPN) may not be up yet.
+
+MARK=/etc/oneclick-firmware
+say() { echo "oneclick-after-upgrade: $1"; logger -t oneclick-after-upgrade "$1" 2>/dev/null; }
+firmware() { (. /etc/openwrt_release; echo "${DISTRIB_REVISION:-unknown}"); }
+tries() { # COUNT PAUSE-SECONDS COMMAND...: until it succeeds
+	n=$1 pause=$2; shift 2
+	while :; do
+		"$@" >/dev/null 2>&1 && return 0
+		n=$((n - 1)); [ $n -gt 0 ] || return 1
+		sleep "$pause"
+	done
+}
+
+manga() { # only where the MangaDex app is installed
+	[ -d /www/mangadex-safe ] || return 0
+	grep -q 'safe-otaku: manga.lan' /www/index.html 2>/dev/null && return 0
+	sed -i 's|<head>|<head>\n\t\t<script>/* safe-otaku: manga.lan opens the MangaDex safe app */ if (location.hostname === "manga.lan") location.replace("/mangadex-safe/");</script>|' /www/index.html 2>/dev/null
+	if grep -q 'safe-otaku: manga.lan' /www/index.html 2>/dev/null; then
+		say "manga.lan redirect put back"
+	else
+		say "could not add the manga.lan redirect: /www/index.html is missing or has no <head>"; return 1
+	fi
+}
+
+case ${1-} in
+	manga) manga; exit ;;
+	mark) firmware > "$MARK"; exit 0 ;;
+	boot) ;;
+	*) echo "usage: $0 boot|manga|mark" >&2; exit 2 ;;
+esac
+
+manga
+# One after the other: both need memory (as their nightly jobs are apart).
+fw=$(firmware)
+if [ "$(cat "$MARK" 2>/dev/null)" != "$fw" ]; then
+	if [ -x /etc/init.d/adblock-lean ] && ! /etc/init.d/adblock-lean enabled; then
+		/etc/init.d/adblock-lean enable
+		if tries 5 120 /etc/init.d/adblock-lean start; then say "adblock-lean switched on again"
+		else say "adblock-lean switched on again, but it didn't start; its 05:00 job tries again"; fi
+	fi
+	echo "$fw" > "$MARK"
+fi
+# The updater installs the program, switches Redlib on and starts it.
+if [ -x /usr/sbin/redlib-update ] && [ ! -x /usr/sbin/redlib ]; then
+	if tries 3 300 /usr/sbin/redlib-update; then say "Redlib reinstalled"
+	else say "Redlib reinstall failed; its 03:40 update tries again"; fi
+fi

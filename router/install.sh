@@ -228,7 +228,7 @@ if on "${ENABLE_MANGADEX:-0}"; then put_tree "$ROUTER/vendor/safe-otaku"; chmod 
 # Redlib: its own user (created before the firewall rule that names its number).
 # Turned off since an earlier run: everything goes, the rule before the user.
 REDLIB_NFT=/etc/nftables.d/30-oneclick-redlib-dns.nft
-REDLIB_FILES="/etc/init.d/redlib /usr/sbin/redlib-update $REDLIB_NFT /etc/redlib.conf"
+REDLIB_FILES="/etc/init.d/redlib /usr/sbin/redlib-update $REDLIB_NFT /etc/redlib.conf /etc/redlib.rejected"
 if [ -n "$REDLIB" ]; then
 	# OpenWrt's helpers (in a subshell: they read variables this script's set -u rejects)
 	( set +u; . /lib/functions.sh
@@ -250,7 +250,7 @@ elif [ -e /etc/init.d/redlib ] || grep -q '^redlib:' /etc/passwd; then
 	sed -i '/^redlib:/d' /etc/passwd /etc/shadow /etc/group
 	for f in $REDLIB_FILES; do sed -i "\#^$f\$#d" /etc/sysupgrade.conf; done
 fi
-chmod 755 /usr/sbin/safesearch-hosts /usr/sbin/redlib-block /usr/sbin/telegram-ranges
+chmod 755 /usr/sbin/safesearch-hosts /usr/sbin/redlib-block /usr/sbin/telegram-ranges /usr/sbin/oneclick-after-upgrade
 
 # adblock-lean local lists: own entries + project sections
 section() { # NAME FILE -> marked section, if the file has entries
@@ -718,8 +718,11 @@ fi
 if on "${ENABLE_MANGADEX:-0}"; then
 	step "MangaDex app"
 	uci set uhttpd.main.max_requests='6'; uci set uhttpd.main.setup_maxreq=1; uci commit uhttpd
-	grep -q 'safe-otaku: manga.lan' /www/index.html || sed -i 's|<head>|<head>\n\t\t<script>/* safe-otaku: manga.lan opens the MangaDex safe app */ if (location.hostname === "manga.lan") location.replace("/mangadex-safe/");</script>|' /www/index.html
-	pass "MangaDex reader at http://manga.lan (uhttpd max_requests 6)"
+	if /usr/sbin/oneclick-after-upgrade manga; then   # also after firmware upgrades (LuCI's index.html)
+		pass "MangaDex reader at http://manga.lan (uhttpd max_requests 6)"
+	else
+		fail "MangaDex reader installed, but manga.lan can't open it: LuCI's /www/index.html is missing or has no <head> (use http://$LAN_IP/mangadex-safe/)"
+	fi
 fi
 
 # ---------------------------------------------------------------- Wi-Fi
@@ -756,7 +759,13 @@ sed -i '/safesearch-hosts\|redlib-block\|redlib-update\|proton-pick\|telegram-ra
 [ -n "$VPN" ] && on "${TELEGRAM_VIA_VPN:-0}" && echo "20 4 * * * /usr/sbin/telegram-ranges" >> /etc/crontabs/root
 # Redlib updates at 03:40, apart from adblock-lean's 05:00 run (both need memory).
 [ -n "$REDLIB" ] && echo "40 3 * * * /usr/sbin/redlib-update" >> /etc/crontabs/root
-sed -i '/safesearch-hosts\|proton-pick/d' /etc/rc.local
+sed -i '/safesearch-hosts\|proton-pick\|oneclick-after-upgrade/d' /etc/rc.local
+# After a firmware upgrade: the manga.lan redirect back, adblock-lean and
+# Redlib on again (see the script). Does nothing on other boots.
+sed -i 's|^exit 0$|(sleep 60; /usr/sbin/oneclick-after-upgrade boot) \&\nexit 0|' /etc/rc.local
+/usr/sbin/oneclick-after-upgrade mark
+grep -q 'oneclick-after-upgrade boot' /etc/rc.local \
+	|| fail "/etc/rc.local has no 'exit 0' line: after a firmware upgrade, adblock-lean and Redlib stay off until their nightly jobs"
 if [ -f /etc/proton-pick.conf ]; then
 	echo "*/5 * * * * /usr/sbin/proton-pick check" >> /etc/crontabs/root
 	echo "17 4 * * * /usr/sbin/proton-pick refresh" >> /etc/crontabs/root
@@ -769,14 +778,14 @@ if on "${FAMILY_FILTER:-0}"; then
 	sed -i 's|^exit 0$|(sleep 30; /usr/sbin/safesearch-hosts) \&\nexit 0|' /etc/rc.local
 fi
 # Not the Redlib program (11 MB in every upgrade backup): the updater
-# reinstalls it the night after a firmware upgrade.
+# (oneclick-after-upgrade) reinstalls it after a firmware upgrade.
 [ -n "$REDLIB" ] && for f in $REDLIB_FILES; do
 	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 done
 [ -f /etc/proton-pick.conf ] && for f in /usr/sbin/proton-pick /usr/share/proton-pick/ /etc/proton/ /etc/proton-pick.conf; do
 	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 done
-for f in /usr/sbin/safesearch-hosts /usr/sbin/redlib-block /usr/sbin/telegram-ranges /etc/redlib-block.allow /etc/init.d/adblock-lean /usr/lib/adblock-lean/ /etc/adblock-lean/ /www/mangadex-safe/ /www/cgi-bin/md; do
+for f in /usr/sbin/safesearch-hosts /etc/safesearch/google.domains /usr/sbin/redlib-block /usr/sbin/telegram-ranges /usr/sbin/oneclick-after-upgrade /etc/oneclick-vpn-aaaa.applied /etc/redlib-block.allow /etc/init.d/adblock-lean /usr/lib/adblock-lean/ /etc/adblock-lean/ /www/mangadex-safe/ /www/cgi-bin/md; do
 	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 done
 pass "custom files kept across firmware upgrades${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo '; safe search every 30 min, Redlib list daily 04:50')}"
