@@ -399,8 +399,11 @@ telegram_proxy_checks() {
 		t socks5h://telegram:wrong@192.168.1.1:1080 http://149.154.167.99/ wrong-password
 		ip netns del pc" 2>&1 | tr '\n' ' ')
 	want="telegram=28 telegram-without-vpn=28 dropped-outside-vpn other=97 router-dns=97 router-web=97 wrong-password=97 "
-	[ "$r" = "$want" ] && ok "Telegram proxy (from a LAN device): only Telegram, only through the VPN, only with the password" \
-		|| bad "Telegram proxy (want '$want'): $r"
+	if [ "$r" = "$want" ]; then ok "Telegram proxy (from a LAN device): only Telegram, only through the VPN, only with the password"
+	else
+		bad "Telegram proxy (want '$want'): $r"
+		vm_ssh 'nft list chain inet fw4 oneclick_telegram_proxy; nft list set inet fw4 oneclick_telegram4 | grep -c 149.154; uci show pbr | grep -E "telegram=|chain=|\.interface="; ls -l /etc/nftables.d/' 2>&1 | sed 's/^/        | /'
+	fi
 }
 
 scenario_full() {
