@@ -388,11 +388,13 @@ telegram_proxy_checks() {
 		ip link add veth2 type veth peer name veth3; ip link set veth2 master br-lan up
 		ip netns add pc; ip link set veth3 netns pc; ip -n pc link set lo up; ip -n pc link set veth3 up; ip -n pc addr add 192.168.1.61/24 dev veth3
 		t() { ip netns exec pc curl -s -m 6 -o /dev/null -x \$1 \$2; echo \"\$3=\$?\"; }
+		w() { i=0; until ip route show table pbr_testvpn 2>/dev/null | grep -q default || [ \$i -ge 30 ]; do sleep 1; i=\$((i + 1)); done; sleep 2; }
+		w   # pbr may still be rebuilding its tables after the checks before
 		t \$px http://149.154.167.99/ telegram
 		d0=\$(nft list chain inet fw4 oneclick_telegram_proxy_vpn | sed -n 's/.*packets \([0-9]*\).*/\1/p')
 		/etc/init.d/pbr stop >/dev/null 2>&1; t \$px http://149.154.167.99/ telegram-without-vpn
 		[ \"\$(nft list chain inet fw4 oneclick_telegram_proxy_vpn | sed -n 's/.*packets \([0-9]*\).*/\1/p')\" -gt \"\$d0\" ] && echo dropped-outside-vpn
-		/etc/init.d/pbr start >/dev/null 2>&1
+		/etc/init.d/pbr start >/dev/null 2>&1; w
 		t \$px http://192.0.2.1/ other
 		t \$px http://127.0.0.1:5354/ router-dns
 		t \$px http://192.168.1.1/ router-web
