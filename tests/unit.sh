@@ -387,6 +387,7 @@ $(printf '%s\n' "$REMOTE_PEERS" | head -1)"; eq "repeated remote device rejected
 	TELEGRAM_PROXY_PASS="0123456789ab'cdef"; eq "proxy password with a quote rejected" "$(check_settings | grep -c TELEGRAM_PROXY_PASS)" 1
 	TELEGRAM_PROXY_PASS=short; eq "short proxy password rejected" "$(check_settings | grep -c TELEGRAM_PROXY_PASS)" 1
 	TELEGRAM_PROXY_PASS=0123456789abcdef01234567 TELEGRAM_PROXY_PORT=80; eq "proxy port below 1024 rejected" "$(check_settings | grep -c TELEGRAM_PROXY_PORT)" 1
+	TELEGRAM_PROXY_PORT=5354; eq "proxy port of the router's DNS rejected" "$(check_settings | grep -c 'used by the router')" 1
 	TELEGRAM_PROXY_PORT=1080 TELEGRAM_VIA_VPN=0; eq "proxy without Telegram through the VPN rejected" "$(check_settings | grep -c 'TELEGRAM_PROXY needs')" 1
 	TELEGRAM_PROXY=0 TELEGRAM_VIA_VPN=0
 	REMOTE_HOST=home.example.org:51820; eq "remote host with a port rejected" "$(check_settings | grep -c REMOTE_HOST)" 1

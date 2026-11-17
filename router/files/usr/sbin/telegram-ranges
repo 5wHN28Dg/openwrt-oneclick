@@ -105,27 +105,35 @@ firewall_rules() {
 	uci commit firewall
 	[ -n "$noreload" ] || fw4 reload >/dev/null 2>&1
 }
-# The proxy's user (microsocks) may open connections only to Telegram's IPv4
-# ranges (and the router itself, for DNS): a leaked password can't turn it
-# into a way around the family filter. Only new connections are checked: its
-# replies to the phones that connected to it must go through.
+# The proxy's user (microsocks) may open new connections only to Telegram's
+# IPv4 ranges through the VPN, and to the filtered DNS on the router itself
+# (dnsmasq, port 53 over lo). Everything else is refused: other addresses,
+# Telegram without the VPN (the provider would see it), the router's other
+# services (dnsproxy's unfiltered DNS on 5354 among them), IPv6. So the
+# proxy password can't become a way around the family filter. Replies to
+# the phones connected to it are not new connections and pass.
 # Status 0 if the file changed.
 PROXY_NFT=/etc/nftables.d/31-oneclick-telegram-proxy.nft
 proxy_rules() {
 	[ -f "$PROXY_NFT" ] || return 1
-	uid=$(id -u microsocks 2>/dev/null) || return 1
-	case $uid in ''|*[!0-9]*) return 1 ;; esac
+	uid=$(id -u microsocks 2>/dev/null)
+	case $uid in ''|*[!0-9]*) say "no microsocks user: the proxy's rules stay as they are"; return 1 ;; esac
+	# The VPN: the interface of the policy for the router's own traffic.
+	pv=''
+	for p in $policies; do [ "$(uci -q get "pbr.$p.chain")" = output ] && pv=$(uci -q get "pbr.$p.interface"); done
+	case $pv in *[!A-Za-z0-9_.-]*) pv='' ;; esac
 	{
-		echo "# openwrt-oneclick: the Telegram proxy (user microsocks) may only reach Telegram."
-		echo "# Written by telegram-ranges from Telegram's list; IPv6 isn't proxied."
+		echo "# openwrt-oneclick: the Telegram proxy (user microsocks) may only reach Telegram,"
+		echo "# through the VPN. Written by telegram-ranges from Telegram's list."
 		echo "set oneclick_telegram4 {"
 		echo "	type ipv4_addr; flags interval; auto-merge"
 		echo "	elements = { $(tr '\n' ',' < "$TMP.v4" | sed 's/,$//; s/,/, /g') }"
 		echo "}"
 		echo "chain oneclick_telegram_proxy {"
 		echo "	type filter hook output priority filter - 1; policy accept;"
-		echo "	meta skuid $uid ct state new oifname != \"lo\" ip daddr != @oneclick_telegram4 counter reject"
-		echo "	meta skuid $uid ct state new oifname != \"lo\" meta nfproto ipv6 counter reject"
+		echo "	meta skuid $uid ct state new oifname \"lo\" ip daddr 127.0.0.1 meta l4proto { tcp, udp } th dport 53 accept"
+		[ -n "$pv" ] && echo "	meta skuid $uid ct state new oifname \"$pv\" ip daddr @oneclick_telegram4 accept"
+		echo "	meta skuid $uid ct state new counter reject"
 		echo "}"
 	} > "$PROXY_NFT.tmp"
 	if cmp -s "$PROXY_NFT.tmp" "$PROXY_NFT"; then rm -f "$PROXY_NFT.tmp"; return 1; fi

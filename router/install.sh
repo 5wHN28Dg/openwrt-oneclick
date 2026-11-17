@@ -412,8 +412,14 @@ if [ -n "$VPN" ]; then
 	fi
 	uci commit pbr
 	if on "${TELEGRAM_VIA_VPN:-0}"; then
-		# telegram-ranges writes the proxy's allow list into this file when it exists.
-		if [ -n "$TG_PROXY" ]; then : > /etc/nftables.d/31-oneclick-telegram-proxy.nft; fi
+		# The proxy's rules start as "nothing allowed"; telegram-ranges then
+		# replaces the file whole with the allow list (fails closed, never open).
+		if [ -n "$TG_PROXY" ]; then
+			muid=$(id -u microsocks 2>/dev/null)
+			case $muid in ''|*[!0-9]*) die "the microsocks package didn't create its user" ;; esac
+			f=/etc/nftables.d/31-oneclick-telegram-proxy.nft
+			printf 'chain oneclick_telegram_proxy {\n\ttype filter hook output priority filter - 1; policy accept;\n\tmeta skuid %s ct state new counter reject\n}\n' "$muid" > "$f.tmp" && mv "$f.tmp" "$f"
+		fi
 		TELEGRAM_NO_RELOAD=1 /usr/sbin/telegram-ranges "$ROUTER/lists/telegram-cidr.txt" >/dev/null || die "could not fill the Telegram policy"
 	fi
 	pass "WireGuard $VPN to ${PREV_HOST:-$WG_ENDPOINT_HOST}; PBR: ${VPN_ROUTE_DOMAINS:-no domains}${VPN_ROUTE_SUBNETS:+ + IP ranges}${TG_DOMAINS:+ + Telegram}"
@@ -426,6 +432,7 @@ fi
 TG_PROXY_NFT=/etc/nftables.d/31-oneclick-telegram-proxy.nft
 if [ -n "$TG_PROXY" ]; then
 	uci batch >/dev/null <<-EOF
+		set microsocks.config.oneclick='1'
 		set microsocks.config.enabled='1'
 		set microsocks.config.listenip='0.0.0.0'
 		set microsocks.config.port='${TELEGRAM_PROXY_PORT:-1080}'
@@ -436,10 +443,13 @@ if [ -n "$TG_PROXY" ]; then
 		set microsocks.config.quiet='1'
 	EOF
 	uci commit microsocks
-elif [ -x /etc/init.d/microsocks ] || [ -f "$TG_PROXY_NFT" ]; then   # turned off since an earlier run
+	chmod 600 /etc/config/microsocks   # it holds the password
+elif [ "$(uci -q get microsocks.config.oneclick)" = 1 ] || [ -f "$TG_PROXY_NFT" ]; then
+	# Turned off since an earlier run: only a proxy this setup made is removed.
 	/etc/init.d/microsocks stop >/dev/null 2>&1; /etc/init.d/microsocks disable >/dev/null 2>&1
-	rm -f "$TG_PROXY_NFT"; sed -i "\#^$TG_PROXY_NFT\$#d" /etc/sysupgrade.conf
+	rm -f "$TG_PROXY_NFT" "$TG_PROXY_NFT.tmp"; sed -i "\#^$TG_PROXY_NFT\$#d" /etc/sysupgrade.conf
 	if [ $PKG = apk ]; then apk del microsocks >/dev/null 2>&1; else opkg remove microsocks >/dev/null 2>&1; fi
+	rm -f /etc/config/microsocks   # kept by the package manager, and it holds the password
 fi
 
 # Proton VPN server choice (proton-pick): session, settings; off = all removed.
@@ -1092,12 +1102,17 @@ if [ -n "$VPN" ]; then
 	check "VPN WireGuard handshake" "[ \"\$(wg show $VPN latest-handshakes | awk '{print \$2}')\" -gt 0 ]"
 	check "PBR active (no errors, $VPN gateway)" "pbr_ok"
 	if [ -n "$TG_PROXY" ]; then
-		px="socks5h://$TELEGRAM_PROXY_USER:$TELEGRAM_PROXY_PASS@127.0.0.1:${TELEGRAM_PROXY_PORT:-1080}"
+		# The password goes to curl on stdin, not on its command line (ps shows those).
+		viaproxy() { # PASSWORD URL -> curl's exit code (97: the proxy refused)
+			printf 'proxy = "socks5h://%s:%s@127.0.0.1:%s"\n' "$TELEGRAM_PROXY_USER" "$1" "${TELEGRAM_PROXY_PORT:-1080}" \
+				| curl -K - -s -m 15 -o /dev/null "$2"
+		}
 		mpid=$(pidof microsocks)
 		check "Telegram proxy runs as its own user" "[ -n '$mpid' ] && [ \"\$(awk '/^Uid:/ { print \$2 }' /proc/$mpid/status)\" = \"\$(id -u microsocks)\" ]"
-		check "Telegram proxy refuses other addresses (1.1.1.1)" "! curl -s -m 8 -o /dev/null -x '$px' http://1.1.1.1/"
-		check "Telegram proxy refuses a wrong password" "! curl -s -m 8 -o /dev/null -x 'socks5h://$TELEGRAM_PROXY_USER:wrong@127.0.0.1:${TELEGRAM_PROXY_PORT:-1080}' https://core.telegram.org/"
-		if curl -s -m 20 -o /dev/null -x "$px" https://core.telegram.org/resources/cidr.txt; then
+		check "Telegram proxy refuses other addresses (1.1.1.1)" "viaproxy \"\$TELEGRAM_PROXY_PASS\" http://1.1.1.1/; [ \$? = 97 ]"
+		check "Telegram proxy refuses the router's unfiltered DNS (127.0.0.1:5354)" "viaproxy \"\$TELEGRAM_PROXY_PASS\" http://127.0.0.1:5354/; [ \$? = 97 ]"
+		check "Telegram proxy refuses a wrong password" "viaproxy wrong https://core.telegram.org/; [ \$? = 97 ]"
+		if viaproxy "$TELEGRAM_PROXY_PASS" https://core.telegram.org/resources/cidr.txt; then
 			info "Telegram proxy reaches Telegram (through $VPN)"
 		else
 			info "Telegram proxy could not reach Telegram right now (is $VPN up?)"

@@ -377,26 +377,27 @@ telegram_checks() {
 		*) bad "Telegram rollback when pbr refuses the list: $r" ;; esac
 }
 
-# Telegram proxy, from a LAN device: it reaches only Telegram's addresses.
-# The test VPN is a dead tunnel, so for a moment pbr is stopped and the test
-# server's network (10.0.2.0/24) is put on the list: then the proxy reaches
-# it, while an address not on the list (10.0.2.3, the VM's DNS, is on it;
-# 192.0.2.1 is not) is refused; then everything goes back.
+# Telegram proxy, from a LAN device. The test VPN is a dead tunnel, so curl's
+# exit code tells what happened: 28 = let through and stuck in the VPN,
+# 97 = refused by the proxy. A Telegram address goes into the VPN; with pbr
+# stopped (it would leave directly) it is refused; so are an address that
+# isn't Telegram's, the router's unfiltered DNS (5354), the router's web page
+# and a wrong password.
 telegram_proxy_checks() {
-	r=$(vm_ssh "u=http://10.0.2.2:$RPORT; px=socks5h://telegram:0123456789abcdef01234567@192.168.1.1:1080
+	r=$(vm_ssh "px=socks5h://telegram:0123456789abcdef01234567@192.168.1.1:1080
 		ip link add veth2 type veth peer name veth3; ip link set veth2 master br-lan up
 		ip netns add pc; ip link set veth3 netns pc; ip -n pc link set lo up; ip -n pc link set veth3 up; ip -n pc addr add 192.168.1.61/24 dev veth3
-		/etc/init.d/pbr stop >/dev/null 2>&1
-		uclient-fetch -qO /tmp/tg-plus.txt \$u/tg-plus-test.txt && TELEGRAM_NO_RELOAD=1 /usr/sbin/telegram-ranges /tmp/tg-plus.txt >/dev/null 2>&1; fw4 reload >/dev/null 2>&1
-		ip netns exec pc curl -s -m 10 -o /dev/null -x \$px \$u/tg-repo.txt && echo listed-reached || { echo \"listed-failed:\$?\"; netstat -ltn | grep -c :1080 | sed 's/^/listening=/'; nft list set inet fw4 oneclick_telegram4 2>&1 | grep -c 10.0.2.0 | sed 's/^/in-set=/'; ip netns exec pc curl -sS -m 5 -o /dev/null -x \$px \$u/tg-repo.txt 2>&1 | head -1; }
-		ip netns exec pc curl -s -m 10 -o /dev/null -x \$px http://192.0.2.1/; e=\$?; [ \$e = 97 ] || [ \$e = 7 ] && echo unlisted-refused || echo \"unlisted:\$e\"
-		ip netns exec pc curl -s -m 10 -o /dev/null -x socks5h://telegram:wrong@192.168.1.1:1080 \$u/tg-repo.txt; e=\$?; [ \$e = 97 ] && echo wrong-password-refused || echo \"wrong-password:\$e\"
-		uclient-fetch -qO /tmp/tg-repo.txt \$u/tg-repo.txt && TELEGRAM_NO_RELOAD=1 /usr/sbin/telegram-ranges /tmp/tg-repo.txt >/dev/null 2>&1; fw4 reload >/dev/null 2>&1
-		ip netns exec pc curl -s -m 10 -o /dev/null -x \$px \$u/tg-repo.txt || echo unlisted-again
-		/etc/init.d/pbr start >/dev/null 2>&1; ip netns del pc; ip link del veth2 2>/dev/null; rm -f /tmp/tg-plus.txt /tmp/tg-repo.txt" 2>&1 | tr '\n' ' ')
-	case $r in "listed-reached unlisted-refused wrong-password-refused unlisted-again ")
-		ok "Telegram proxy (from a LAN device): reaches only addresses on Telegram's list, needs the password" ;;
-		*) bad "Telegram proxy (want 'listed-reached unlisted-refused wrong-password-refused unlisted-again'): $r" ;; esac
+		t() { ip netns exec pc curl -s -m 6 -o /dev/null -x \$1 \$2; echo \"\$3=\$?\"; }
+		t \$px http://149.154.167.99/ telegram
+		/etc/init.d/pbr stop >/dev/null 2>&1; t \$px http://149.154.167.99/ telegram-without-vpn; /etc/init.d/pbr start >/dev/null 2>&1
+		t \$px http://192.0.2.1/ other
+		t \$px http://127.0.0.1:5354/ router-dns
+		t \$px http://192.168.1.1/ router-web
+		t socks5h://telegram:wrong@192.168.1.1:1080 http://149.154.167.99/ wrong-password
+		ip netns del pc" 2>&1 | tr '\n' ' ')
+	want="telegram=28 telegram-without-vpn=97 other=97 router-dns=97 router-web=97 wrong-password=97 "
+	[ "$r" = "$want" ] && ok "Telegram proxy (from a LAN device): only Telegram, only through the VPN, only with the password" \
+		|| bad "Telegram proxy (want '$want'): $r"
 }
 
 scenario_full() {
@@ -489,7 +490,10 @@ scenario_full() {
 		|| bad "overlap: exit $rc, after: $st" ;; *) bad "overlapping tunnel range not refused (exit $rc)" ;; esac
 
 	# GitHub's API unreachable on a re-run: the installed adblock-lean is kept
-	# (one FAIL in the report), and the router still blocks.
+	# (one FAIL in the report), and the router still blocks. The same run turns
+	# only the Telegram proxy off (the VPN and Telegram stay on).
+	# shellcheck disable=SC2034  # write_config reads the settings through eval
+	(. "$P/config.env"; TELEGRAM_PROXY=0; write_config "$P/config.env")
 	vm_ssh 'echo "0.0.0.0 api.github.com" >> /etc/hosts'
 	ONECLICK_PRIVATE=$P timeout 1500 "$W/setup.sh" 127.0.0.1 "$PORT" > "$W/full-nogh.log" 2>&1; rc=$?
 	vm_ssh 'sed -i "/api.github.com/d" /etc/hosts; /etc/init.d/dnsmasq restart >/dev/null 2>&1'
@@ -500,6 +504,11 @@ scenario_full() {
 	else
 		bad "GitHub unreachable: exit $rc; other FAILs: $other"; tail -8 "$W/full-nogh.log" | sed 's/^/        | /'
 	fi
+	left=$(vm_ssh 'pidof microsocks >/dev/null && echo running; apk info -e microsocks >/dev/null 2>&1 && echo package
+		[ -e /etc/config/microsocks ] && echo config; [ -e /etc/nftables.d/31-oneclick-telegram-proxy.nft ] && echo rules
+		echo "telegram-policies=$(uci show pbr | grep -c "telegram=.1.")"' | tr '\n' ' ')
+	[ "$left" = "telegram-policies=1 " ] && ok "Telegram proxy turned off (VPN still on): package, config with its password, rules and router policy removed; Telegram for devices stays" \
+		|| bad "Telegram proxy off (want 'telegram-policies=1'): $left"
 	counts=$(vm_ssh 'printf "%s %s %s %s %s %s %s %s %s\n" \
 		"$(uci show firewall | grep -c "name=.testvpn.")" \
 		"$(uci show firewall | grep -c "name=.Block-WireGuard-LAN.")" \

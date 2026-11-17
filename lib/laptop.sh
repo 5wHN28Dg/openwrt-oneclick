@@ -135,7 +135,9 @@ check_settings() {
 	if [ "${TELEGRAM_PROXY-}" = 1 ]; then
 		[ "${ENABLE_VPN-}" = 1 ] && [ "${TELEGRAM_VIA_VPN-}" = 1 ] || echo "TELEGRAM_PROXY needs ENABLE_VPN=1 and TELEGRAM_VIA_VPN=1"
 		case ${TELEGRAM_PROXY_PORT:-1080} in *[!0-9]*) echo "TELEGRAM_PROXY_PORT must be a number" ;; *)
-			[ "${TELEGRAM_PROXY_PORT:-1080}" -ge 1024 ] && [ "${TELEGRAM_PROXY_PORT:-1080}" -le 65535 ] || echo "TELEGRAM_PROXY_PORT must be 1024-65535" ;; esac
+			[ "${TELEGRAM_PROXY_PORT:-1080}" -ge 1024 ] && [ "${TELEGRAM_PROXY_PORT:-1080}" -le 65535 ] || echo "TELEGRAM_PROXY_PORT must be 1024-65535"
+			# ports the router already uses (dnsproxy, Redlib, ZeroTier, WireGuard, mDNS)
+			case ${TELEGRAM_PROXY_PORT:-1080} in 5353|5354|8080|8443|9993|51820) echo "TELEGRAM_PROXY_PORT ${TELEGRAM_PROXY_PORT} is used by the router already" ;; esac ;; esac
 		case ${TELEGRAM_PROXY_USER-} in ''|*[!A-Za-z0-9_-]*) echo "TELEGRAM_PROXY_USER must be letters, digits, _ or -" ;; esac
 		case ${TELEGRAM_PROXY_PASS-} in ''|*[!A-Za-z0-9]*) echo "TELEGRAM_PROXY_PASS must be letters and digits" ;; *)
 			[ ${#TELEGRAM_PROXY_PASS} -ge 16 ] || echo "TELEGRAM_PROXY_PASS must be at least 16 characters" ;; esac

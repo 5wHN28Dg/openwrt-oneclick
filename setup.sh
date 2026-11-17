@@ -382,8 +382,13 @@ fi
 if [ "${TELEGRAM_PROXY-}" = 1 ] && [ "${ENABLE_VPN-}" = 1 ] && [ "$rc" != 1 ]; then
 	say ""
 	say "Telegram proxy, set once in Telegram (Settings > Data and Storage > Proxy > Add proxy):"
-	say "  SOCKS5, server: the router (192.168.1.1, or its ZeroTier address away from home),"
-	say "  port ${TELEGRAM_PROXY_PORT:-1080}, username ${TELEGRAM_PROXY_USER-}, password: TELEGRAM_PROXY_PASS in $USED"
+	say "  SOCKS5, server: the router ($HOST; away from home its ZeroTier address, if ZeroTier is"
+	say "  in the router's lan zone), port ${TELEGRAM_PROXY_PORT:-1080}, username ${TELEGRAM_PROXY_USER-},"
+	if [ "$USED" = "$CONF" ]; then
+		say "  password: TELEGRAM_PROXY_PASS in $CONF"
+	else   # the settings weren't saved: this is the only place the password shows up
+		say "  password: ${TELEGRAM_PROXY_PASS-} (not saved anywhere else)"
+	fi
 fi
 
 case $rc in
