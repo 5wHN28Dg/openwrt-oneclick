@@ -131,7 +131,9 @@ pbr_errors > "$TMP.err0"
 i=0 new=''
 while [ $i -lt 10 ]; do
 	sleep 1; i=$((i + 1))
-	new=$(pbr_errors | grep -vxF -f "$TMP.err0")
+	pbr_errors > "$TMP.err1"
+	# (not grep -vxF -f: with no earlier errors BusyBox's grep would drop all)
+	new=$(awk 'FILENAME == ARGV[1] { old[$0] = 1; next } !($0 in old)' "$TMP.err0" "$TMP.err1")
 	[ -n "$new" ] && break
 done
 if [ -n "$new" ]; then

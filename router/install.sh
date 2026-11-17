@@ -1016,7 +1016,8 @@ if on "${FAMILY_FILTER:-0}"; then
 	check "family list: mangadex.org blocked" "blocked mangadex.org"
 	check "family allowlist: api.mangadex.org resolves" "[ -n \"\$(resolve api.mangadex.org)\" ]"
 	# An instance from the list itself (the list changes; a fixed name went stale).
-	ri=$(awk '/^# >>> redlib$/{s=1; next} /^# <<< redlib$/{s=0} s' /etc/adblock-lean/blocklist | grep -vxF -f /etc/redlib-block.allow | head -1)
+	ri=$(awk '/^# >>> redlib$/{s=1; next} /^# <<< redlib$/{s=0} s' /etc/adblock-lean/blocklist \
+		| awk 'FILENAME == ARGV[1] { allow[$0] = 1; next } !($0 in allow)' /etc/redlib-block.allow - | head -1)
 	if [ -n "$ri" ]; then check "Redlib: listed instance $ri blocked" "blocked $ri"
 	else fail "Redlib: no listed instance in the block list"; fi
 	for h in ${REDLIB_ALLOW-}; do check "Redlib: $h allowed" "[ -n \"\$(resolve \"\$h\")\" ]"; done

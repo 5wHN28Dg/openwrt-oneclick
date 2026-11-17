@@ -36,7 +36,8 @@ jsonfilter -i "$TMP.json" -e '@.instances[*].url' 2>/dev/null \
 [ -s "$TMP.hosts" ] || { logger -t redlib-block "list empty or unreadable, keeping previous list"; exit 1; }
 
 grep -vE '^[[:space:]]*(#|$)' "$ALLOW_FILE" 2>/dev/null | tr 'A-Z' 'a-z' | sort -u > "$TMP.allow"
-grep -vxF -f "$TMP.allow" "$TMP.hosts" > "$TMP.block"
+# (not grep -vxF -f: with an empty allow list BusyBox's grep drops every line)
+awk 'FILENAME == ARGV[1] { allow[$0] = 1; next } !($0 in allow)' "$TMP.allow" "$TMP.hosts" > "$TMP.block"
 
 changed=
 section "$BL" "$TMP.block" && changed=1

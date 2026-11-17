@@ -365,8 +365,10 @@ telegram_checks() {
 	# doesn't exist) puts the previous list back.
 	r=$(vm_ssh "u=http://10.0.2.2:$RPORT
 		p=\$(uci show pbr | sed -n \"s/^pbr\\.\\([^.]*\\)\\.telegram=.1.\$/\\1/p\"); before=\$(uci get pbr.\$p.dest_addr)
-		uci add pbr policy >/dev/null; uci set pbr.@policy[-1].name=rollback-test; uci set pbr.@policy[-1].telegram=1; uci set pbr.@policy[-1].interface=nosuchvpn; uci set pbr.@policy[-1].dest_addr=10.0.0.0/8; uci commit pbr
+		uci add pbr policy >/dev/null; uci set pbr.@policy[-1].name=rollback-test; uci set pbr.@policy[-1].interface=testvpn; uci set pbr.@policy[-1].dest_addr=bad_domain!; uci commit pbr
 		out=\$(TELEGRAM_CIDR_URL=\$u/tg-new.txt /usr/sbin/telegram-ranges 2>&1); echo \"\$out\" | grep -o 'put the previous one back'; echo rc=\$?; echo \"[\$out]\" | tr '\\n' ' '
+		echo \"errors-now=[\$(ubus call service list '{\"name\":\"pbr\"}' | jsonfilter -e '@.pbr.instances.main.data.errors[*]' | tr '\\n' ' ')]\"; sleep 20
+		echo \"errors-20s=[\$(ubus call service list '{\"name\":\"pbr\"}' | jsonfilter -e '@.pbr.instances.main.data.errors[*]' | tr '\\n' ' ')] delay=\$(uci -q get pbr.config.procd_reload_delay)\"; logread -e pbr | tail -4 | cut -c1-160 | tr '\\n' ' '
 		[ \"\$(uci get pbr.\$p.dest_addr)\" = \"\$before\" ] && echo restored
 		uci delete pbr.@policy[-1]; uci commit pbr; /etc/init.d/pbr reload >/dev/null 2>&1" 2>&1 | tr '\n' ' ')
 	case $r in *"put the previous one back rc=0 "*"restored "*) ok "Telegram list update: when pbr refuses it, the previous list comes back" ;;
@@ -419,6 +421,12 @@ scenario_full() {
 	proton_checks
 	redlib_checks
 	telegram_checks
+	# Family filtering with no Redlib instance allowed still blocks them all
+	# (BusyBox's grep -vxF -f dropped every line when the allow list was empty).
+	r=$(vm_ssh 'cp /etc/redlib-block.allow /tmp/allow.bak; : > /etc/redlib-block.allow; /usr/sbin/redlib-block
+		awk "/^# >>> redlib\$/{s=1;next} /^# <<< redlib\$/{s=0} s" /etc/adblock-lean/blocklist | grep -c .
+		cp /tmp/allow.bak /etc/redlib-block.allow; /usr/sbin/redlib-block' 2>&1 | tail -1)
+	[ "${r:-0}" -ge 1 ] 2>/dev/null && ok "Redlib block list with nothing allowed: $r instances blocked" || bad "Redlib block list with an empty allow list: $r"
 	r=$(ONECLICK_PRIVATE=$P "$W/kids.sh" 127.0.0.1 "$PORT" 2>&1)
 	case $r in *PASS*) ok "kids.sh: $r" ;; *) bad "kids.sh: $r" ;; esac
 	# A kid's device can't be given Redlib's address; the rules in place stay.
