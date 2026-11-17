@@ -1,0 +1,145 @@
+#!/bin/sh
+# Keeps the pbr policy that sends Telegram through the VPN complete: Telegram's
+# own list of address ranges plus its web domains, written into every pbr
+# policy marked telegram='1'. Runs daily from cron and from install.sh.
+# - A failed or odd download keeps the previous list; every range is checked
+#   strictly (one bad entry would stop pbr from loading any of its rules).
+# - pbr reloads only when the list changed; if the new list brings errors
+#   that pbr didn't have before, the previous list is put back.
+# - IPv6 ranges go into the policy only when pbr routes IPv6 (the VPN has
+#   IPv6). Otherwise they go into firewall rules marked telegram='1' that
+#   reject them from the LAN, so apps switch to IPv4 (through the VPN) at once
+#   instead of waiting on a blocked connection.
+#
+#   telegram-ranges               download and apply
+#   telegram-ranges LIST-FILE     apply a file instead (install.sh, tests)
+#   telegram-ranges --check FILE  only print the ranges that pass the checks
+# TELEGRAM_NO_RELOAD=1: write the settings only (install.sh restarts later).
+
+URL=${TELEGRAM_CIDR_URL:-https://core.telegram.org/resources/cidr.txt}   # tests: tests/vm.sh
+DOMAINS='t.me telegram.org telegram.me telegram.dog telesco.pe telegra.ph graph.org tdesktop.com fragment.com'
+TMP=/tmp/telegram-ranges.$$
+cleanup() { rm -f "$TMP".*; }
+trap cleanup EXIT
+say() { echo "telegram-ranges: $1"; logger -t telegram-ranges "$1" 2>/dev/null; }
+
+# Strict checks (FILE -> accepted ranges): IPv4 in canonical form (no empty or
+# zero-padded parts, each at most 255), starting on its prefix's boundary,
+# prefix 8-32; IPv6 with 1-4 hex digits per group, at most one "::", no lone
+# ":" at either end, 8 groups (fewer only with "::"), prefix 16-128. Prefixes
+# are plain numbers (nft reads "/024" as octal).
+check4() {
+	tr -d '\r' < "$1" | awk -F'/' '
+		NF == 2 && $2 ~ /^[1-9][0-9]?$/ && $2 >= 8 && $2 <= 32 {
+			if (split($1, o, ".") != 4) next
+			for (i = 1; i <= 4; i++) if (o[i] !~ /^(0|[1-9][0-9]?[0-9]?)$/ || o[i] > 255) next
+			ip = ((o[1] * 256 + o[2]) * 256 + o[3]) * 256 + o[4]
+			size = 1; for (k = $2; k < 32; k++) size *= 2   # no "^" or "%": BusyBox awk may lack math support
+			if (ip - int(ip / size) * size != 0) next
+			print
+		}' | sort -u
+}
+check6() {
+	tr -d '\r' < "$1" | awk -F'/' '
+		NF == 2 && $2 ~ /^[1-9][0-9]?[0-9]?$/ && $2 >= 16 && $2 <= 128 && $1 ~ /^[0-9a-fA-F:]+$/ && $1 !~ /:::/ {
+			if ($1 ~ /^:[^:]/ || $1 ~ /[^:]:$/) next
+			a = $1; d = gsub(/::/, "", a)
+			if (d > 1) next
+			n = split($1, g, ":"); used = 0
+			for (i = 1; i <= n; i++) {
+				if (g[i] == "") continue
+				if (length(g[i]) > 4) next
+				used++
+			}
+			if ((d == 0 && n != 8) || (d == 1 && used > 7)) next
+			print
+		}' | sort -u
+}
+if [ "${1-}" = --check ]; then check4 "$2"; check6 "$2"; exit 0; fi
+
+policies=$(uci -q show pbr | sed -n "s/^pbr\.\([^.]*\)\.telegram='1'$/\1/p")
+[ -n "$policies" ] || { say "no pbr policy marked telegram='1'"; exit 1; }
+
+# Where Telegram is blocked, so is telegram.org: fetch through the VPN (the
+# router's own traffic doesn't follow pbr's policies), directly as a fallback.
+iface=$(uci -q get "pbr.$(echo "$policies" | head -1).interface")
+if [ -n "${1-}" ]; then
+	cp "$1" "$TMP.raw" || exit 1
+elif ! { [ -n "$iface" ] && command -v curl >/dev/null \
+		&& curl -sf -m 30 --interface "$iface" -o "$TMP.raw" "$URL" 2>/dev/null; } \
+	&& ! curl -4 -sf -m 30 -o "$TMP.raw" "$URL" 2>/dev/null \
+	&& ! uclient-fetch -4 -q -T 30 -O "$TMP.raw" "$URL" 2>/dev/null; then
+	say "download failed (through ${iface:-the VPN} and directly), keeping the previous list"; exit 1
+fi
+check4 "$TMP.raw" > "$TMP.v4"
+check6 "$TMP.raw" > "$TMP.v6"
+# Telegram publishes about ten IPv4 ranges: far fewer means a broken download.
+[ "$(wc -l < "$TMP.v4")" -ge 3 ] || { say "the list has $(wc -l < "$TMP.v4") IPv4 ranges, keeping the previous one"; exit 1; }
+
+dest="$(tr '\n' ' ' < "$TMP.v4")"
+v6="$(tr '\n' ' ' < "$TMP.v6")"
+if [ "$(uci -q get pbr.config.ipv6_enabled)" = 1 ]; then
+	dest="$dest$v6" v6rule=''
+else
+	v6rule=${v6% }
+fi
+dest="$dest$DOMAINS"
+noreload=''; [ "${TELEGRAM_NO_RELOAD-}" = 1 ] && noreload=1
+
+# IPv6 that doesn't go through the VPN: rejected from the LAN; a rule without
+# ranges is switched off (with no address it would reject all IPv6).
+firewall_rules() {
+	fwchanged=''
+	for r in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.telegram='1'$/\1/p"); do
+		want=0; [ -n "$v6rule" ] && want=1
+		[ "$(uci -q get "firewall.$r.dest_ip")" = "$v6rule" ] && [ "$(uci -q get "firewall.$r.enabled")" = "$want" ] && continue
+		uci -q delete "firewall.$r.dest_ip"
+		for a in $v6rule; do uci add_list "firewall.$r.dest_ip=$a"; done
+		uci set "firewall.$r.enabled=$want"
+		fwchanged=1
+	done
+	[ -n "$fwchanged" ] || return 0
+	uci commit firewall
+	[ -n "$noreload" ] || fw4 reload >/dev/null 2>&1
+}
+pbr_errors() { # pbr's current errors, one per line, sorted
+	ubus call service list '{"name":"pbr"}' 2>/dev/null \
+		| jsonfilter -e '@.pbr.instances.main.data.errors[*]' 2>/dev/null | sort -u
+}
+
+changed='' : > "$TMP.prev"
+for p in $policies; do
+	prev=$(uci -q get "pbr.$p.dest_addr")
+	[ "$prev" = "$dest" ] && continue
+	echo "$p $prev" >> "$TMP.prev"
+	uci set "pbr.$p.dest_addr=$dest"; changed=1
+done
+if [ -z "$changed" ]; then
+	firewall_rules
+	say "unchanged: $(wc -l < "$TMP.v4") IPv4 ranges"; exit 0
+fi
+uci commit pbr
+if [ -n "$noreload" ] || ! /etc/init.d/pbr enabled; then
+	firewall_rules
+	say "updated: $(wc -l < "$TMP.v4") IPv4 ranges + domains"; exit 0
+fi
+# pbr installs its rules in one go and refuses all of them on a bad entry: if
+# the new list brings errors pbr didn't have before, the previous list goes
+# back (errors that were already there, from other policies, don't count).
+pbr_errors > "$TMP.err0"
+/etc/init.d/pbr reload >/dev/null 2>&1
+i=0 new=''
+while [ $i -lt 10 ]; do
+	sleep 1; i=$((i + 1))
+	pbr_errors > "$TMP.err1"
+	# (not grep -vxF -f: with no earlier errors BusyBox's grep would drop all)
+	new=$(awk 'FILENAME == ARGV[1] { old[$0] = 1; next } !($0 in old)' "$TMP.err0" "$TMP.err1")
+	[ -n "$new" ] && break
+done
+if [ -n "$new" ]; then
+	while read -r p prev; do uci set "pbr.$p.dest_addr=$prev"; done < "$TMP.prev"
+	uci commit pbr; /etc/init.d/pbr reload >/dev/null 2>&1
+	say "pbr refused the new list ($(echo "$new" | head -1)); put the previous one back"; exit 1
+fi
+firewall_rules
+say "updated: $(wc -l < "$TMP.v4") IPv4 ranges + $DOMAINS"

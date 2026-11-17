@@ -26,6 +26,19 @@ WAIT_DAYS=3
 TGZ=/tmp/redlib-update.tgz
 
 say() { echo "redlib-update: $1"; logger -t redlib-update "$1"; }
+fetch() { # URL FILE: three tries, connections to GitHub sometimes time out.
+	# curl (installed by the setup) first: uclient-fetch can't reach github.com
+	# on some networks where curl can.
+	for n in 1 2 3; do
+		if command -v curl >/dev/null; then
+			curl -sfL -m 120 -o "$2" "$1" 2>/dev/null && return 0
+		else
+			uclient-fetch -q -T 30 -O "$2" "$1" 2>/dev/null && return 0
+		fi
+		rm -f "$2"; [ $n -lt 3 ] && sleep 10
+	done
+	return 1
+}
 running() { # make sure it runs (and starts at boot)
 	[ -x $BIN ] || return 0
 	/etc/init.d/redlib enable
@@ -63,7 +76,8 @@ case $(uname -m) in
 	*) fail "no Redlib build for this CPU ($(uname -m))" ;;
 esac
 
-J=$(uclient-fetch -qO- "$API") || fail "can't reach GitHub"
+fetch "$API" /tmp/redlib-releases.json || fail "can't reach GitHub"
+J=$(cat /tmp/redlib-releases.json); rm -f /tmp/redlib-releases.json
 cutoff=$(( $(date +%s) - WAIT_DAYS * 86400 ))
 i=0 tag='' url='' sum=''
 while [ $i -lt 10 ]; do
@@ -88,7 +102,7 @@ fi
 # 11 MB unpacked: make sure the flash has room for it next to the old one.
 free_kb=$(df -k /overlay 2>/dev/null | awk 'NR == 2 { print $4 }')
 [ "${free_kb:-0}" -gt 16000 ] || fail "not enough flash space (${free_kb:-?} KB free, 16 MB needed)"
-uclient-fetch -qO "$TGZ" "$url" || fail "download of $tag failed"
+fetch "$url" "$TGZ" || fail "download of $tag failed"
 [ "$(sha256sum "$TGZ" | cut -d' ' -f1)" = "$sum" ] || fail "$tag does not match GitHub's SHA-256; not installed"
 tar -xzOf "$TGZ" redlib > $BIN.new || fail "could not unpack $tag"
 rm -f "$TGZ"

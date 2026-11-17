@@ -247,7 +247,7 @@ elif [ -e /etc/init.d/redlib ] || grep -q '^redlib:' /etc/passwd; then
 	sed -i '/^redlib:/d' /etc/passwd /etc/shadow /etc/group
 	for f in $REDLIB_FILES; do sed -i "\#^$f\$#d" /etc/sysupgrade.conf; done
 fi
-chmod 755 /usr/sbin/safesearch-hosts /usr/sbin/redlib-block
+chmod 755 /usr/sbin/safesearch-hosts /usr/sbin/redlib-block /usr/sbin/telegram-ranges
 
 # adblock-lean local lists: own entries + project sections
 section() { # NAME FILE -> marked section, if the file has entries
@@ -380,19 +380,31 @@ if [ -n "$VPN" ]; then
 	}
 	[ -n "${VPN_ROUTE_DOMAINS-}" ] && policy 'domains through VPN' "$VPN_ROUTE_DOMAINS"
 	[ -n "${VPN_ROUTE_SUBNETS-}" ] && policy 'IP ranges through VPN' "$VPN_ROUTE_SUBNETS"
+	# Telegram: its own list of ranges plus web domains, kept current daily by
+	# telegram-ranges (it fills every policy marked telegram=1). Starts from
+	# the copy in the repo, so it is complete even if the download fails.
+	if on "${TELEGRAM_VIA_VPN:-0}"; then
+		policy 'Telegram through VPN' 'telegram.org'
+		uci set pbr.@policy[-1].telegram=1
+	fi
 	uci commit pbr
-	[ -z "${VPN_ROUTE_DOMAINS-}${VPN_ROUTE_SUBNETS-}" ] && info "VPN set up, but no domains or ranges are routed through it"
+	[ -z "${VPN_ROUTE_DOMAINS-}${VPN_ROUTE_SUBNETS-}" ] && ! on "${TELEGRAM_VIA_VPN:-0}" && info "VPN set up, but no domains or ranges are routed through it"
 	# IPv6 to the VPN domains must not go around the VPN: route it through the
 	# VPN when the VPN has IPv6, otherwise answer their AAAA queries with ::
 	# (no address) so devices use IPv4, which pbr sends through the VPN.
+	TG_DOMAINS=''   # one list of Telegram's domains: the one in telegram-ranges
+	on "${TELEGRAM_VIA_VPN:-0}" && TG_DOMAINS=$(sed -n "s/^DOMAINS='\(.*\)'$/\1/p" /usr/sbin/telegram-ranges)
 	if echo "${WG_ADDRESSES-}" | grep -q ':'; then
 		uci set pbr.config.ipv6_enabled=1
 	else
 		uci set pbr.config.ipv6_enabled=0
-		for d in ${VPN_ROUTE_DOMAINS-}; do echo "/$d/::"; done > /etc/oneclick-vpn-aaaa
+		for d in ${VPN_ROUTE_DOMAINS-} $TG_DOMAINS; do echo "/$d/::"; done > /etc/oneclick-vpn-aaaa
 	fi
 	uci commit pbr
-	pass "WireGuard $VPN to ${PREV_HOST:-$WG_ENDPOINT_HOST}; PBR: ${VPN_ROUTE_DOMAINS:-no domains}${VPN_ROUTE_SUBNETS:+ + IP ranges}"
+	if on "${TELEGRAM_VIA_VPN:-0}"; then
+		TELEGRAM_NO_RELOAD=1 /usr/sbin/telegram-ranges "$ROUTER/lists/telegram-cidr.txt" >/dev/null || die "could not fill the Telegram policy"
+	fi
+	pass "WireGuard $VPN to ${PREV_HOST:-$WG_ENDPOINT_HOST}; PBR: ${VPN_ROUTE_DOMAINS:-no domains}${VPN_ROUTE_SUBNETS:+ + IP ranges}${TG_DOMAINS:+ + Telegram}"
 fi
 
 # Proton VPN server choice (proton-pick): session, settings; off = all removed.
@@ -569,6 +581,25 @@ if [ -n "$REDLIB" ]; then
 		set firewall.@redirect[-1].target='DNAT'
 	EOF
 fi
+# Telegram's IPv6 ranges, when the VPN has no IPv6: rejected from the LAN so
+# apps fall back to IPv4 (through the VPN) at once (telegram-ranges keeps
+# the list current).
+if [ -n "$VPN" ] && on "${TELEGRAM_VIA_VPN:-0}" && ! echo "${WG_ADDRESSES-}" | grep -q ':'; then
+	uci batch >/dev/null <<-EOF
+		add firewall rule
+		set firewall.@rule[-1].setup='1'
+		set firewall.@rule[-1].telegram='1'
+		set firewall.@rule[-1].name='Telegram-IPv6-not-through-VPN'
+		set firewall.@rule[-1].src='lan'
+		set firewall.@rule[-1].dest='wan'
+		set firewall.@rule[-1].family='ipv6'
+		set firewall.@rule[-1].proto='all'
+		set firewall.@rule[-1].target='REJECT'
+	EOF
+	# The same checks and order as telegram-ranges, so its next run finds nothing to change.
+	for a in $(/usr/sbin/telegram-ranges --check "$ROUTER/lists/telegram-cidr.txt" | grep ':'); do uci add_list "firewall.@rule[-1].dest_ip=$a"; done
+	uci set firewall.@rule[-1].enabled='1'
+fi
 uci commit firewall
 pass "software flow offloading (hardware offloading off: it bypasses SQM), DNS hijack${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo ', DoT and VPN-protocol blocks')}${VPN:+, $VPN zone}${REMOTE:+, remote access in the lan zone}"
 
@@ -675,7 +706,9 @@ fi
 # ---------------------------------------------------------------- jobs, upgrade persistence
 step "Scheduled jobs"
 touch /etc/crontabs/root
-sed -i '/safesearch-hosts\|redlib-block\|redlib-update\|proton-pick/d' /etc/crontabs/root
+sed -i '/safesearch-hosts\|redlib-block\|redlib-update\|proton-pick\|telegram-ranges/d' /etc/crontabs/root
+# Telegram's list, daily (the policy only exists with the VPN and the option on).
+[ -n "$VPN" ] && on "${TELEGRAM_VIA_VPN:-0}" && echo "20 4 * * * /usr/sbin/telegram-ranges" >> /etc/crontabs/root
 # Redlib updates at 03:40, apart from adblock-lean's 05:00 run (both need memory).
 [ -n "$REDLIB" ] && echo "40 3 * * * /usr/sbin/redlib-update" >> /etc/crontabs/root
 sed -i '/safesearch-hosts\|proton-pick/d' /etc/rc.local
@@ -698,7 +731,7 @@ done
 [ -f /etc/proton-pick.conf ] && for f in /usr/sbin/proton-pick /usr/share/proton-pick/ /etc/proton/ /etc/proton-pick.conf; do
 	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 done
-for f in /usr/sbin/safesearch-hosts /usr/sbin/redlib-block /etc/redlib-block.allow /etc/init.d/adblock-lean /usr/lib/adblock-lean/ /etc/adblock-lean/ /www/mangadex-safe/ /www/cgi-bin/md; do
+for f in /usr/sbin/safesearch-hosts /usr/sbin/redlib-block /usr/sbin/telegram-ranges /etc/redlib-block.allow /etc/init.d/adblock-lean /usr/lib/adblock-lean/ /etc/adblock-lean/ /www/mangadex-safe/ /www/cgi-bin/md; do
 	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 done
 pass "custom files kept across firmware upgrades${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo '; safe search every 30 min, Redlib list daily 04:50')}"
@@ -922,6 +955,13 @@ fi
 /etc/init.d/banip enable; /etc/init.d/banip restart >/dev/null 2>&1
 if [ -n "$VPN" ]; then
 	/etc/init.d/pbr enable; /etc/init.d/pbr restart >/dev/null 2>&1
+	if on "${TELEGRAM_VIA_VPN:-0}"; then
+		if r=$(/usr/sbin/telegram-ranges 2>&1); then
+			pass "Telegram through $VPN: Telegram's own list ($(echo "$r" | sed -n 's/.*: \([0-9]*\) IPv4 ranges.*/\1/p') ranges) and its web domains, refreshed daily 04:20"
+		else
+			info "Telegram through $VPN: list not updated (${r#telegram-ranges: }); the copy from the setup is in use, tried again daily 04:20"
+		fi
+	fi
 	if [ -f /etc/proton-pick.conf ] && [ -f /etc/proton/session ]; then
 		rm -f /tmp/proton/loads   # a PASS below must come from this refresh
 		/usr/sbin/proton-pick refresh >/dev/null 2>&1
@@ -976,7 +1016,8 @@ if on "${FAMILY_FILTER:-0}"; then
 	check "family list: mangadex.org blocked" "blocked mangadex.org"
 	check "family allowlist: api.mangadex.org resolves" "[ -n \"\$(resolve api.mangadex.org)\" ]"
 	# An instance from the list itself (the list changes; a fixed name went stale).
-	ri=$(awk '/^# >>> redlib$/{s=1; next} /^# <<< redlib$/{s=0} s' /etc/adblock-lean/blocklist | grep -vxF -f /etc/redlib-block.allow | head -1)
+	ri=$(awk '/^# >>> redlib$/{s=1; next} /^# <<< redlib$/{s=0} s' /etc/adblock-lean/blocklist \
+		| awk 'FILENAME == ARGV[1] { allow[$0] = 1; next } !($0 in allow)' /etc/redlib-block.allow - | head -1)
 	if [ -n "$ri" ]; then check "Redlib: listed instance $ri blocked" "blocked $ri"
 	else fail "Redlib: no listed instance in the block list"; fi
 	for h in ${REDLIB_ALLOW-}; do check "Redlib: $h allowed" "[ -n \"\$(resolve \"\$h\")\" ]"; done
@@ -1010,6 +1051,8 @@ if [ -n "$VPN" ]; then
 	i=0; while [ $i -lt 10 ] && [ "$(wg show "$VPN" latest-handshakes 2>/dev/null | awk '{print $2}')" = 0 ]; do sleep 3; i=$((i + 1)); done
 	check "VPN WireGuard handshake" "[ \"\$(wg show $VPN latest-handshakes | awk '{print \$2}')\" -gt 0 ]"
 	check "PBR active (no errors, $VPN gateway)" "pbr_ok"
+	on "${TELEGRAM_VIA_VPN:-0}" && check "Telegram's ranges routed through $VPN (149.154.160.0/20 in pbr)" \
+		"nft list chain inet fw4 pbr_prerouting | grep -q '149.154.160.0/20.*Telegram through VPN'"
 fi
 if [ -n "$REMOTE" ]; then
 	check "remote access: WireGuard listens on UDP $REMOTE_PORT" "[ \"\$(wg show remote listen-port)\" = $REMOTE_PORT ]"

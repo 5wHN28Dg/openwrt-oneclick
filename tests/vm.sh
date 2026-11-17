@@ -109,6 +109,11 @@ rel too-new.json 1 "$zeros" v9.9.9 redlib.tgz
 rel bad-sum.json 10 "$zeros" v9.9.9 redlib.tgz
 rel silent.json 10 "$fake" v9.9.9 fake.tgz
 rel silent-too.json 10 "$fake" v9.9.8 fake.tgz
+# Stand-ins for Telegram's list: an error page, and a list with one new range
+# and lines that aren't ranges.
+printf '<html><body>Service unavailable</body></html>\n' > "$W/rel/tg-junk.txt"
+cp "$HERE/router/lists/telegram-cidr.txt" "$W/rel/tg-repo.txt"
+{ cat "$HERE/router/lists/telegram-cidr.txt"; printf '203.0.113.0/24\n300.1.1.0/24\ngarbage\n'; } > "$W/rel/tg-new.txt"
 python3 -I -m http.server -b 127.0.0.1 -d "$W/rel" "$RPORT" >/dev/null 2>&1 & RPID=$!
 sleep 1
 kill -0 "$RPID" 2>/dev/null || { RPID=''; echo "release list stand-in did not start (port $RPORT in use?)"; exit 1; }
@@ -129,7 +134,7 @@ make_private() { # dir full|minimal
 			ENABLE_VPN=1 VPN_IFACE=testvpn WG_PRIVATE_KEY=$(wgkey) WG_PEER_PUBLIC_KEY=$(wgkey)
 			WG_ADDRESSES=10.66.0.2/32 WG_DNS=10.66.0.1 WG_ENDPOINT_HOST=192.0.2.1 WG_ENDPOINT_PORT=51820
 			WG_ALLOWED_IPS="0.0.0.0/0 ::/0" WG_KEEPALIVE=25
-			VPN_ROUTE_DOMAINS="example.com" VPN_ROUTE_SUBNETS="198.51.100.0/24"
+			VPN_ROUTE_DOMAINS="example.com" VPN_ROUTE_SUBNETS="198.51.100.0/24" TELEGRAM_VIA_VPN=1
 			PROTON_AUTO=1 PROTON_COUNTRIES="PL CH" PROTON_API=http://10.0.2.2:$XPORT
 			ENABLE_MANGADEX=1 ENABLE_REDLIB=1
 			ENABLE_REMOTE=1 REMOTE_HOST='' REMOTE_PORT=51820 REMOTE_NET=10.77.0.0/24
@@ -329,6 +334,47 @@ redlib_checks() {
 		*) bad "Redlib update without a working version to compare: $r" ;; esac
 }
 
+# Telegram through the VPN: the policy holds Telegram's ranges and pbr routes
+# them; a broken download changes nothing; a new list is taken over without
+# its junk lines; the repo's list puts it back.
+telegram_checks() {
+	r=$(vm_ssh 'p=$(uci show pbr | sed -n "s/^pbr\.\([^.]*\)\.telegram=.1.$/\1/p"); echo "policies=$(echo $p | wc -w)"
+		uci get pbr.$p.dest_addr | tr " " "\n" | grep -c "/" | sed "s/^/ranges=/"
+		uci get pbr.$p.dest_addr | grep -q "t.me telegram.org" && echo domains
+		nft list chain inet fw4 pbr_prerouting | grep -q "149.154.160.0/20" && echo routed
+		grep -c telegram-ranges /etc/crontabs/root | sed "s/^/cron=/"' | tr '\n' ' ')
+	case $r in "policies=1 ranges=9 domains routed cron=1 ") ok "Telegram: its 9 ranges and web domains routed through the VPN, refreshed daily" ;;
+		*) bad "Telegram policy (want 'policies=1 ranges=9 domains routed cron=1'): $r" ;; esac
+	r=$(vm_ssh "u=http://10.0.2.2:$RPORT
+		p=\$(uci show pbr | sed -n \"s/^pbr\\.\\([^.]*\\)\\.telegram=.1.\$/\\1/p\"); before=\$(uci get pbr.\$p.dest_addr)
+		TELEGRAM_CIDR_URL=\$u/tg-junk.txt /usr/sbin/telegram-ranges >/dev/null 2>&1; echo junk-rc=\$?
+		[ \"\$(uci get pbr.\$p.dest_addr)\" = \"\$before\" ] && echo junk-kept
+		TELEGRAM_CIDR_URL=\$u/tg-new.txt /usr/sbin/telegram-ranges >/dev/null 2>&1; echo new-rc=\$?
+		d=\$(uci get pbr.\$p.dest_addr); case \" \$d \" in *' 203.0.113.0/24 '*) echo new-range ;; esac
+		case \" \$d \" in *300.1.1*|*garbage*) echo junk-taken ;; esac
+		sleep 3; nft list chain inet fw4 pbr_prerouting | grep -q 203.0.113 && echo new-routed
+		uclient-fetch -qO /tmp/tg-list.txt \$u/tg-repo.txt && /usr/sbin/telegram-ranges /tmp/tg-list.txt >/dev/null 2>&1; echo back-rc=\$?; rm -f /tmp/tg-list.txt" 2>&1 | tr '\n' ' ')
+	case $r in "junk-rc=1 junk-kept new-rc=0 new-range new-routed back-rc=0 ") ok "Telegram list update: an error page changes nothing; a new range is taken over (and routed), junk lines are not" ;;
+		*) bad "Telegram list update (want 'junk-rc=1 junk-kept new-rc=0 new-range new-routed back-rc=0'): $r" ;; esac
+	# The VPN has no IPv6: Telegram's IPv6 ranges are rejected from the LAN.
+	r=$(vm_ssh 'r=$(uci show firewall | sed -n "s/^firewall\.\([^.]*\)\.telegram=.1.$/\1/p"); echo "rules=$(echo $r | wc -w) enabled=$(uci -q get firewall.$r.enabled)"
+		nft list ruleset | grep "Telegram-IPv6-not-through-VPN" | grep -q "ip6 daddr .*2001:b28:f2" && echo rejected' | tr '\n' ' ')
+	case $r in "rules=1 enabled=1 rejected "|"rules=1 enabled= rejected ") ok "Telegram IPv6 (the VPN has none) is rejected from the LAN" ;;
+		*) bad "Telegram IPv6 reject rule: $r" ;; esac
+	# pbr refusing the new list (here: a second Telegram policy whose interface
+	# doesn't exist) puts the previous list back.
+	r=$(vm_ssh "u=http://10.0.2.2:$RPORT
+		p=\$(uci show pbr | sed -n \"s/^pbr\\.\\([^.]*\\)\\.telegram=.1.\$/\\1/p\"); before=\$(uci get pbr.\$p.dest_addr)
+		uci add pbr policy >/dev/null; uci set pbr.@policy[-1].name=rollback-test; uci set pbr.@policy[-1].interface=testvpn; uci set pbr.@policy[-1].dest_addr=bad_domain!; uci commit pbr
+		out=\$(TELEGRAM_CIDR_URL=\$u/tg-new.txt /usr/sbin/telegram-ranges 2>&1); echo \"\$out\" | grep -o 'put the previous one back'; echo rc=\$?; echo \"[\$out]\" | tr '\\n' ' '
+		echo \"errors-now=[\$(ubus call service list '{\"name\":\"pbr\"}' | jsonfilter -e '@.pbr.instances.main.data.errors[*]' | tr '\\n' ' ')]\"; sleep 20
+		echo \"errors-20s=[\$(ubus call service list '{\"name\":\"pbr\"}' | jsonfilter -e '@.pbr.instances.main.data.errors[*]' | tr '\\n' ' ')] delay=\$(uci -q get pbr.config.procd_reload_delay)\"; logread -e pbr | tail -4 | cut -c1-160 | tr '\\n' ' '
+		[ \"\$(uci get pbr.\$p.dest_addr)\" = \"\$before\" ] && echo restored
+		uci delete pbr.@policy[-1]; uci commit pbr; /etc/init.d/pbr reload >/dev/null 2>&1" 2>&1 | tr '\n' ' ')
+	case $r in *"put the previous one back rc=0 "*"restored "*) ok "Telegram list update: when pbr refuses it, the previous list comes back" ;;
+		*) bad "Telegram rollback when pbr refuses the list: $r" ;; esac
+}
+
 scenario_full() {
 	echo "== full: every option on"
 	start_vm; P=$W/p-full; make_private "$P" full
@@ -374,6 +420,13 @@ scenario_full() {
 		|| bad "remote access through the tunnel (want 'dns=192.168.1.1 served own-list-blocks'): $r"
 	proton_checks
 	redlib_checks
+	telegram_checks
+	# Family filtering with no Redlib instance allowed still blocks them all
+	# (BusyBox's grep -vxF -f dropped every line when the allow list was empty).
+	r=$(vm_ssh 'cp /etc/redlib-block.allow /tmp/allow.bak; : > /etc/redlib-block.allow; /usr/sbin/redlib-block
+		awk "/^# >>> redlib\$/{s=1;next} /^# <<< redlib\$/{s=0} s" /etc/adblock-lean/blocklist | grep -c .
+		cp /tmp/allow.bak /etc/redlib-block.allow; /usr/sbin/redlib-block' 2>&1 | tail -1)
+	[ "${r:-0}" -ge 1 ] 2>/dev/null && ok "Redlib block list with nothing allowed: $r instances blocked" || bad "Redlib block list with an empty allow list: $r"
 	r=$(ONECLICK_PRIVATE=$P "$W/kids.sh" 127.0.0.1 "$PORT" 2>&1)
 	case $r in *PASS*) ok "kids.sh: $r" ;; *) bad "kids.sh: $r" ;; esac
 	# A kid's device can't be given Redlib's address; the rules in place stay.
@@ -394,6 +447,8 @@ scenario_full() {
 	vm_ssh 'uci set firewall.@defaults[0].flow_offloading_hw=1; uci commit firewall'
 	printf "PROTON_UID='uid-test'\nPROTON_REFRESH='refresh-0'\n" > "$P/proton-session"   # an old copy
 	run_setup "$P" "$W/full-rerun.log"
+	r=$(vm_ssh 'uci show pbr | grep -c "telegram=.1."; grep -c telegram-ranges /etc/crontabs/root' | tr '\n' ' ')
+	[ "$r" = "1 1 " ] && ok "re-run: one Telegram policy, one daily job" || bad "re-run Telegram duplicates (policy cron): $r"
 	r=$(vm_ssh 'uci -q get firewall.@defaults[0].flow_offloading; uci -q get firewall.@defaults[0].flow_offloading_hw' | tr '\n' ' ')
 	[ "$r" = "1 0 " ] && ok "flow offloading: software on, hardware off" || bad "flow offloading (software hardware): $r"
 	proton_rerun_checks
@@ -472,6 +527,8 @@ scenario_full() {
 	VM_KEY=$W/key2   # the router now only knows the new key
 	left=$(vm_ssh 'uci show network | grep -c testvpn; uci show firewall | grep -c "name=.testvpn."; uci -q get dhcp.@dnsmasq[0].address | grep -c "::"' | tr '\n' ' ')
 	[ "$left" = "0 0 0 " ] && ok "VPN turned off: interface, zone and IPv6 suppression removed" || bad "VPN leftovers (network firewall aaaa): $left"
+	left=$(vm_ssh 'uci show pbr | grep -c "telegram=.1."; grep -c telegram-ranges /etc/crontabs/root' | tr '\n' ' ')
+	[ "$left" = "0 0 " ] && ok "VPN turned off: Telegram policy and its daily job removed" || bad "Telegram leftovers (policy cron): $left"
 	left=$(vm_ssh 'pidof redlib >/dev/null && echo process
 		for f in /usr/sbin/redlib /usr/sbin/redlib-update /etc/init.d/redlib /etc/redlib.conf /etc/redlib.version /etc/nftables.d/30-oneclick-redlib-dns.nft; do [ -e $f ] && echo $f; done
 		grep -q "^redlib:" /etc/passwd /etc/group /etc/shadow && echo user

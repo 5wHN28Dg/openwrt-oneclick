@@ -73,6 +73,24 @@ else
 	echo "skip  refused speed test (needs python3 and curl)"
 fi
 
+# --- Telegram's list: only ranges nft reads as meant pass (router/files/usr/sbin/telegram-ranges)
+printf '%s\n' 91.108.56.0/22 149.154.160.0/20 2001:b28:f23d::/48 2a0a:f280::/32 1:2:3:4:5:6:7:8/128 > "$T/tg-good"
+printf '%s\n' 1..3.4/24 .1.2.3/24 1.2.3./24 01.2.3.4/24 256.1.1.1/24 1.2.3.4/33 1.2.3.4/4 1.2.3.0/024 1.2.3.4/8 \
+	'::::/999' fffff::/48 2001:db8::1::/64 1:2:3:4:5:6:7/64 2001:db8::/129 ':::/64' :1:2:3:4:5:6:7/64 \
+	1:2:3:4:5:6:7:/64 1::2:/64 ::1:/64 1::/016 '<html>' > "$T/tg-bad"
+cat "$T/tg-good" "$T/tg-bad" > "$T/tg-all"
+want="149.154.160.0/20 91.108.56.0/22 1:2:3:4:5:6:7:8/128 2001:b28:f23d::/48 2a0a:f280::/32 "
+eq "Telegram ranges: only good ones pass" "$(sh "$HERE/router/files/usr/sbin/telegram-ranges" --check "$T/tg-all" | tr '\n' ' ')" "$want"
+# The router's awk is BusyBox's: the same, with only BusyBox's tools on PATH.
+if BB=$(command -v busybox); then
+	mkdir -p "$T/bb"; for c in awk sort tr cat rm sh; do ln -sf "$BB" "$T/bb/$c"; done
+	eq "Telegram ranges (BusyBox): only good ones pass" "$(PATH="$T/bb" "$BB" sh "$HERE/router/files/usr/sbin/telegram-ranges" --check "$T/tg-all" | tr '\n' ' ')" "$want"
+else
+	echo "skip  Telegram range checks with BusyBox (not installed)"
+fi
+eq "Telegram ranges: the repo's copy passes whole" "$(sh "$HERE/router/files/usr/sbin/telegram-ranges" --check "$HERE/router/lists/telegram-cidr.txt" | wc -l | tr -d ' ')" \
+	"$(grep -c . "$HERE/router/lists/telegram-cidr.txt")"
+
 # --- quoting and the settings file -------------------------------------------
 nasty="it's \"q\" \$HOME \`id\` back\\slash
 second line"
@@ -129,12 +147,12 @@ export HOME="$T/home"; mkdir -p "$HOME/.ssh"
 P1=$T/priv1
 # Wi-Fi name, Wi-Fi password x2, admin password x2, SSH key path, create key?,
 # time zone, PPPoE?, PPPoE user, PPPoE password x2, link type number,
-# family filtering?, Redlib allow, VPN?, wg path, VPN iface, domains, subnets,
+# family filtering?, Redlib allow, VPN?, wg path, VPN iface, domains, subnets, Telegram?,
 # Proton picks the server?, Proton countries, MangaDex?, Redlib?, remote access?, public name, port, devices,
 # create settings? (first) / save? (last)
 printf '%s\n' y "Home Net" "pa'ss word1" "pa'ss word1" adminpw adminpw "$HOME/.ssh/test_key" y \
 	Europe/Berlin "" y "user@isp" ppppass ppppass 7 y "safereddit.com" y "$T/proton.conf" protonvpn \
-	"archive.org newegg.com" "91.108.4.0/22" y "pl ch" y y y home.example.org "" "phone tablet" y \
+	"archive.org newegg.com" "91.108.4.0/22" y y "pl ch" y y y home.example.org "" "phone tablet" y \
 	| ONECLICK_PRIVATE=$P1 "$HERE/setup.sh" --settings-only >"$T/w1.out" 2>&1
 eq "wizard (all on) exit" "$?" 0
 eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config.env")" 600
@@ -158,6 +176,7 @@ eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config
 	eq "w1 mangadex" "$ENABLE_MANGADEX" 1
 	eq "w1 redlib" "$ENABLE_REDLIB" 1
 	eq "w1 Proton server choice" "$PROTON_AUTO|$PROTON_COUNTRIES" "1|PL CH"
+	eq "w1 Telegram through the VPN" "$TELEGRAM_VIA_VPN" 1
 	PROTON_COUNTRIES='PL; reboot'; eq "bad Proton countries rejected" "$(check_settings | grep -c PROTON_COUNTRIES)" 1
 	PROTON_COUNTRIES=PL PROTON_API='ftp://x'; eq "bad Proton API rejected" "$(check_settings | grep -c PROTON_API)" 1
 	PROTON_API='http://10.0.2.2:1'; eq "plain-http Proton API rejected outside tests" "$(check_settings | grep -c PROTON_API)" 1
@@ -185,6 +204,7 @@ eq "wizard (all off) exit" "$?" 0
 	eq "w2 vpn off" "$ENABLE_VPN" 0
 	eq "w2 mangadex off" "$ENABLE_MANGADEX" 0
 	eq "w2 redlib off" "$ENABLE_REDLIB" 0
+	eq "w2 VPN off: Telegram off" "$TELEGRAM_VIA_VPN" 0
 	eq "w2 remote off" "$ENABLE_REMOTE|${REMOTE_PEERS-}" "0|"
 ) | tee "$T/w2.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/w2.res"))); n=$((n + $(wc -l < "$T/w2.res")))
