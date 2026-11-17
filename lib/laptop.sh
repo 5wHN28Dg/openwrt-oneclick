@@ -8,6 +8,7 @@ TZ_NAME TZ_POSIX WAN_PROTO PPPOE_USER PPPOE_PASS LINK_TYPE SQM_DOWN SQM_UP SQM_F
 FAMILY_FILTER ADBLOCK_EXTRA_LISTS BANIP_FEEDS REDLIB_ALLOW
 ENABLE_VPN VPN_IFACE WG_PRIVATE_KEY WG_ADDRESSES WG_DNS WG_PEER_PUBLIC_KEY WG_PRESHARED_KEY
 WG_ENDPOINT_HOST WG_ENDPOINT_PORT WG_ALLOWED_IPS WG_KEEPALIVE VPN_ROUTE_DOMAINS VPN_ROUTE_SUBNETS TELEGRAM_VIA_VPN
+TELEGRAM_PROXY TELEGRAM_PROXY_PORT TELEGRAM_PROXY_USER TELEGRAM_PROXY_PASS
 PROTON_AUTO PROTON_COUNTRIES PROTON_API
 ENABLE_MANGADEX ENABLE_REDLIB ULA_PREFIX
 ENABLE_REMOTE REMOTE_HOST REMOTE_PORT REMOTE_NET REMOTE_SERVER_KEY REMOTE_PEERS'
@@ -130,6 +131,14 @@ check_settings() {
 	if [ -n "${SQM_DOWN-}${SQM_UP-}" ]; then
 		case ${SQM_DOWN:-x}${SQM_UP:-x} in *[!0-9]*|?????????????????*) echo "SQM_DOWN and SQM_UP must both be set (kbit/s), or both empty to measure the line" ;; *)
 			[ "$SQM_DOWN" -ge 100 ] && [ "$SQM_UP" -ge 100 ] || echo "SQM_DOWN and SQM_UP are in kbit/s and must be at least 100" ;; esac
+	fi
+	if [ "${TELEGRAM_PROXY-}" = 1 ]; then
+		[ "${ENABLE_VPN-}" = 1 ] && [ "${TELEGRAM_VIA_VPN-}" = 1 ] || echo "TELEGRAM_PROXY needs ENABLE_VPN=1 and TELEGRAM_VIA_VPN=1"
+		case ${TELEGRAM_PROXY_PORT:-1080} in *[!0-9]*) echo "TELEGRAM_PROXY_PORT must be a number" ;; *)
+			[ "${TELEGRAM_PROXY_PORT:-1080}" -ge 1024 ] && [ "${TELEGRAM_PROXY_PORT:-1080}" -le 65535 ] || echo "TELEGRAM_PROXY_PORT must be 1024-65535" ;; esac
+		case ${TELEGRAM_PROXY_USER-} in ''|*[!A-Za-z0-9_-]*) echo "TELEGRAM_PROXY_USER must be letters, digits, _ or -" ;; esac
+		case ${TELEGRAM_PROXY_PASS-} in ''|*[!A-Za-z0-9]*) echo "TELEGRAM_PROXY_PASS must be letters and digits" ;; *)
+			[ ${#TELEGRAM_PROXY_PASS} -ge 16 ] || echo "TELEGRAM_PROXY_PASS must be at least 16 characters" ;; esac
 	fi
 	case ${SPEEDTEST_URL-} in ''|http://?*|https://?*) ;; *) echo "SPEEDTEST_URL must start with http:// or https://" ;; esac
 	case ${SPEEDTEST_URL-} in *[!A-Za-z0-9.:/_-]*) echo "SPEEDTEST_URL has unexpected characters" ;; esac

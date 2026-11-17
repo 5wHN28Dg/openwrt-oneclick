@@ -99,6 +99,9 @@ PACKAGES="luci luci-ssl luci-app-attendedsysupgrade owut luci-app-banip luci-app
 	dnsmasq-full dnsproxy curl gawk sed coreutils-sort"
 [ -n "$VPN$REMOTE" ] && PACKAGES="$PACKAGES luci-proto-wireguard"
 [ -n "$VPN" ] && PACKAGES="$PACKAGES luci-app-pbr"
+# Telegram proxy for phones (SOCKS5, 7 KB): only with Telegram through the VPN.
+TG_PROXY=''; [ -n "$VPN" ] && on "${TELEGRAM_VIA_VPN:-0}" && on "${TELEGRAM_PROXY:-0}" && TG_PROXY=1
+[ -n "$TG_PROXY" ] && PACKAGES="$PACKAGES microsocks"
 [ "${WAN_PROTO:-dhcp}" = pppoe ] && PACKAGES="$PACKAGES ppp-mod-pppoe luci-proto-ppp"
 
 # Copy files only: never apply directory modes to system directories like /etc.
@@ -387,6 +390,13 @@ if [ -n "$VPN" ]; then
 		policy 'Telegram through VPN' 'telegram.org'
 		uci set pbr.@policy[-1].telegram=1
 	fi
+	# The proxy's connections start on the router itself, which the policy
+	# above doesn't cover: the same list for the router's own traffic.
+	if [ -n "$TG_PROXY" ]; then
+		policy 'Telegram from the router (proxy)' 'telegram.org'
+		uci set pbr.@policy[-1].telegram=1
+		uci set pbr.@policy[-1].chain=output
+	fi
 	uci commit pbr
 	[ -z "${VPN_ROUTE_DOMAINS-}${VPN_ROUTE_SUBNETS-}" ] && ! on "${TELEGRAM_VIA_VPN:-0}" && info "VPN set up, but no domains or ranges are routed through it"
 	# IPv6 to the VPN domains must not go around the VPN: route it through the
@@ -402,9 +412,34 @@ if [ -n "$VPN" ]; then
 	fi
 	uci commit pbr
 	if on "${TELEGRAM_VIA_VPN:-0}"; then
+		# telegram-ranges writes the proxy's allow list into this file when it exists.
+		if [ -n "$TG_PROXY" ]; then : > /etc/nftables.d/31-oneclick-telegram-proxy.nft; fi
 		TELEGRAM_NO_RELOAD=1 /usr/sbin/telegram-ranges "$ROUTER/lists/telegram-cidr.txt" >/dev/null || die "could not fill the Telegram policy"
 	fi
 	pass "WireGuard $VPN to ${PREV_HOST:-$WG_ENDPOINT_HOST}; PBR: ${VPN_ROUTE_DOMAINS:-no domains}${VPN_ROUTE_SUBNETS:+ + IP ranges}${TG_DOMAINS:+ + Telegram}"
+fi
+
+# ---------------------------------------------------------------- Telegram proxy
+# SOCKS5 with a password, for phones: at home and through ZeroTier. Listens on
+# every address, but the firewall only lets the LAN zone (and ZeroTier in it)
+# reach the router; telegram-ranges keeps its user to Telegram's addresses.
+TG_PROXY_NFT=/etc/nftables.d/31-oneclick-telegram-proxy.nft
+if [ -n "$TG_PROXY" ]; then
+	uci batch >/dev/null <<-EOF
+		set microsocks.config.enabled='1'
+		set microsocks.config.listenip='0.0.0.0'
+		set microsocks.config.port='${TELEGRAM_PROXY_PORT:-1080}'
+		set microsocks.config.user='$TELEGRAM_PROXY_USER'
+		set microsocks.config.password='$TELEGRAM_PROXY_PASS'
+		set microsocks.config.bindaddr=''
+		set microsocks.config.auth_once='0'
+		set microsocks.config.quiet='1'
+	EOF
+	uci commit microsocks
+elif [ -x /etc/init.d/microsocks ] || [ -f "$TG_PROXY_NFT" ]; then   # turned off since an earlier run
+	/etc/init.d/microsocks stop >/dev/null 2>&1; /etc/init.d/microsocks disable >/dev/null 2>&1
+	rm -f "$TG_PROXY_NFT"; sed -i "\#^$TG_PROXY_NFT\$#d" /etc/sysupgrade.conf
+	if [ $PKG = apk ]; then apk del microsocks >/dev/null 2>&1; else opkg remove microsocks >/dev/null 2>&1; fi
 fi
 
 # Proton VPN server choice (proton-pick): session, settings; off = all removed.
@@ -962,6 +997,11 @@ if [ -n "$VPN" ]; then
 			info "Telegram through $VPN: list not updated (${r#telegram-ranges: }); the copy from the setup is in use, tried again daily 04:20"
 		fi
 	fi
+	if [ -n "$TG_PROXY" ]; then
+		/etc/init.d/microsocks enable; /etc/init.d/microsocks restart >/dev/null 2>&1
+		grep -qxF "$TG_PROXY_NFT" /etc/sysupgrade.conf || echo "$TG_PROXY_NFT" >> /etc/sysupgrade.conf
+		pass "Telegram proxy: SOCKS5 on $LAN_IP port ${TELEGRAM_PROXY_PORT:-1080} (and the router's ZeroTier address), Telegram only, through $VPN"
+	fi
 	if [ -f /etc/proton-pick.conf ] && [ -f /etc/proton/session ]; then
 		rm -f /tmp/proton/loads   # a PASS below must come from this refresh
 		/usr/sbin/proton-pick refresh >/dev/null 2>&1
@@ -1051,6 +1091,18 @@ if [ -n "$VPN" ]; then
 	i=0; while [ $i -lt 10 ] && [ "$(wg show "$VPN" latest-handshakes 2>/dev/null | awk '{print $2}')" = 0 ]; do sleep 3; i=$((i + 1)); done
 	check "VPN WireGuard handshake" "[ \"\$(wg show $VPN latest-handshakes | awk '{print \$2}')\" -gt 0 ]"
 	check "PBR active (no errors, $VPN gateway)" "pbr_ok"
+	if [ -n "$TG_PROXY" ]; then
+		px="socks5h://$TELEGRAM_PROXY_USER:$TELEGRAM_PROXY_PASS@127.0.0.1:${TELEGRAM_PROXY_PORT:-1080}"
+		mpid=$(pidof microsocks)
+		check "Telegram proxy runs as its own user" "[ -n '$mpid' ] && [ \"\$(awk '/^Uid:/ { print \$2 }' /proc/$mpid/status)\" = \"\$(id -u microsocks)\" ]"
+		check "Telegram proxy refuses other addresses (1.1.1.1)" "! curl -s -m 8 -o /dev/null -x '$px' http://1.1.1.1/"
+		check "Telegram proxy refuses a wrong password" "! curl -s -m 8 -o /dev/null -x 'socks5h://$TELEGRAM_PROXY_USER:wrong@127.0.0.1:${TELEGRAM_PROXY_PORT:-1080}' https://core.telegram.org/"
+		if curl -s -m 20 -o /dev/null -x "$px" https://core.telegram.org/resources/cidr.txt; then
+			info "Telegram proxy reaches Telegram (through $VPN)"
+		else
+			info "Telegram proxy could not reach Telegram right now (is $VPN up?)"
+		fi
+	fi
 	on "${TELEGRAM_VIA_VPN:-0}" && check "Telegram's ranges routed through $VPN (149.154.160.0/20 in pbr)" \
 		"nft list chain inet fw4 pbr_prerouting | grep -q '149.154.160.0/20.*Telegram through VPN'"
 fi

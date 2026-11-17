@@ -113,6 +113,7 @@ rel silent-too.json 10 "$fake" v9.9.8 fake.tgz
 # and lines that aren't ranges.
 printf '<html><body>Service unavailable</body></html>\n' > "$W/rel/tg-junk.txt"
 cp "$HERE/router/lists/telegram-cidr.txt" "$W/rel/tg-repo.txt"
+{ cat "$HERE/router/lists/telegram-cidr.txt"; echo 10.0.2.0/24; } > "$W/rel/tg-plus-test.txt"
 { cat "$HERE/router/lists/telegram-cidr.txt"; printf '203.0.113.0/24\n300.1.1.0/24\ngarbage\n'; } > "$W/rel/tg-new.txt"
 python3 -I -m http.server -b 127.0.0.1 -d "$W/rel" "$RPORT" >/dev/null 2>&1 & RPID=$!
 sleep 1
@@ -135,6 +136,7 @@ make_private() { # dir full|minimal
 			WG_ADDRESSES=10.66.0.2/32 WG_DNS=10.66.0.1 WG_ENDPOINT_HOST=192.0.2.1 WG_ENDPOINT_PORT=51820
 			WG_ALLOWED_IPS="0.0.0.0/0 ::/0" WG_KEEPALIVE=25
 			VPN_ROUTE_DOMAINS="example.com" VPN_ROUTE_SUBNETS="198.51.100.0/24" TELEGRAM_VIA_VPN=1
+			TELEGRAM_PROXY=1 TELEGRAM_PROXY_PORT=1080 TELEGRAM_PROXY_USER=telegram TELEGRAM_PROXY_PASS=0123456789abcdef01234567
 			PROTON_AUTO=1 PROTON_COUNTRIES="PL CH" PROTON_API=http://10.0.2.2:$XPORT
 			ENABLE_MANGADEX=1 ENABLE_REDLIB=1
 			ENABLE_REMOTE=1 REMOTE_HOST='' REMOTE_PORT=51820 REMOTE_NET=10.77.0.0/24
@@ -375,6 +377,28 @@ telegram_checks() {
 		*) bad "Telegram rollback when pbr refuses the list: $r" ;; esac
 }
 
+# Telegram proxy, from a LAN device: it reaches only Telegram's addresses.
+# The test VPN is a dead tunnel, so for a moment pbr is stopped and the test
+# server's network (10.0.2.0/24) is put on the list: then the proxy reaches
+# it, while an address not on the list (10.0.2.3, the VM's DNS, is on it;
+# 192.0.2.1 is not) is refused; then everything goes back.
+telegram_proxy_checks() {
+	r=$(vm_ssh "u=http://10.0.2.2:$RPORT; px=socks5h://telegram:0123456789abcdef01234567@192.168.1.1:1080
+		ip link add veth2 type veth peer name veth3; ip link set veth2 master br-lan up
+		ip netns add pc; ip link set veth3 netns pc; ip -n pc link set lo up; ip -n pc link set veth3 up; ip -n pc addr add 192.168.1.61/24 dev veth3
+		/etc/init.d/pbr stop >/dev/null 2>&1
+		uclient-fetch -qO /tmp/tg-plus.txt \$u/tg-plus-test.txt && TELEGRAM_NO_RELOAD=1 /usr/sbin/telegram-ranges /tmp/tg-plus.txt >/dev/null 2>&1; fw4 reload >/dev/null 2>&1
+		ip netns exec pc curl -s -m 10 -o /dev/null -x \$px \$u/tg-repo.txt && echo listed-reached
+		ip netns exec pc curl -s -m 10 -o /dev/null -x \$px http://192.0.2.1/ || echo unlisted-refused
+		ip netns exec pc curl -s -m 10 -o /dev/null -x socks5h://telegram:wrong@192.168.1.1:1080 \$u/tg-repo.txt || echo wrong-password-refused
+		uclient-fetch -qO /tmp/tg-repo.txt \$u/tg-repo.txt && TELEGRAM_NO_RELOAD=1 /usr/sbin/telegram-ranges /tmp/tg-repo.txt >/dev/null 2>&1; fw4 reload >/dev/null 2>&1
+		ip netns exec pc curl -s -m 10 -o /dev/null -x \$px \$u/tg-repo.txt || echo unlisted-again
+		/etc/init.d/pbr start >/dev/null 2>&1; ip netns del pc; ip link del veth2 2>/dev/null; rm -f /tmp/tg-plus.txt /tmp/tg-repo.txt" 2>&1 | tr '\n' ' ')
+	case $r in "listed-reached unlisted-refused wrong-password-refused unlisted-again ")
+		ok "Telegram proxy (from a LAN device): reaches only addresses on Telegram's list, needs the password" ;;
+		*) bad "Telegram proxy (want 'listed-reached unlisted-refused wrong-password-refused unlisted-again'): $r" ;; esac
+}
+
 scenario_full() {
 	echo "== full: every option on"
 	start_vm; P=$W/p-full; make_private "$P" full
@@ -421,6 +445,7 @@ scenario_full() {
 	proton_checks
 	redlib_checks
 	telegram_checks
+	telegram_proxy_checks
 	# Family filtering with no Redlib instance allowed still blocks them all
 	# (BusyBox's grep -vxF -f dropped every line when the allow list was empty).
 	r=$(vm_ssh 'cp /etc/redlib-block.allow /tmp/allow.bak; : > /etc/redlib-block.allow; /usr/sbin/redlib-block
@@ -529,6 +554,9 @@ scenario_full() {
 	[ "$left" = "0 0 0 " ] && ok "VPN turned off: interface, zone and IPv6 suppression removed" || bad "VPN leftovers (network firewall aaaa): $left"
 	left=$(vm_ssh 'uci show pbr | grep -c "telegram=.1."; grep -c telegram-ranges /etc/crontabs/root' | tr '\n' ' ')
 	[ "$left" = "0 0 " ] && ok "VPN turned off: Telegram policy and its daily job removed" || bad "Telegram leftovers (policy cron): $left"
+	left=$(vm_ssh 'pidof microsocks >/dev/null && echo running; apk info -e microsocks >/dev/null 2>&1 && echo package
+		[ -e /etc/nftables.d/31-oneclick-telegram-proxy.nft ] && echo rules; uci show pbr | grep -q "chain=.output." && echo policy; true' | tr '\n' ' ')
+	[ -z "$left" ] && ok "VPN turned off: Telegram proxy, its rules and policy removed" || bad "Telegram proxy leftovers: $left"
 	left=$(vm_ssh 'pidof redlib >/dev/null && echo process
 		for f in /usr/sbin/redlib /usr/sbin/redlib-update /etc/init.d/redlib /etc/redlib.conf /etc/redlib.version /etc/nftables.d/30-oneclick-redlib-dns.nft; do [ -e $f ] && echo $f; done
 		grep -q "^redlib:" /etc/passwd /etc/group /etc/shadow && echo user
@@ -578,6 +606,7 @@ scenario_minimal() {
 		grep -q "nsfw" /etc/adblock-lean/config && echo "nsfw list"
 		uci -q get network.remote >/dev/null && echo "remote interface"
 		[ -e /etc/init.d/redlib ] && echo "redlib"
+		apk info -e microsocks >/dev/null 2>&1 && echo "microsocks"
 		apk info -e bind-dig >/dev/null 2>&1 && echo "bind-dig"
 		apk info -e openssl-util >/dev/null 2>&1 && echo "openssl-util"
 		true')
