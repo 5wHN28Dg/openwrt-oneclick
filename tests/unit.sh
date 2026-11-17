@@ -129,12 +129,12 @@ export HOME="$T/home"; mkdir -p "$HOME/.ssh"
 P1=$T/priv1
 # Wi-Fi name, Wi-Fi password x2, admin password x2, SSH key path, create key?,
 # time zone, PPPoE?, PPPoE user, PPPoE password x2, link type number,
-# family filtering?, Redlib allow, VPN?, wg path, VPN iface, domains, subnets,
+# family filtering?, Redlib allow, VPN?, wg path, VPN iface, domains, subnets, Telegram?,
 # Proton picks the server?, Proton countries, MangaDex?, Redlib?, remote access?, public name, port, devices,
 # create settings? (first) / save? (last)
 printf '%s\n' y "Home Net" "pa'ss word1" "pa'ss word1" adminpw adminpw "$HOME/.ssh/test_key" y \
 	Europe/Berlin "" y "user@isp" ppppass ppppass 7 y "safereddit.com" y "$T/proton.conf" protonvpn \
-	"archive.org newegg.com" "91.108.4.0/22" y "pl ch" y y y home.example.org "" "phone tablet" y \
+	"archive.org newegg.com" "91.108.4.0/22" y y "pl ch" y y y home.example.org "" "phone tablet" y \
 	| ONECLICK_PRIVATE=$P1 "$HERE/setup.sh" --settings-only >"$T/w1.out" 2>&1
 eq "wizard (all on) exit" "$?" 0
 eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config.env")" 600
@@ -158,6 +158,7 @@ eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config
 	eq "w1 mangadex" "$ENABLE_MANGADEX" 1
 	eq "w1 redlib" "$ENABLE_REDLIB" 1
 	eq "w1 Proton server choice" "$PROTON_AUTO|$PROTON_COUNTRIES" "1|PL CH"
+	eq "w1 Telegram through the VPN" "$TELEGRAM_VIA_VPN" 1
 	PROTON_COUNTRIES='PL; reboot'; eq "bad Proton countries rejected" "$(check_settings | grep -c PROTON_COUNTRIES)" 1
 	PROTON_COUNTRIES=PL PROTON_API='ftp://x'; eq "bad Proton API rejected" "$(check_settings | grep -c PROTON_API)" 1
 	PROTON_API='http://10.0.2.2:1'; eq "plain-http Proton API rejected outside tests" "$(check_settings | grep -c PROTON_API)" 1
@@ -185,6 +186,7 @@ eq "wizard (all off) exit" "$?" 0
 	eq "w2 vpn off" "$ENABLE_VPN" 0
 	eq "w2 mangadex off" "$ENABLE_MANGADEX" 0
 	eq "w2 redlib off" "$ENABLE_REDLIB" 0
+	eq "w2 VPN off: Telegram off" "$TELEGRAM_VIA_VPN" 0
 	eq "w2 remote off" "$ENABLE_REMOTE|${REMOTE_PEERS-}" "0|"
 ) | tee "$T/w2.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/w2.res"))); n=$((n + $(wc -l < "$T/w2.res")))

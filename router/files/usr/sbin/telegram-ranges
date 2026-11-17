@@ -1,0 +1,52 @@
+#!/bin/sh
+# Keeps the pbr policy that sends Telegram through the VPN complete: Telegram's
+# own list of address ranges plus its web domains, written into every pbr
+# policy marked telegram='1'. Runs daily from cron and from install.sh.
+# A failed or odd download keeps the previous list; pbr reloads only when the
+# list changed (flash wear, and a reload briefly rebuilds the routing rules).
+# IPv6 ranges are used only when pbr routes IPv6 (the VPN has IPv6).
+#   telegram-ranges [LIST-FILE]   (a file instead of the download: install.sh's
+#                                  starting list and the tests)
+
+URL=${TELEGRAM_CIDR_URL:-https://core.telegram.org/resources/cidr.txt}   # tests: tests/vm.sh
+DOMAINS='t.me telegram.org telegram.me telesco.pe telegra.ph'
+TMP=/tmp/telegram-ranges.$$
+cleanup() { rm -f "$TMP".*; }
+trap cleanup EXIT
+say() { echo "telegram-ranges: $1"; logger -t telegram-ranges "$1"; }
+
+policies=$(uci -q show pbr | sed -n "s/^pbr\.\([^.]*\)\.telegram='1'$/\1/p")
+[ -n "$policies" ] || { say "no pbr policy marked telegram='1'"; exit 1; }
+
+# Where Telegram is blocked, so is telegram.org: fetch through the VPN (the
+# router's own traffic doesn't follow pbr's policies), directly as a fallback.
+iface=$(uci -q get "pbr.$(echo "$policies" | head -1).interface")
+if [ -n "${1-}" ]; then
+	cp "$1" "$TMP.raw" || exit 1
+elif ! { [ -n "$iface" ] && command -v curl >/dev/null \
+		&& curl -sf -m 30 --interface "$iface" -o "$TMP.raw" "$URL" 2>/dev/null; } \
+	&& ! uclient-fetch -q -T 30 -O "$TMP.raw" "$URL" 2>/dev/null; then
+	say "download failed (through ${iface:-the VPN} and directly), keeping the previous list"; exit 1
+fi
+# Only well-formed ranges; anything else (an error page, junk) is dropped.
+tr -d '\r' < "$TMP.raw" | awk -F'[./]' 'NF == 5 && $0 ~ /^[0-9.]+\/[0-9]+$/ && $1 < 256 && $2 < 256 && $3 < 256 && $4 < 256 && $5 >= 8 && $5 <= 32' | sort -u > "$TMP.v4"
+tr -d '\r' < "$TMP.raw" | grep -E '^[0-9a-fA-F:]+::?[0-9a-fA-F:]*/[0-9]{1,3}$' | sort -u > "$TMP.v6"
+# Telegram publishes about ten IPv4 ranges: far fewer means a broken download.
+[ "$(wc -l < "$TMP.v4")" -ge 3 ] || { say "the list has $(wc -l < "$TMP.v4") IPv4 ranges, keeping the previous one"; exit 1; }
+
+dest="$(tr '\n' ' ' < "$TMP.v4")"
+[ "$(uci -q get pbr.config.ipv6_enabled)" = 1 ] && dest="$dest$(tr '\n' ' ' < "$TMP.v6")"
+dest="$dest$DOMAINS"
+
+changed=''
+for p in $policies; do
+	[ "$(uci -q get "pbr.$p.dest_addr")" = "$dest" ] && continue
+	uci set "pbr.$p.dest_addr=$dest"; changed=1
+done
+if [ -n "$changed" ]; then
+	uci commit pbr
+	/etc/init.d/pbr enabled && /etc/init.d/pbr reload >/dev/null 2>&1
+	say "updated: $(wc -l < "$TMP.v4") IPv4 ranges + $DOMAINS"
+else
+	say "unchanged: $(wc -l < "$TMP.v4") IPv4 ranges"
+fi

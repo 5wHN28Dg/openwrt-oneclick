@@ -107,6 +107,11 @@ wizard() {
 		ask VPN_IFACE "Name for the VPN interface" "${VPN_IFACE:-vpn}"
 		ask VPN_ROUTE_DOMAINS "Domains to send through the VPN, space separated" "${VPN_ROUTE_DOMAINS-}"
 		ask VPN_ROUTE_SUBNETS "IP ranges to send through the VPN, space separated (optional)" "${VPN_ROUTE_SUBNETS-}"
+		if ask_yn "Send Telegram through the VPN (Telegram's own address list, kept current daily)?" "$(yn "${TELEGRAM_VIA_VPN:-0}")"; then
+			TELEGRAM_VIA_VPN=1
+		else
+			TELEGRAM_VIA_VPN=0
+		fi
 		say "Proton VPN only: the router can keep the tunnel on a working, fast server by itself"
 		say "(checks every 5 minutes, needs a one-time ./proton-login.sh)."
 		if ask_yn "Is this Proton VPN, and should the router pick the server?" "$(yn "${PROTON_AUTO:-0}")"; then
@@ -117,7 +122,7 @@ wizard() {
 			PROTON_AUTO=0
 		fi
 	else
-		ENABLE_VPN=0 PROTON_AUTO=0
+		ENABLE_VPN=0 PROTON_AUTO=0 TELEGRAM_VIA_VPN=0
 	fi
 	if ask_yn "Install the MangaDex safe-mode reader (opens at http://manga.lan)?" "$(yn "${ENABLE_MANGADEX:-0}")"; then
 		ENABLE_MANGADEX=1
