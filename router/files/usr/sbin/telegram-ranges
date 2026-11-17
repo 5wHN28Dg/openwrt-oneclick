@@ -105,9 +105,11 @@ firewall_rules() {
 	uci commit firewall
 	[ -n "$noreload" ] || fw4 reload >/dev/null 2>&1
 }
-# The proxy's user (microsocks) may reach only Telegram's IPv4 ranges (and
-# the router itself, for DNS): a leaked password can't turn it into a way
-# around the family filter. Status 0 if the file changed.
+# The proxy's user (microsocks) may open connections only to Telegram's IPv4
+# ranges (and the router itself, for DNS): a leaked password can't turn it
+# into a way around the family filter. Only new connections are checked: its
+# replies to the phones that connected to it must go through.
+# Status 0 if the file changed.
 PROXY_NFT=/etc/nftables.d/31-oneclick-telegram-proxy.nft
 proxy_rules() {
 	[ -f "$PROXY_NFT" ] || return 1
@@ -122,8 +124,8 @@ proxy_rules() {
 		echo "}"
 		echo "chain oneclick_telegram_proxy {"
 		echo "	type filter hook output priority filter - 1; policy accept;"
-		echo "	meta skuid $uid oifname != \"lo\" ip daddr != @oneclick_telegram4 counter reject"
-		echo "	meta skuid $uid oifname != \"lo\" meta nfproto ipv6 counter reject"
+		echo "	meta skuid $uid ct state new oifname != \"lo\" ip daddr != @oneclick_telegram4 counter reject"
+		echo "	meta skuid $uid ct state new oifname != \"lo\" meta nfproto ipv6 counter reject"
 		echo "}"
 	} > "$PROXY_NFT.tmp"
 	if cmp -s "$PROXY_NFT.tmp" "$PROXY_NFT"; then rm -f "$PROXY_NFT.tmp"; return 1; fi
