@@ -14,7 +14,9 @@
 #   oneclick-after-upgrade mark    note this firmware as done (install.sh)
 #
 # The firmware it last ran on is in /etc/oneclick-firmware, left out of
-# /etc/sysupgrade.conf on purpose: a new firmware starts without it.
+# /etc/sysupgrade.conf on purpose: a new firmware starts without it. (An
+# upgrade that keeps every changed file, sysupgrade -c, keeps it too; the
+# firmware's revision differs, so it still runs.)
 
 MARK=/etc/oneclick-firmware
 say() { echo "oneclick-after-upgrade: $1"; logger -t oneclick-after-upgrade "$1" 2>/dev/null; }

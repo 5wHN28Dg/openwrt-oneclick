@@ -761,6 +761,8 @@ sed -i '/safesearch-hosts\|proton-pick\|oneclick-after-upgrade/d' /etc/rc.local
 # Redlib on again (see the script). Does nothing on other boots.
 sed -i 's|^exit 0$|(sleep 60; /usr/sbin/oneclick-after-upgrade boot) \&\nexit 0|' /etc/rc.local
 /usr/sbin/oneclick-after-upgrade mark
+grep -q 'oneclick-after-upgrade boot' /etc/rc.local \
+	|| fail "/etc/rc.local has no 'exit 0' line: after a firmware upgrade, adblock-lean and Redlib stay off until their nightly jobs"
 if [ -f /etc/proton-pick.conf ]; then
 	echo "*/5 * * * * /usr/sbin/proton-pick check" >> /etc/crontabs/root
 	echo "17 4 * * * /usr/sbin/proton-pick refresh" >> /etc/crontabs/root
@@ -773,14 +775,14 @@ if on "${FAMILY_FILTER:-0}"; then
 	sed -i 's|^exit 0$|(sleep 30; /usr/sbin/safesearch-hosts) \&\nexit 0|' /etc/rc.local
 fi
 # Not the Redlib program (11 MB in every upgrade backup): the updater
-# reinstalls it the night after a firmware upgrade.
+# (oneclick-after-upgrade) reinstalls it after a firmware upgrade.
 [ -n "$REDLIB" ] && for f in $REDLIB_FILES; do
 	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 done
 [ -f /etc/proton-pick.conf ] && for f in /usr/sbin/proton-pick /usr/share/proton-pick/ /etc/proton/ /etc/proton-pick.conf; do
 	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 done
-for f in /usr/sbin/safesearch-hosts /etc/safesearch/google.domains /usr/sbin/redlib-block /usr/sbin/telegram-ranges /usr/sbin/oneclick-after-upgrade /etc/redlib-block.allow /etc/init.d/adblock-lean /usr/lib/adblock-lean/ /etc/adblock-lean/ /www/mangadex-safe/ /www/cgi-bin/md; do
+for f in /usr/sbin/safesearch-hosts /etc/safesearch/google.domains /usr/sbin/redlib-block /usr/sbin/telegram-ranges /usr/sbin/oneclick-after-upgrade /etc/oneclick-vpn-aaaa.applied /etc/redlib-block.allow /etc/init.d/adblock-lean /usr/lib/adblock-lean/ /etc/adblock-lean/ /www/mangadex-safe/ /www/cgi-bin/md; do
 	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 done
 pass "custom files kept across firmware upgrades${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo '; safe search every 30 min, Redlib list daily 04:50')}"

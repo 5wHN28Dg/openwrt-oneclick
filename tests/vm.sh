@@ -419,9 +419,10 @@ telegram_proxy_checks() {
 upgrade_checks() {
 	r=$(vm_ssh 'sysupgrade -l > /tmp/keep
 		for f in /usr/sbin/oneclick-after-upgrade /etc/safesearch/google.domains /etc/init.d/adblock-lean /etc/init.d/redlib \
-			/usr/sbin/redlib-update /usr/sbin/telegram-ranges /etc/rc.local $(find /etc/adblock-lean /usr/lib/adblock-lean /www/mangadex-safe /www/cgi-bin/md -type f); do
+			/usr/sbin/redlib-update /usr/sbin/telegram-ranges /etc/rc.local /etc/oneclick-vpn-aaaa.applied $(find /etc/adblock-lean /usr/lib/adblock-lean /www/mangadex-safe /www/cgi-bin/md -type f); do
 			grep -qxF "$f" /tmp/keep || echo "not-kept:$f"
 		done
+		grep -qxF /etc/oneclick-firmware /tmp/keep && echo mark-kept
 		grep -c "oneclick-after-upgrade boot" /etc/rc.local' 2>&1 | tr '\n' ' ')
 	[ "$r" = "1 " ] && ok "firmware upgrade: the backup keeps the setup's files; rc.local starts the after-upgrade fixes" \
 		|| bad "firmware upgrade keep list (want '1'): $r"
@@ -439,7 +440,7 @@ upgrade_checks() {
 		sleep 10; i=$((i + 1))
 	done
 	[ "$r" = "redirect adblock redlib marked " ] && ok "firmware upgrade (simulated): after the reboot manga.lan redirect, adblock-lean and Redlib are back" \
-		|| bad "after the simulated upgrade (want 'redirect adblock redlib marked'): $r"
+		|| bad "after the simulated upgrade (want 'redirect adblock redlib marked'; Redlib comes from GitHub, whose API allows 60 calls an hour): $r"
 	# On later boots of the same firmware it changes nothing: adblock-lean
 	# switched off by hand stays off.
 	r=$(vm_ssh '/etc/init.d/adblock-lean disable; /usr/sbin/oneclick-after-upgrade boot; /etc/init.d/adblock-lean enabled && echo re-enabled
