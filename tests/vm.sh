@@ -390,7 +390,10 @@ telegram_proxy_checks() {
 		t() { ip netns exec pc curl -s -m 6 -o /dev/null -x \$1 \$2; echo \"\$3=\$?\"; }
 		w() { i=0; until ip route show table pbr_testvpn 2>/dev/null | grep -q default || [ \$i -ge 30 ]; do sleep 1; i=\$((i + 1)); done; sleep 2; }
 		w   # pbr may still be rebuilding its tables after the checks before
-		t \$px http://149.154.167.99/ telegram
+		rj() { nft list chain inet fw4 oneclick_telegram_proxy | sed -n 's/.*packets \([0-9]*\).*reject.*/\1/p'; }
+		# (the dead test VPN may make pbr refuse it itself: what counts is that
+		# the proxy's own rules let it through)
+		r0=\$(rj); ip netns exec pc curl -s -m 6 -o /dev/null -x \$px http://149.154.167.99/; [ \"\$(rj)\" = \"\$r0\" ] && echo telegram-let-through
 		d0=\$(nft list chain inet fw4 oneclick_telegram_proxy_vpn | sed -n 's/.*packets \([0-9]*\).*/\1/p')
 		/etc/init.d/pbr stop >/dev/null 2>&1; t \$px http://149.154.167.99/ telegram-without-vpn
 		[ \"\$(nft list chain inet fw4 oneclick_telegram_proxy_vpn | sed -n 's/.*packets \([0-9]*\).*/\1/p')\" -gt \"\$d0\" ] && echo dropped-outside-vpn
@@ -400,7 +403,7 @@ telegram_proxy_checks() {
 		t \$px http://192.168.1.1/ router-web
 		t socks5h://telegram:wrong@192.168.1.1:1080 http://149.154.167.99/ wrong-password
 		ip netns del pc" 2>&1 | tr '\n' ' ')
-	want="telegram=28 telegram-without-vpn=28 dropped-outside-vpn other=97 router-dns=97 router-web=97 wrong-password=97 "
+	want="telegram-let-through telegram-without-vpn=28 dropped-outside-vpn other=97 router-dns=97 router-web=97 wrong-password=97 "
 	if [ "$r" = "$want" ]; then ok "Telegram proxy (from a LAN device): only Telegram, only through the VPN, only with the password"
 	else
 		bad "Telegram proxy (want '$want'): $r"
