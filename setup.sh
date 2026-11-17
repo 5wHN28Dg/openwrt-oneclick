@@ -109,8 +109,19 @@ wizard() {
 		ask VPN_ROUTE_SUBNETS "IP ranges to send through the VPN, space separated (optional)" "${VPN_ROUTE_SUBNETS-}"
 		if ask_yn "Send Telegram through the VPN (Telegram's own address list, kept current daily)?" "$(yn "${TELEGRAM_VIA_VPN:-0}")"; then
 			TELEGRAM_VIA_VPN=1
+			say "  A Telegram proxy on the router lets phones use this too: at home, and away"
+			say "  through ZeroTier (set once in Telegram: Settings > Data and Storage > Proxy)."
+			if ask_yn "Run a Telegram proxy on the router?" "$(yn "${TELEGRAM_PROXY:-0}")"; then
+				TELEGRAM_PROXY=1 TELEGRAM_PROXY_PORT=${TELEGRAM_PROXY_PORT:-1080} TELEGRAM_PROXY_USER=${TELEGRAM_PROXY_USER:-telegram}
+				if [ -z "${TELEGRAM_PROXY_PASS-}" ]; then
+					OPENSSL=$(find_openssl) || { say "Need OpenSSL 1.1.1+ to make the proxy password (macOS: brew install openssl@3)."; exit 1; }
+					TELEGRAM_PROXY_PASS=$("$OPENSSL" rand -hex 12)
+				fi
+			else
+				TELEGRAM_PROXY=0
+			fi
 		else
-			TELEGRAM_VIA_VPN=0
+			TELEGRAM_VIA_VPN=0 TELEGRAM_PROXY=0
 		fi
 		say "Proton VPN only: the router can keep the tunnel on a working, fast server by itself"
 		say "(checks every 5 minutes, needs a one-time ./proton-login.sh)."
@@ -122,7 +133,7 @@ wizard() {
 			PROTON_AUTO=0
 		fi
 	else
-		ENABLE_VPN=0 PROTON_AUTO=0 TELEGRAM_VIA_VPN=0
+		ENABLE_VPN=0 PROTON_AUTO=0 TELEGRAM_VIA_VPN=0 TELEGRAM_PROXY=0
 	fi
 	if ask_yn "Install the MangaDex safe-mode reader (opens at http://manga.lan)?" "$(yn "${ENABLE_MANGADEX:-0}")"; then
 		ENABLE_MANGADEX=1
@@ -365,6 +376,18 @@ if [ -n "$SENT_SESSION" ]; then
 		say "The router now holds the Proton session (removed the laptop copy)."
 	else
 		say "The router did not take the Proton session; the laptop copy stays for the next run."
+	fi
+fi
+
+if [ "${TELEGRAM_PROXY-}" = 1 ] && [ "${ENABLE_VPN-}" = 1 ] && [ "$rc" != 1 ]; then
+	say ""
+	say "Telegram proxy, set once in Telegram (Settings > Data and Storage > Proxy > Add proxy):"
+	say "  SOCKS5, server: the router ($HOST; away from home its ZeroTier address, if ZeroTier is"
+	say "  in the router's lan zone), port ${TELEGRAM_PROXY_PORT:-1080}, username ${TELEGRAM_PROXY_USER-},"
+	if [ "$USED" = "$CONF" ]; then
+		say "  password: TELEGRAM_PROXY_PASS in $CONF"
+	else   # the settings weren't saved: this is the only place the password shows up
+		say "  password: ${TELEGRAM_PROXY_PASS-} (not saved anywhere else)"
 	fi
 fi
 

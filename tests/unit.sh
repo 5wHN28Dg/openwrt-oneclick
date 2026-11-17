@@ -147,12 +147,12 @@ export HOME="$T/home"; mkdir -p "$HOME/.ssh"
 P1=$T/priv1
 # Wi-Fi name, Wi-Fi password x2, admin password x2, SSH key path, create key?,
 # time zone, PPPoE?, PPPoE user, PPPoE password x2, link type number,
-# family filtering?, Redlib allow, VPN?, wg path, VPN iface, domains, subnets, Telegram?,
+# family filtering?, Redlib allow, VPN?, wg path, VPN iface, domains, subnets, Telegram?, Telegram proxy?,
 # Proton picks the server?, Proton countries, MangaDex?, Redlib?, remote access?, public name, port, devices,
 # create settings? (first) / save? (last)
 printf '%s\n' y "Home Net" "pa'ss word1" "pa'ss word1" adminpw adminpw "$HOME/.ssh/test_key" y \
 	Europe/Berlin "" y "user@isp" ppppass ppppass 7 y "safereddit.com" y "$T/proton.conf" protonvpn \
-	"archive.org newegg.com" "91.108.4.0/22" y y "pl ch" y y y home.example.org "" "phone tablet" y \
+	"archive.org newegg.com" "91.108.4.0/22" y y y "pl ch" y y y home.example.org "" "phone tablet" y \
 	| ONECLICK_PRIVATE=$P1 "$HERE/setup.sh" --settings-only >"$T/w1.out" 2>&1
 eq "wizard (all on) exit" "$?" 0
 eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config.env")" 600
@@ -177,6 +177,8 @@ eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config
 	eq "w1 redlib" "$ENABLE_REDLIB" 1
 	eq "w1 Proton server choice" "$PROTON_AUTO|$PROTON_COUNTRIES" "1|PL CH"
 	eq "w1 Telegram through the VPN" "$TELEGRAM_VIA_VPN" 1
+	eq "w1 Telegram proxy" "$TELEGRAM_PROXY|$TELEGRAM_PROXY_PORT|$TELEGRAM_PROXY_USER|${#TELEGRAM_PROXY_PASS}" "1|1080|telegram|24"
+	eq "w1 settings valid" "$(check_settings)" ""
 	PROTON_COUNTRIES='PL; reboot'; eq "bad Proton countries rejected" "$(check_settings | grep -c PROTON_COUNTRIES)" 1
 	PROTON_COUNTRIES=PL PROTON_API='ftp://x'; eq "bad Proton API rejected" "$(check_settings | grep -c PROTON_API)" 1
 	PROTON_API='http://10.0.2.2:1'; eq "plain-http Proton API rejected outside tests" "$(check_settings | grep -c PROTON_API)" 1
@@ -204,7 +206,7 @@ eq "wizard (all off) exit" "$?" 0
 	eq "w2 vpn off" "$ENABLE_VPN" 0
 	eq "w2 mangadex off" "$ENABLE_MANGADEX" 0
 	eq "w2 redlib off" "$ENABLE_REDLIB" 0
-	eq "w2 VPN off: Telegram off" "$TELEGRAM_VIA_VPN" 0
+	eq "w2 VPN off: Telegram off" "$TELEGRAM_VIA_VPN|$TELEGRAM_PROXY" "0|0"
 	eq "w2 remote off" "$ENABLE_REMOTE|${REMOTE_PEERS-}" "0|"
 ) | tee "$T/w2.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/w2.res"))); n=$((n + $(wc -l < "$T/w2.res")))
@@ -379,6 +381,15 @@ $(printf '%s\n' "$REMOTE_PEERS" | head -1)"; eq "repeated remote device rejected
 	REMOTE_PEERS=; eq "remote on without devices rejected" "$(check_settings | grep -c REMOTE_PEERS)" 1
 	VPN_IFACE=remote; eq "VPN_IFACE 'remote' rejected" "$(check_settings | grep -c VPN_IFACE)" 1
 	VPN_IFACE=redlib; eq "VPN_IFACE 'redlib' rejected" "$(check_settings | grep -c VPN_IFACE)" 1
+	VPN_IFACE=protonvpn
+	TELEGRAM_PROXY=1 TELEGRAM_VIA_VPN=1 TELEGRAM_PROXY_USER=telegram TELEGRAM_PROXY_PASS=0123456789abcdef01234567
+	eq "Telegram proxy settings accepted" "$(check_settings | grep -c TELEGRAM)" 0
+	TELEGRAM_PROXY_PASS="0123456789ab'cdef"; eq "proxy password with a quote rejected" "$(check_settings | grep -c TELEGRAM_PROXY_PASS)" 1
+	TELEGRAM_PROXY_PASS=short; eq "short proxy password rejected" "$(check_settings | grep -c TELEGRAM_PROXY_PASS)" 1
+	TELEGRAM_PROXY_PASS=0123456789abcdef01234567 TELEGRAM_PROXY_PORT=80; eq "proxy port below 1024 rejected" "$(check_settings | grep -c TELEGRAM_PROXY_PORT)" 1
+	TELEGRAM_PROXY_PORT=5354; eq "proxy port of the router's DNS rejected" "$(check_settings | grep -c 'used by the router')" 1
+	TELEGRAM_PROXY_PORT=1080 TELEGRAM_VIA_VPN=0; eq "proxy without Telegram through the VPN rejected" "$(check_settings | grep -c 'TELEGRAM_PROXY needs')" 1
+	TELEGRAM_PROXY=0 TELEGRAM_VIA_VPN=0
 	REMOTE_HOST=home.example.org:51820; eq "remote host with a port rejected" "$(check_settings | grep -c REMOTE_HOST)" 1
 	REMOTE_HOST=2001:db8::1; eq "remote host IPv6 address accepted" "$(check_settings | grep -c REMOTE_HOST)" 0
 	REMOTE_HOST='' REMOTE_PEERS="living-room-ipad|2|$(wg_genkey)|$(wg_psk)"; eq "device name over 15 characters rejected" "$(check_settings | grep -c REMOTE_PEERS)" 1
