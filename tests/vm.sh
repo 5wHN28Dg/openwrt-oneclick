@@ -340,15 +340,15 @@ redlib_checks() {
 # them; a broken download changes nothing; a new list is taken over without
 # its junk lines; the repo's list puts it back.
 telegram_checks() {
-	r=$(vm_ssh 'p=$(uci show pbr | sed -n "s/^pbr\.\([^.]*\)\.telegram=.1.$/\1/p"); echo "policies=$(echo $p | wc -w)"
+	r=$(vm_ssh 'p=$(uci show pbr | sed -n "s/^pbr\.\([^.]*\)\.name=.Telegram through VPN.$/\1/p"); echo "policies=$(uci show pbr | grep -c "telegram=.1.")"
 		uci get pbr.$p.dest_addr | tr " " "\n" | grep -c "/" | sed "s/^/ranges=/"
 		uci get pbr.$p.dest_addr | grep -q "t.me telegram.org" && echo domains
 		nft list chain inet fw4 pbr_prerouting | grep -q "149.154.160.0/20" && echo routed
 		grep -c telegram-ranges /etc/crontabs/root | sed "s/^/cron=/"' | tr '\n' ' ')
-	case $r in "policies=1 ranges=9 domains routed cron=1 ") ok "Telegram: its 9 ranges and web domains routed through the VPN, refreshed daily" ;;
-		*) bad "Telegram policy (want 'policies=1 ranges=9 domains routed cron=1'): $r" ;; esac
+	case $r in "policies=2 ranges=9 domains routed cron=1 ") ok "Telegram: its 9 ranges and web domains routed through the VPN (devices and the router's proxy), refreshed daily" ;;
+		*) bad "Telegram policy (want 'policies=2 ranges=9 domains routed cron=1'): $r" ;; esac
 	r=$(vm_ssh "u=http://10.0.2.2:$RPORT
-		p=\$(uci show pbr | sed -n \"s/^pbr\\.\\([^.]*\\)\\.telegram=.1.\$/\\1/p\"); before=\$(uci get pbr.\$p.dest_addr)
+		p=\$(uci show pbr | sed -n \"s/^pbr\\.\\([^.]*\\)\\.name=.Telegram through VPN.\$/\\1/p\"); before=\$(uci get pbr.\$p.dest_addr)
 		TELEGRAM_CIDR_URL=\$u/tg-junk.txt /usr/sbin/telegram-ranges >/dev/null 2>&1; echo junk-rc=\$?
 		[ \"\$(uci get pbr.\$p.dest_addr)\" = \"\$before\" ] && echo junk-kept
 		TELEGRAM_CIDR_URL=\$u/tg-new.txt /usr/sbin/telegram-ranges >/dev/null 2>&1; echo new-rc=\$?
@@ -366,7 +366,7 @@ telegram_checks() {
 	# pbr refusing the new list (here: a second Telegram policy whose interface
 	# doesn't exist) puts the previous list back.
 	r=$(vm_ssh "u=http://10.0.2.2:$RPORT
-		p=\$(uci show pbr | sed -n \"s/^pbr\\.\\([^.]*\\)\\.telegram=.1.\$/\\1/p\"); before=\$(uci get pbr.\$p.dest_addr)
+		p=\$(uci show pbr | sed -n \"s/^pbr\\.\\([^.]*\\)\\.name=.Telegram through VPN.\$/\\1/p\"); before=\$(uci get pbr.\$p.dest_addr)
 		uci add pbr policy >/dev/null; uci set pbr.@policy[-1].name=rollback-test; uci set pbr.@policy[-1].interface=testvpn; uci set pbr.@policy[-1].dest_addr=bad_domain!; uci commit pbr
 		out=\$(TELEGRAM_CIDR_URL=\$u/tg-new.txt /usr/sbin/telegram-ranges 2>&1); echo \"\$out\" | grep -o 'put the previous one back'; echo rc=\$?; echo \"[\$out]\" | tr '\\n' ' '
 		echo \"errors-now=[\$(ubus call service list '{\"name\":\"pbr\"}' | jsonfilter -e '@.pbr.instances.main.data.errors[*]' | tr '\\n' ' ')]\"; sleep 20
@@ -388,9 +388,9 @@ telegram_proxy_checks() {
 		ip netns add pc; ip link set veth3 netns pc; ip -n pc link set lo up; ip -n pc link set veth3 up; ip -n pc addr add 192.168.1.61/24 dev veth3
 		/etc/init.d/pbr stop >/dev/null 2>&1
 		uclient-fetch -qO /tmp/tg-plus.txt \$u/tg-plus-test.txt && TELEGRAM_NO_RELOAD=1 /usr/sbin/telegram-ranges /tmp/tg-plus.txt >/dev/null 2>&1; fw4 reload >/dev/null 2>&1
-		ip netns exec pc curl -s -m 10 -o /dev/null -x \$px \$u/tg-repo.txt && echo listed-reached
-		ip netns exec pc curl -s -m 10 -o /dev/null -x \$px http://192.0.2.1/ || echo unlisted-refused
-		ip netns exec pc curl -s -m 10 -o /dev/null -x socks5h://telegram:wrong@192.168.1.1:1080 \$u/tg-repo.txt || echo wrong-password-refused
+		ip netns exec pc curl -s -m 10 -o /dev/null -x \$px \$u/tg-repo.txt && echo listed-reached || { echo \"listed-failed:\$?\"; netstat -ltn | grep -c :1080 | sed 's/^/listening=/'; nft list set inet fw4 oneclick_telegram4 2>&1 | grep -c 10.0.2.0 | sed 's/^/in-set=/'; ip netns exec pc curl -sS -m 5 -o /dev/null -x \$px \$u/tg-repo.txt 2>&1 | head -1; }
+		ip netns exec pc curl -s -m 10 -o /dev/null -x \$px http://192.0.2.1/; e=\$?; [ \$e = 97 ] || [ \$e = 7 ] && echo unlisted-refused || echo \"unlisted:\$e\"
+		ip netns exec pc curl -s -m 10 -o /dev/null -x socks5h://telegram:wrong@192.168.1.1:1080 \$u/tg-repo.txt; e=\$?; [ \$e = 97 ] && echo wrong-password-refused || echo \"wrong-password:\$e\"
 		uclient-fetch -qO /tmp/tg-repo.txt \$u/tg-repo.txt && TELEGRAM_NO_RELOAD=1 /usr/sbin/telegram-ranges /tmp/tg-repo.txt >/dev/null 2>&1; fw4 reload >/dev/null 2>&1
 		ip netns exec pc curl -s -m 10 -o /dev/null -x \$px \$u/tg-repo.txt || echo unlisted-again
 		/etc/init.d/pbr start >/dev/null 2>&1; ip netns del pc; ip link del veth2 2>/dev/null; rm -f /tmp/tg-plus.txt /tmp/tg-repo.txt" 2>&1 | tr '\n' ' ')
@@ -473,7 +473,7 @@ scenario_full() {
 	printf "PROTON_UID='uid-test'\nPROTON_REFRESH='refresh-0'\n" > "$P/proton-session"   # an old copy
 	run_setup "$P" "$W/full-rerun.log"
 	r=$(vm_ssh 'uci show pbr | grep -c "telegram=.1."; grep -c telegram-ranges /etc/crontabs/root' | tr '\n' ' ')
-	[ "$r" = "1 1 " ] && ok "re-run: one Telegram policy, one daily job" || bad "re-run Telegram duplicates (policy cron): $r"
+	[ "$r" = "2 1 " ] && ok "re-run: two Telegram policies (devices, proxy), one daily job" || bad "re-run Telegram duplicates (policy cron): $r"
 	r=$(vm_ssh 'uci -q get firewall.@defaults[0].flow_offloading; uci -q get firewall.@defaults[0].flow_offloading_hw' | tr '\n' ' ')
 	[ "$r" = "1 0 " ] && ok "flow offloading: software on, hardware off" || bad "flow offloading (software hardware): $r"
 	proton_rerun_checks
