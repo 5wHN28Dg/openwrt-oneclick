@@ -73,6 +73,24 @@ else
 	echo "skip  refused speed test (needs python3 and curl)"
 fi
 
+# --- Telegram's list: only ranges nft reads as meant pass (router/files/usr/sbin/telegram-ranges)
+printf '%s\n' 91.108.56.0/22 149.154.160.0/20 2001:b28:f23d::/48 2a0a:f280::/32 1:2:3:4:5:6:7:8/128 > "$T/tg-good"
+printf '%s\n' 1..3.4/24 .1.2.3/24 1.2.3./24 01.2.3.4/24 256.1.1.1/24 1.2.3.4/33 1.2.3.4/4 1.2.3.0/024 1.2.3.4/8 \
+	'::::/999' fffff::/48 2001:db8::1::/64 1:2:3:4:5:6:7/64 2001:db8::/129 ':::/64' :1:2:3:4:5:6:7/64 \
+	1:2:3:4:5:6:7:/64 1::2:/64 ::1:/64 1::/016 '<html>' > "$T/tg-bad"
+cat "$T/tg-good" "$T/tg-bad" > "$T/tg-all"
+want="149.154.160.0/20 91.108.56.0/22 1:2:3:4:5:6:7:8/128 2001:b28:f23d::/48 2a0a:f280::/32 "
+eq "Telegram ranges: only good ones pass" "$(sh "$HERE/router/files/usr/sbin/telegram-ranges" --check "$T/tg-all" | tr '\n' ' ')" "$want"
+# The router's awk is BusyBox's: the same, with only BusyBox's tools on PATH.
+if BB=$(command -v busybox); then
+	mkdir -p "$T/bb"; for c in awk sort tr cat rm sh; do ln -sf "$BB" "$T/bb/$c"; done
+	eq "Telegram ranges (BusyBox): only good ones pass" "$(PATH="$T/bb" "$BB" sh "$HERE/router/files/usr/sbin/telegram-ranges" --check "$T/tg-all" | tr '\n' ' ')" "$want"
+else
+	echo "skip  Telegram range checks with BusyBox (not installed)"
+fi
+eq "Telegram ranges: the repo's copy passes whole" "$(sh "$HERE/router/files/usr/sbin/telegram-ranges" --check "$HERE/router/lists/telegram-cidr.txt" | wc -l | tr -d ' ')" \
+	"$(grep -c . "$HERE/router/lists/telegram-cidr.txt")"
+
 # --- quoting and the settings file -------------------------------------------
 nasty="it's \"q\" \$HOME \`id\` back\\slash
 second line"

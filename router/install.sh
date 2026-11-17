@@ -596,7 +596,9 @@ if [ -n "$VPN" ] && on "${TELEGRAM_VIA_VPN:-0}" && ! echo "${WG_ADDRESSES-}" | g
 		set firewall.@rule[-1].proto='all'
 		set firewall.@rule[-1].target='REJECT'
 	EOF
-	for a in $(grep ':' "$ROUTER/lists/telegram-cidr.txt"); do uci add_list "firewall.@rule[-1].dest_ip=$a"; done
+	# The same checks and order as telegram-ranges, so its next run finds nothing to change.
+	for a in $(/usr/sbin/telegram-ranges --check "$ROUTER/lists/telegram-cidr.txt" | grep ':'); do uci add_list "firewall.@rule[-1].dest_ip=$a"; done
+	uci set firewall.@rule[-1].enabled='1'
 fi
 uci commit firewall
 pass "software flow offloading (hardware offloading off: it bypasses SQM), DNS hijack${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo ', DoT and VPN-protocol blocks')}${VPN:+, $VPN zone}${REMOTE:+, remote access in the lan zone}"
@@ -957,7 +959,7 @@ if [ -n "$VPN" ]; then
 		if r=$(/usr/sbin/telegram-ranges 2>&1); then
 			pass "Telegram through $VPN: Telegram's own list ($(echo "$r" | sed -n 's/.*: \([0-9]*\) IPv4 ranges.*/\1/p') ranges) and its web domains, refreshed daily 04:20"
 		else
-			info "Telegram through $VPN: the list from telegram.org could not be fetched ($r); using the copy from the setup, retried daily 04:20"
+			info "Telegram through $VPN: list not updated (${r#telegram-ranges: }); the copy from the setup is in use, tried again daily 04:20"
 		fi
 	fi
 	if [ -f /etc/proton-pick.conf ] && [ -f /etc/proton/session ]; then
