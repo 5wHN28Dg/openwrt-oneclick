@@ -419,7 +419,11 @@ telegram_proxy_checks() {
 upgrade_checks() {
 	r=$(vm_ssh 'sysupgrade -l > /tmp/keep
 		for f in /usr/sbin/oneclick-after-upgrade /etc/safesearch/google.domains /etc/init.d/adblock-lean /etc/init.d/redlib \
-			/usr/sbin/redlib-update /usr/sbin/telegram-ranges /etc/rc.local /etc/oneclick-vpn-aaaa.applied $(find /etc/adblock-lean /usr/lib/adblock-lean /www/mangadex-safe /www/cgi-bin/md -type f); do
+			/usr/sbin/redlib-update /usr/sbin/telegram-ranges /etc/rc.local /etc/oneclick-vpn-aaaa.applied /etc/crontabs/root \
+			/etc/redlib.conf /etc/nftables.d/30-oneclick-redlib-dns.nft /etc/nftables.d/31-oneclick-telegram-proxy.nft \
+			/usr/sbin/safesearch-hosts /usr/sbin/redlib-block /etc/redlib-block.allow /etc/banip/banip.custom.feeds \
+			$(find /etc/adblock-lean /usr/lib/adblock-lean /www/mangadex-safe /www/cgi-bin/md /etc/proton /usr/share/proton-pick \
+				/usr/sbin/proton-pick /etc/proton-pick.conf -type f 2>/dev/null); do
 			grep -qxF "$f" /tmp/keep || echo "not-kept:$f"
 		done
 		grep -qxF /etc/oneclick-firmware /tmp/keep && echo mark-kept

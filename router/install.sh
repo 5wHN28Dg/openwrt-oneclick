@@ -718,8 +718,11 @@ fi
 if on "${ENABLE_MANGADEX:-0}"; then
 	step "MangaDex app"
 	uci set uhttpd.main.max_requests='6'; uci set uhttpd.main.setup_maxreq=1; uci commit uhttpd
-	/usr/sbin/oneclick-after-upgrade manga   # also after firmware upgrades (LuCI's index.html)
-	pass "MangaDex reader at http://manga.lan (uhttpd max_requests 6)"
+	if /usr/sbin/oneclick-after-upgrade manga; then   # also after firmware upgrades (LuCI's index.html)
+		pass "MangaDex reader at http://manga.lan (uhttpd max_requests 6)"
+	else
+		fail "MangaDex reader installed, but manga.lan can't open it: LuCI's /www/index.html is missing or has no <head> (use http://$LAN_IP/mangadex-safe/)"
+	fi
 fi
 
 # ---------------------------------------------------------------- Wi-Fi
