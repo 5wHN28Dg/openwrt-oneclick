@@ -378,24 +378,27 @@ telegram_checks() {
 }
 
 # Telegram proxy, from a LAN device. The test VPN is a dead tunnel, so curl's
-# exit code tells what happened: 28 = let through and stuck in the VPN,
-# 97 = refused by the proxy. A Telegram address goes into the VPN; with pbr
-# stopped (it would leave directly) it is refused; so are an address that
-# isn't Telegram's, the router's unfiltered DNS (5354), the router's web page
-# and a wrong password.
+# exit code tells what happened: 28 = let through and stuck in the VPN (or
+# dropped), 97 = refused by the proxy. A Telegram address goes into the VPN;
+# with pbr stopped it would leave directly, so it is dropped (the counter of
+# that rule rises); an address that isn't Telegram's, the router's unfiltered
+# DNS (5354), the router's web page and a wrong password are refused.
 telegram_proxy_checks() {
 	r=$(vm_ssh "px=socks5h://telegram:0123456789abcdef01234567@192.168.1.1:1080
 		ip link add veth2 type veth peer name veth3; ip link set veth2 master br-lan up
 		ip netns add pc; ip link set veth3 netns pc; ip -n pc link set lo up; ip -n pc link set veth3 up; ip -n pc addr add 192.168.1.61/24 dev veth3
 		t() { ip netns exec pc curl -s -m 6 -o /dev/null -x \$1 \$2; echo \"\$3=\$?\"; }
 		t \$px http://149.154.167.99/ telegram
-		/etc/init.d/pbr stop >/dev/null 2>&1; t \$px http://149.154.167.99/ telegram-without-vpn; /etc/init.d/pbr start >/dev/null 2>&1
+		d0=\$(nft list chain inet fw4 oneclick_telegram_proxy_vpn | sed -n 's/.*packets \([0-9]*\).*/\1/p')
+		/etc/init.d/pbr stop >/dev/null 2>&1; t \$px http://149.154.167.99/ telegram-without-vpn
+		[ \"\$(nft list chain inet fw4 oneclick_telegram_proxy_vpn | sed -n 's/.*packets \([0-9]*\).*/\1/p')\" -gt \"\$d0\" ] && echo dropped-outside-vpn
+		/etc/init.d/pbr start >/dev/null 2>&1
 		t \$px http://192.0.2.1/ other
 		t \$px http://127.0.0.1:5354/ router-dns
 		t \$px http://192.168.1.1/ router-web
 		t socks5h://telegram:wrong@192.168.1.1:1080 http://149.154.167.99/ wrong-password
 		ip netns del pc" 2>&1 | tr '\n' ' ')
-	want="telegram=28 telegram-without-vpn=97 other=97 router-dns=97 router-web=97 wrong-password=97 "
+	want="telegram=28 telegram-without-vpn=28 dropped-outside-vpn other=97 router-dns=97 router-web=97 wrong-password=97 "
 	[ "$r" = "$want" ] && ok "Telegram proxy (from a LAN device): only Telegram, only through the VPN, only with the password" \
 		|| bad "Telegram proxy (want '$want'): $r"
 }
