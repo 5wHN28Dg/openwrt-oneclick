@@ -2,14 +2,20 @@
 # Keeps the pbr policy that sends Telegram through the VPN complete: Telegram's
 # own list of address ranges plus its web domains, written into every pbr
 # policy marked telegram='1'. Runs daily from cron and from install.sh.
-# A failed or odd download keeps the previous list; pbr reloads only when the
-# list changed (flash wear, and a reload briefly rebuilds the routing rules).
-# IPv6 ranges are used only when pbr routes IPv6 (the VPN has IPv6).
+# - A failed or odd download keeps the previous list; every range is checked
+#   strictly (one bad entry would stop pbr from loading any of its rules).
+# - pbr reloads only when the list changed; if it then reports errors, the
+#   previous list is put back.
+# - IPv6 ranges go into the policy only when pbr routes IPv6 (the VPN has
+#   IPv6). Otherwise they go into firewall rules marked telegram='1' that
+#   reject them from the LAN, so apps switch to IPv4 (through the VPN) at once
+#   instead of waiting on a blocked connection.
 #   telegram-ranges [LIST-FILE]   (a file instead of the download: install.sh's
 #                                  starting list and the tests)
+# TELEGRAM_NO_RELOAD=1: write the settings only (install.sh restarts later).
 
 URL=${TELEGRAM_CIDR_URL:-https://core.telegram.org/resources/cidr.txt}   # tests: tests/vm.sh
-DOMAINS='t.me telegram.org telegram.me telesco.pe telegra.ph'
+DOMAINS='t.me telegram.org telegram.me telegram.dog telesco.pe telegra.ph graph.org tdesktop.com fragment.com'
 TMP=/tmp/telegram-ranges.$$
 cleanup() { rm -f "$TMP".*; }
 trap cleanup EXIT
@@ -25,28 +31,83 @@ if [ -n "${1-}" ]; then
 	cp "$1" "$TMP.raw" || exit 1
 elif ! { [ -n "$iface" ] && command -v curl >/dev/null \
 		&& curl -sf -m 30 --interface "$iface" -o "$TMP.raw" "$URL" 2>/dev/null; } \
-	&& ! uclient-fetch -q -T 30 -O "$TMP.raw" "$URL" 2>/dev/null; then
+	&& ! uclient-fetch -4 -q -T 30 -O "$TMP.raw" "$URL" 2>/dev/null; then
 	say "download failed (through ${iface:-the VPN} and directly), keeping the previous list"; exit 1
 fi
-# Only well-formed ranges; anything else (an error page, junk) is dropped.
-tr -d '\r' < "$TMP.raw" | awk -F'[./]' 'NF == 5 && $0 ~ /^[0-9.]+\/[0-9]+$/ && $1 < 256 && $2 < 256 && $3 < 256 && $4 < 256 && $5 >= 8 && $5 <= 32' | sort -u > "$TMP.v4"
-tr -d '\r' < "$TMP.raw" | grep -E '^[0-9a-fA-F:]+::?[0-9a-fA-F:]*/[0-9]{1,3}$' | sort -u > "$TMP.v6"
+
+# Strict checks: IPv4 in canonical form (no empty or zero-padded parts, each
+# at most 255, prefix 8-32); IPv6 with at most one "::", 1-4 hex digits per
+# group, 8 groups (fewer only with "::") and a prefix of 16-128.
+tr -d '\r' < "$TMP.raw" | awk -F'/' '
+	NF == 2 && $2 ~ /^[0-9]+$/ && $2 >= 8 && $2 <= 32 {
+		if (split($1, o, ".") != 4) next
+		for (i = 1; i <= 4; i++) if (o[i] !~ /^(0|[1-9][0-9]?[0-9]?)$/ || o[i] > 255) next
+		print
+	}' | sort -u > "$TMP.v4"
+tr -d '\r' < "$TMP.raw" | awk -F'/' '
+	NF == 2 && $2 ~ /^[0-9]+$/ && $2 >= 16 && $2 <= 128 && $1 ~ /^[0-9a-fA-F:]+$/ && $1 !~ /:::/ {
+		a = $1; d = gsub(/::/, "", a)
+		if (d > 1) next
+		n = split($1, g, ":"); used = 0
+		for (i = 1; i <= n; i++) {
+			if (g[i] == "") continue
+			if (length(g[i]) > 4) next
+			used++
+		}
+		if ((d == 0 && n != 8) || (d == 1 && used > 7)) next
+		print
+	}' | sort -u > "$TMP.v6"
 # Telegram publishes about ten IPv4 ranges: far fewer means a broken download.
 [ "$(wc -l < "$TMP.v4")" -ge 3 ] || { say "the list has $(wc -l < "$TMP.v4") IPv4 ranges, keeping the previous one"; exit 1; }
 
 dest="$(tr '\n' ' ' < "$TMP.v4")"
-[ "$(uci -q get pbr.config.ipv6_enabled)" = 1 ] && dest="$dest$(tr '\n' ' ' < "$TMP.v6")"
+v6="$(tr '\n' ' ' < "$TMP.v6")"
+if [ "$(uci -q get pbr.config.ipv6_enabled)" = 1 ]; then
+	dest="$dest$v6" v6rule=''
+else
+	v6rule=${v6% }
+fi
 dest="$dest$DOMAINS"
 
-changed=''
+# IPv6 that doesn't go through the VPN: rejected from the LAN (no ranges = off).
+fwchanged=''
+for r in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.telegram='1'$/\1/p"); do
+	[ "$(uci -q get "firewall.$r.dest_ip")" = "$v6rule" ] && continue
+	uci -q delete "firewall.$r.dest_ip"
+	for a in $v6rule; do uci add_list "firewall.$r.dest_ip=$a"; done
+	uci set "firewall.$r.enabled=$([ -n "$v6rule" ] && echo 1 || echo 0)"
+	fwchanged=1
+done
+if [ -n "$fwchanged" ]; then
+	uci commit firewall
+	[ -n "${TELEGRAM_NO_RELOAD-}" ] || fw4 reload >/dev/null 2>&1
+fi
+
+changed='' : > "$TMP.prev"
 for p in $policies; do
-	[ "$(uci -q get "pbr.$p.dest_addr")" = "$dest" ] && continue
+	prev=$(uci -q get "pbr.$p.dest_addr")
+	[ "$prev" = "$dest" ] && continue
+	echo "$p $prev" >> "$TMP.prev"
 	uci set "pbr.$p.dest_addr=$dest"; changed=1
 done
-if [ -n "$changed" ]; then
-	uci commit pbr
-	/etc/init.d/pbr enabled && /etc/init.d/pbr reload >/dev/null 2>&1
-	say "updated: $(wc -l < "$TMP.v4") IPv4 ranges + $DOMAINS"
-else
-	say "unchanged: $(wc -l < "$TMP.v4") IPv4 ranges"
+[ -n "$changed" ] || { say "unchanged: $(wc -l < "$TMP.v4") IPv4 ranges"; exit 0; }
+uci commit pbr
+if [ -n "${TELEGRAM_NO_RELOAD-}" ] || ! /etc/init.d/pbr enabled; then
+	say "updated: $(wc -l < "$TMP.v4") IPv4 ranges + domains"; exit 0
 fi
+/etc/init.d/pbr reload >/dev/null 2>&1
+# pbr installs its rules in one go and refuses all of them on a bad entry:
+# if it reports errors now, the previous list goes back.
+i=0 errs=''
+while [ $i -lt 20 ]; do
+	sleep 1; i=$((i + 1))
+	errs=$(ubus call service list '{"name":"pbr"}' 2>/dev/null | jsonfilter -e '@.pbr.instances.main.data.errors[*]' 2>/dev/null)
+	[ -n "$errs" ] && break
+	[ $i -ge 3 ] && nft list chain inet fw4 pbr_prerouting >/dev/null 2>&1 && break
+done
+if [ -n "$errs" ]; then
+	while read -r p prev; do uci set "pbr.$p.dest_addr=$prev"; done < "$TMP.prev"
+	uci commit pbr; /etc/init.d/pbr reload >/dev/null 2>&1
+	say "pbr refused the new list ($(echo "$errs" | head -1)); put the previous one back"; exit 1
+fi
+say "updated: $(wc -l < "$TMP.v4") IPv4 ranges + $DOMAINS"

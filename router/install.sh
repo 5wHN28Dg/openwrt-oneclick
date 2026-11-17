@@ -388,11 +388,12 @@ if [ -n "$VPN" ]; then
 		uci set pbr.@policy[-1].telegram=1
 	fi
 	uci commit pbr
-	[ -z "${VPN_ROUTE_DOMAINS-}${VPN_ROUTE_SUBNETS-}" ] && info "VPN set up, but no domains or ranges are routed through it"
+	[ -z "${VPN_ROUTE_DOMAINS-}${VPN_ROUTE_SUBNETS-}" ] && ! on "${TELEGRAM_VIA_VPN:-0}" && info "VPN set up, but no domains or ranges are routed through it"
 	# IPv6 to the VPN domains must not go around the VPN: route it through the
 	# VPN when the VPN has IPv6, otherwise answer their AAAA queries with ::
 	# (no address) so devices use IPv4, which pbr sends through the VPN.
-	TG_DOMAINS=''; on "${TELEGRAM_VIA_VPN:-0}" && TG_DOMAINS='t.me telegram.org telegram.me telesco.pe telegra.ph'
+	TG_DOMAINS=''   # one list of Telegram's domains: the one in telegram-ranges
+	on "${TELEGRAM_VIA_VPN:-0}" && TG_DOMAINS=$(sed -n "s/^DOMAINS='\(.*\)'$/\1/p" /usr/sbin/telegram-ranges)
 	if echo "${WG_ADDRESSES-}" | grep -q ':'; then
 		uci set pbr.config.ipv6_enabled=1
 	else
@@ -401,7 +402,7 @@ if [ -n "$VPN" ]; then
 	fi
 	uci commit pbr
 	if on "${TELEGRAM_VIA_VPN:-0}"; then
-		/usr/sbin/telegram-ranges "$ROUTER/lists/telegram-cidr.txt" >/dev/null || die "could not fill the Telegram policy"
+		TELEGRAM_NO_RELOAD=1 /usr/sbin/telegram-ranges "$ROUTER/lists/telegram-cidr.txt" >/dev/null || die "could not fill the Telegram policy"
 	fi
 	pass "WireGuard $VPN to ${PREV_HOST:-$WG_ENDPOINT_HOST}; PBR: ${VPN_ROUTE_DOMAINS:-no domains}${VPN_ROUTE_SUBNETS:+ + IP ranges}${TG_DOMAINS:+ + Telegram}"
 fi
@@ -579,6 +580,23 @@ if [ -n "$REDLIB" ]; then
 		set firewall.@redirect[-1].dest_port='8080'
 		set firewall.@redirect[-1].target='DNAT'
 	EOF
+fi
+# Telegram's IPv6 ranges, when the VPN has no IPv6: rejected from the LAN so
+# apps fall back to IPv4 (through the VPN) at once (telegram-ranges keeps
+# the list current).
+if [ -n "$VPN" ] && on "${TELEGRAM_VIA_VPN:-0}" && ! echo "${WG_ADDRESSES-}" | grep -q ':'; then
+	uci batch >/dev/null <<-EOF
+		add firewall rule
+		set firewall.@rule[-1].setup='1'
+		set firewall.@rule[-1].telegram='1'
+		set firewall.@rule[-1].name='Telegram-IPv6-not-through-VPN'
+		set firewall.@rule[-1].src='lan'
+		set firewall.@rule[-1].dest='wan'
+		set firewall.@rule[-1].family='ipv6'
+		set firewall.@rule[-1].proto='all'
+		set firewall.@rule[-1].target='REJECT'
+	EOF
+	for a in $(grep ':' "$ROUTER/lists/telegram-cidr.txt"); do uci add_list "firewall.@rule[-1].dest_ip=$a"; done
 fi
 uci commit firewall
 pass "software flow offloading (hardware offloading off: it bypasses SQM), DNS hijack${FAMILY_FILTER:+$(on "$FAMILY_FILTER" && echo ', DoT and VPN-protocol blocks')}${VPN:+, $VPN zone}${REMOTE:+, remote access in the lan zone}"

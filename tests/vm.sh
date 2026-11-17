@@ -356,6 +356,21 @@ telegram_checks() {
 		uclient-fetch -qO /tmp/tg-list.txt \$u/tg-repo.txt && /usr/sbin/telegram-ranges /tmp/tg-list.txt >/dev/null 2>&1; echo back-rc=\$?; rm -f /tmp/tg-list.txt" 2>&1 | tr '\n' ' ')
 	case $r in "junk-rc=1 junk-kept new-rc=0 new-range new-routed back-rc=0 ") ok "Telegram list update: an error page changes nothing; a new range is taken over (and routed), junk lines are not" ;;
 		*) bad "Telegram list update (want 'junk-rc=1 junk-kept new-rc=0 new-range new-routed back-rc=0'): $r" ;; esac
+	# The VPN has no IPv6: Telegram's IPv6 ranges are rejected from the LAN.
+	r=$(vm_ssh 'r=$(uci show firewall | sed -n "s/^firewall\.\([^.]*\)\.telegram=.1.$/\1/p"); echo "rules=$(echo $r | wc -w) enabled=$(uci -q get firewall.$r.enabled)"
+		nft list ruleset | grep "Telegram-IPv6-not-through-VPN" | grep -q "2001:b28:f23d::/48" && echo rejected' | tr '\n' ' ')
+	case $r in "rules=1 enabled=1 rejected "|"rules=1 enabled= rejected ") ok "Telegram IPv6 (the VPN has none) is rejected from the LAN" ;;
+		*) bad "Telegram IPv6 reject rule: $r" ;; esac
+	# pbr refusing the new list (here: a second Telegram policy whose interface
+	# doesn't exist) puts the previous list back.
+	r=$(vm_ssh "u=http://10.0.2.2:$RPORT
+		p=\$(uci show pbr | sed -n \"s/^pbr\\.\\([^.]*\\)\\.telegram=.1.\$/\\1/p\"); before=\$(uci get pbr.\$p.dest_addr)
+		uci add pbr policy >/dev/null; uci set pbr.@policy[-1].name=rollback-test; uci set pbr.@policy[-1].telegram=1; uci set pbr.@policy[-1].interface=nosuchvpn; uci set pbr.@policy[-1].dest_addr=10.0.0.0/8; uci commit pbr
+		TELEGRAM_CIDR_URL=\$u/tg-new.txt /usr/sbin/telegram-ranges 2>&1 | grep -o 'put the previous one back'; echo rc=\$?
+		[ \"\$(uci get pbr.\$p.dest_addr)\" = \"\$before\" ] && echo restored
+		uci delete pbr.@policy[-1]; uci commit pbr; /etc/init.d/pbr reload >/dev/null 2>&1" 2>&1 | tr '\n' ' ')
+	case $r in *"put the previous one back rc=0 restored "*) ok "Telegram list update: when pbr refuses it, the previous list comes back" ;;
+		*) bad "Telegram rollback when pbr refuses the list: $r" ;; esac
 }
 
 scenario_full() {

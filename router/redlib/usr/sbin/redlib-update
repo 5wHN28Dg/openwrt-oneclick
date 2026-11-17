@@ -26,10 +26,10 @@ WAIT_DAYS=3
 TGZ=/tmp/redlib-update.tgz
 
 say() { echo "redlib-update: $1"; logger -t redlib-update "$1"; }
-fetch() { # URL FILE|-: three tries, connections to GitHub sometimes time out
+fetch() { # URL FILE: three tries, connections to GitHub sometimes time out
 	for n in 1 2 3; do
 		uclient-fetch -q -T 30 -O "$2" "$1" 2>/dev/null && return 0
-		[ $n -lt 3 ] && sleep 10
+		rm -f "$2"; [ $n -lt 3 ] && sleep 10
 	done
 	return 1
 }
@@ -70,7 +70,8 @@ case $(uname -m) in
 	*) fail "no Redlib build for this CPU ($(uname -m))" ;;
 esac
 
-J=$(fetch "$API" -) || fail "can't reach GitHub"
+fetch "$API" /tmp/redlib-releases.json || fail "can't reach GitHub"
+J=$(cat /tmp/redlib-releases.json); rm -f /tmp/redlib-releases.json
 cutoff=$(( $(date +%s) - WAIT_DAYS * 86400 ))
 i=0 tag='' url='' sum=''
 while [ $i -lt 10 ]; do
