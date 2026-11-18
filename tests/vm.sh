@@ -460,13 +460,20 @@ upgrade_checks() {
 ZT_TEST_NET=deadbeef00c0ffee
 zerotier_checks() {
 	r=$(vm_ssh "pidof zerotier-one >/dev/null && echo running
+		zerotier-cli -j info | jsonfilter -e @.online
 		uci -q get zerotier.oneclick.id; uci show zerotier | grep -c '=network'
 		uci show zerotier | grep -c 8056c2e21c000001
 		stat -c %a /etc/config/zerotier
-		uci -q get firewall.@zone[0].device | grep -qw 'zt+' && echo in-lan
+		uci -q get firewall.@zone[0].device | grep -q zt && echo in-lan
+		z=\$(uci show firewall | sed -n \"s/^firewall\\.\\([^.]*\\)\\.name='zerotier'\$/\\1/p\")
+		echo zone=\$(uci -q get firewall.\$z.device)/\$(uci -q get firewall.\$z.input)/\$(uci -q get firewall.\$z.forward)
+		uci show firewall | grep -c \"\\.src='zerotier'\"
+		nft list chain inet fw4 forward_zerotier >/dev/null 2>&1 && echo chain
+		nft list chain inet fw4 forward_zerotier 2>/dev/null | grep -c accept_to
 		zerotier-cli -j listnetworks | jsonfilter -e '@[*].id'" 2>&1 | tr '\n' ' ')
-	[ "$r" = "running $ZT_TEST_NET 1 0 600 in-lan $ZT_TEST_NET " ] && ok "ZeroTier: joins the network, only that one, in the lan zone, settings readable by root only" \
-		|| bad "ZeroTier on the router (want 'running $ZT_TEST_NET 1 0 600 in-lan $ZT_TEST_NET'): $r"
+	want="running true $ZT_TEST_NET 1 0 600 zone=zt+/ACCEPT/REJECT 0 chain 0 $ZT_TEST_NET "
+	[ "$r" = "$want" ] && ok "ZeroTier: online, joins only that network, own zone that forwards nowhere, settings readable by root only" \
+		|| bad "ZeroTier on the router (want '$want'): $r"
 	grep -q "^INFO  ZeroTier: router [0-9a-f]\{10\} waits for approval" "$W/full.log" && ok "ZeroTier: report asks to approve the router" \
 		|| bad "ZeroTier report: $(grep ZeroTier "$W/full.log" | tr '\n' ' ')"
 	node=$(vm_ssh 'zerotier-cli -j info | jsonfilter -e @.address')
@@ -551,12 +558,12 @@ scenario_full() {
 	vm_ssh 'uci set firewall.@defaults[0].flow_offloading_hw=1; uci commit firewall'
 	printf "PROTON_UID='uid-test'\nPROTON_REFRESH='refresh-0'\n" > "$P/proton-session"   # an old copy
 	# ZeroTier: a router that lost its identity gets the saved one back; a
-	# network made by hand for the same ID is taken over, not doubled.
+	# network made by hand for the same ID is used as it is, not doubled.
 	vm_ssh "uci delete zerotier.global.secret; uci set zerotier.home=network; uci set zerotier.home.id=$ZT_TEST_NET; uci commit zerotier"
 	run_setup "$P" "$W/full-rerun.log"
-	r=$(vm_ssh "zerotier-cli -j info | jsonfilter -e @.address; uci show zerotier | grep -c '=network'" | tr '\n' ' ')
-	[ "$r" = "$(cut -d: -f1 "$P/zerotier/identity.secret") 1 " ] && ok "ZeroTier re-run: the saved identity comes back, one network" \
-		|| bad "ZeroTier re-run (want '$(cut -d: -f1 "$P/zerotier/identity.secret") 1'): $r"
+	r=$(vm_ssh "zerotier-cli -j info | jsonfilter -e @.address; uci show zerotier | grep -c '=network'; uci -q get zerotier.home.id" | tr '\n' ' ')
+	[ "$r" = "$(cut -d: -f1 "$P/zerotier/identity.secret") 1 $ZT_TEST_NET " ] && ok "ZeroTier re-run: the saved identity comes back; the hand-made network for the ID is used, not doubled" \
+		|| bad "ZeroTier re-run (want '$(cut -d: -f1 "$P/zerotier/identity.secret") 1 $ZT_TEST_NET'): $r"
 	r=$(vm_ssh 'uci show pbr | grep -c "telegram=.1."; grep -c telegram-ranges /etc/crontabs/root' | tr '\n' ' ')
 	[ "$r" = "2 1 " ] && ok "re-run: two Telegram policies (devices, proxy), one daily job" || bad "re-run Telegram duplicates (policy cron): $r"
 	r=$(vm_ssh 'uci -q get firewall.@defaults[0].flow_offloading; uci -q get firewall.@defaults[0].flow_offloading_hw' | tr '\n' ' ')
@@ -663,8 +670,8 @@ scenario_full() {
 		true' | tr '\n' ' ')
 	[ -z "$left" ] && ok "Redlib turned off: program, files, user, address, rules, cron and name removed" || bad "Redlib leftovers: $left"
 	left=$(vm_ssh 'pidof zerotier-one >/dev/null && echo running; apk info -e zerotier >/dev/null 2>&1 && echo package
-		[ -e /etc/config/zerotier ] && echo config; uci -q get firewall.@zone[0].device | grep -q zt && echo in-lan; true' | tr '\n' ' ')
-	[ -z "$left" ] && ok "ZeroTier turned off: package, settings with the private key, lan-zone entry removed" || bad "ZeroTier leftovers: $left"
+		[ -e /etc/config/zerotier ] && echo config; uci show firewall | grep -q "zt+" && echo zone; true' | tr '\n' ' ')
+	[ -z "$left" ] && ok "ZeroTier turned off: package, settings with the private key, firewall zone removed" || bad "ZeroTier leftovers: $left"
 	left=$(vm_ssh 'ls -d /etc/proton /etc/proton-pick.conf /usr/sbin/proton-pick 2>/dev/null; grep -c proton /etc/crontabs/root /etc/rc.local /etc/sysupgrade.conf' | tr '\n' ' ')
 	[ "$left" = "/etc/crontabs/root:0 /etc/rc.local:0 /etc/sysupgrade.conf:0 " ] && ok "VPN turned off: Proton session, settings and jobs removed" || bad "Proton leftovers: $left"
 	left=$(vm_ssh 'uci show network | grep -c "remote"; uci show firewall | grep -c "remote\|Remote"; wg show remote 2>/dev/null | grep -c peer' | tr '\n' ' ')
@@ -711,20 +718,25 @@ scenario_minimal() {
 	# A ZeroTier set up by hand is only borrowed: turning the option off again
 	# takes this setup's network out and leaves the rest (package, own network).
 	vm_ssh 'apk add zerotier >/dev/null 2>&1; uci set zerotier.global.enabled=1; uci set zerotier.mine=network
-		uci set zerotier.mine.id=feedfacecafe0001; uci commit zerotier; /etc/init.d/zerotier restart' >/dev/null 2>&1
+		uci set zerotier.mine.id=feedfacecafe0001; uci commit zerotier; /etc/init.d/zerotier restart
+		uci add_list firewall.@zone[0].device=zt+; uci commit firewall; fw4 reload' >/dev/null 2>&1
+	sleep 5; node=$(vm_ssh 'uci -q get zerotier.global.secret | cut -d: -f1')
 	# shellcheck disable=SC2034  # write_config reads the settings through eval
 	(. "$P/config.env"; ENABLE_ZEROTIER=1 ZEROTIER_NETWORK=$ZT_TEST_NET; write_config "$P/config.env")
 	run_setup "$P" "$W/minimal-zt.log"
-	r=$(vm_ssh 'uci -q get zerotier.oneclick.id; uci -q get zerotier.global.setup_oneclick' | tr '\n' ' ')
-	[ "$r" = "$ZT_TEST_NET borrowed " ] && ok "ZeroTier set up by hand: the setup adds its network, marks ZeroTier as borrowed" || bad "ZeroTier borrowed: $r"
+	r=$(vm_ssh 'uci -q get zerotier.oneclick.id; uci -q get zerotier.global.setup_oneclick; uci -q get zerotier.global.secret | cut -d: -f1
+		uci -q get firewall.@zone[0].device | grep -q zt && echo in-lan; uci show firewall | grep -c "name=.zerotier."' | tr '\n' ' ')
+	[ "$r" = "$ZT_TEST_NET borrowed $node 1 " ] && ok "ZeroTier set up by hand: the setup adds its network, keeps the identity, zt+ moves from the lan zone to its own" \
+		|| bad "ZeroTier borrowed (want '$ZT_TEST_NET borrowed $node 1'): $r"
 	# shellcheck disable=SC2034
 	(. "$P/config.env"; ENABLE_ZEROTIER=0; write_config "$P/config.env")
 	run_setup "$P" "$W/minimal-zt-off.log"
 	r=$(vm_ssh 'apk info -e zerotier >/dev/null 2>&1 && echo package; uci -q get zerotier.mine.id
 		uci -q get zerotier.oneclick.id || echo no-oneclick; uci -q get zerotier.global.setup_oneclick || echo no-mark
-		pidof zerotier-one >/dev/null && echo running' | tr '\n' ' ')
-	[ "$r" = "package feedfacecafe0001 no-oneclick no-mark running " ] && ok "ZeroTier set up by hand, option off again: only the setup's network removed" \
-		|| bad "ZeroTier borrowed then off (want 'package feedfacecafe0001 no-oneclick no-mark running'): $r"
+		pidof zerotier-one >/dev/null && echo running; uci -q get firewall.@zone[0].device | grep -qw "zt+" && echo in-lan
+		uci show firewall | grep -c "name=.zerotier."' | tr '\n' ' ')
+	[ "$r" = "package feedfacecafe0001 no-oneclick no-mark running in-lan 0 " ] && ok "ZeroTier set up by hand, option off again: only the setup's network and zone removed, zt+ back in the lan zone" \
+		|| bad "ZeroTier borrowed then off (want 'package feedfacecafe0001 no-oneclick no-mark running in-lan 0'): $r"
 }
 
 case ${1:-both} in

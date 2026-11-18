@@ -53,8 +53,13 @@ case $lan_sub in /*|*/) lan_sub=$LAN_IP/24 ;; esac
 ZT=''; on "${ENABLE_ZEROTIER:-0}" && ZT=1
 if [ -n "$ZT" ]; then
 	printf '%s\n' "${ZEROTIER_NETWORK-}" | grep -qxE '[0-9a-f]{16}' || { echo "ZEROTIER_NETWORK must be the 16-character network ID"; exit 1; }
-	[ -n "$LAN_ZONE" ] || { echo "no firewall zone named lan, needed for ZeroTier"; exit 1; }
+	z=$(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='zerotier'$/\1/p" | head -1)
+	if [ -n "$z" ] && [ "$(uci -q get "firewall.$z.setup")" != 1 ]; then
+		echo "a firewall zone named zerotier exists that this tool did not make; rename it first"; exit 1
+	fi
 fi
+# Was ZeroTier on this router before this setup touched it (installed by hand)?
+ZT_HAD=''; [ -s /etc/config/zerotier ] && [ -z "$(uci -q get zerotier.global.setup_oneclick)" ] && ZT_HAD=1
 # Remote access: everything that can stop it is checked before anything changes.
 REMOTE=; on "${ENABLE_REMOTE:-0}" && REMOTE=1
 if [ -n "$REMOTE" ]; then
@@ -436,7 +441,7 @@ fi
 
 # ---------------------------------------------------------------- Telegram proxy
 # SOCKS5 with a password, for phones: at home and through ZeroTier. Listens on
-# every address, but the firewall only lets the LAN zone (and ZeroTier in it)
+# every address, but the firewall only lets the LAN and ZeroTier zones
 # reach the router; telegram-ranges keeps its user to Telegram's addresses.
 TG_PROXY_NFT=/etc/nftables.d/31-oneclick-telegram-proxy.nft
 if [ -n "$TG_PROXY" ]; then
@@ -525,41 +530,46 @@ fi
 
 # ---------------------------------------------------------------- ZeroTier
 # Remote access behind a provider's shared address: the router and the
-# devices both connect out to ZeroTier. Devices reach the router itself at its
-# ZeroTier address (LuCI, the MangaDex app, the Telegram proxy); the free plan
-# has no routes or DNS into the rest of the home network. Its interfaces
-# (zt...) join the lan zone below. The identity from
-# private/zerotier/identity.secret (setup.sh saves it after the first run)
-# keeps a reset router an approved member.
+# devices both connect out to ZeroTier. Members of the network reach the
+# router itself at its ZeroTier address (LuCI, SSH, the MangaDex app, the
+# Telegram proxy) and nothing behind it: their own firewall zone (below)
+# forwards nowhere, so no member can reach other devices at home or use the
+# home line or the VPN, even with a route of their own.
+# A ZeroTier that was here before (set up by hand) is only borrowed: its
+# identity, its networks and a hand-made network for the same ID are left as
+# they are, and turning the option off takes out only what this setup added.
+# Otherwise the identity from private/zerotier/identity.secret (setup.sh saves
+# it after the first run) keeps a reset router an approved member.
 ZT_EARTH=8056c2e21c000001   # ZeroTier's public network, in the package's example config
-ZT_REMOVED=''
+ZT_REMOVED='' ZT_MARK=$(uci -q get zerotier.global.setup_oneclick)
 if [ -n "$ZT" ]; then
 	step "ZeroTier"
-	touch /etc/config/zerotier
-	if [ -f "$PRIV/zerotier/identity.secret" ]; then
+	touch /etc/config/zerotier; chmod 600 /etc/config/zerotier   # it holds the identity's private key
+	if [ -z "$ZT_MARK" ]; then
+		ZT_MARK=1; [ -n "$ZT_HAD" ] && ZT_MARK=borrowed
+	fi
+	if [ "$ZT_MARK" = 1 ] && [ -f "$PRIV/zerotier/identity.secret" ]; then
 		secret=$(tr -d '\n' < "$PRIV/zerotier/identity.secret")
 		if printf '%s\n' "$secret" | grep -qxE '[0-9a-f]{10}:0:[0-9a-f]{128}:[0-9a-f]{128}'; then
-			uci set zerotier.global=zerotier
-			uci set zerotier.global.secret="$secret"
+			# through stdin: a command line would show the private key in the process list
+			printf "set zerotier.global=zerotier\nset zerotier.global.secret='%s'\n" "$secret" | uci batch >/dev/null
 		else
 			fail "private/zerotier/identity.secret is not a ZeroTier identity: the router keeps its own"
 		fi
 	fi
-	# Earlier runs' network, the public one, and one made by hand for the same ID go first.
+	# Earlier runs' network and the public example go; a network made by hand
+	# for the same ID stays and is used as it is.
+	own=1
 	for s in $(uci -q show zerotier | sed -n "s/^zerotier\.\([^.]*\)=network$/\1/p" | sort -t'[' -k2 -n -r); do
 		case "$(uci -q get "zerotier.$s.setup")|$(uci -q get "zerotier.$s.id")" in
-			1\|*|*\|$ZT_EARTH|*\|$ZEROTIER_NETWORK) uci delete "zerotier.$s" ;;
+			1\|*|*\|$ZT_EARTH) uci delete "zerotier.$s" ;;
+			*\|$ZEROTIER_NETWORK) own='' ;;
 		esac
 	done
-	# A ZeroTier that was already running (set up by hand) is only borrowed:
-	# turning the option off later removes this setup's network, not ZeroTier.
-	if [ -z "$(uci -q get zerotier.global.setup_oneclick)" ]; then
-		if [ "$(uci -q get zerotier.global.enabled)" = 1 ]; then uci set zerotier.global.setup_oneclick=borrowed
-		else uci set zerotier.global.setup_oneclick=1; fi
-	fi
-	uci batch >/dev/null <<-EOF
-		set zerotier.global=zerotier
-		set zerotier.global.enabled='1'
+	uci set zerotier.global=zerotier
+	uci set zerotier.global.enabled='1'
+	uci set zerotier.global.setup_oneclick="$ZT_MARK"
+	[ -n "$own" ] && uci batch >/dev/null <<-EOF
 		set zerotier.oneclick=network
 		set zerotier.oneclick.setup='1'
 		set zerotier.oneclick.id='$ZEROTIER_NETWORK'
@@ -569,18 +579,18 @@ if [ -n "$ZT" ]; then
 		set zerotier.oneclick.allow_dns='0'
 	EOF
 	uci commit zerotier
-	chmod 600 /etc/config/zerotier   # it holds the identity's private key
-	pass "ZeroTier: joins network $ZEROTIER_NETWORK, its interface in the lan zone"
-elif [ "$(uci -q get zerotier.global.setup_oneclick)" = 1 ]; then
+	pass "ZeroTier: joins network $ZEROTIER_NETWORK${own:- (as set up by hand)}; members reach the router only"
+elif [ "$ZT_MARK" = 1 ]; then
 	# Turned off since an earlier run: a ZeroTier this setup installed goes.
 	/etc/init.d/zerotier stop >/dev/null 2>&1; /etc/init.d/zerotier disable >/dev/null 2>&1
 	if [ $PKG = apk ]; then apk del zerotier >/dev/null 2>&1; else opkg remove zerotier >/dev/null 2>&1; fi
 	rm -f /etc/config/zerotier   # kept by the package manager, and it holds the private key
 	ZT_REMOVED=1
-elif [ "$(uci -q get zerotier.global.setup_oneclick)" = borrowed ]; then
+elif [ "$ZT_MARK" = borrowed ]; then
 	# One that was there before: only this setup's network leaves it.
 	uci -q delete zerotier.oneclick; uci -q delete zerotier.global.setup_oneclick
 	uci commit zerotier; /etc/init.d/zerotier restart >/dev/null 2>&1
+	ZT_REMOVED=1
 fi
 
 # ---------------------------------------------------------------- Redlib address
@@ -608,9 +618,28 @@ for s in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.setup='1'$/\1/
 uci -q delete firewall.dns_int
 uci -q delete firewall.dot_fwd
 [ -n "$LAN_ZONE" ] && uci -q del_list "firewall.$LAN_ZONE.network=remote"
-if [ -n "$LAN_ZONE" ] && [ -n "$ZT$ZT_REMOVED" ]; then
-	uci -q del_list "firewall.$LAN_ZONE.device=zt+"
-	[ -n "$ZT" ] && uci add_list "firewall.$LAN_ZONE.device=zt+"
+# ZeroTier: its own zone (made again below while the option is on). An
+# interface can be in one zone only: a zt+ put in the lan zone by hand moves
+# there, and back when the option is turned off.
+if [ -n "$LAN_ZONE" ] && [ -n "$ZT" ] && uci -q get "firewall.$LAN_ZONE.device" | grep -qw 'zt+'; then
+	uci -q del_list "firewall.$LAN_ZONE.device=zt+"; uci set "firewall.$LAN_ZONE.setup_zt_lan=1"
+fi
+if [ -n "$LAN_ZONE" ] && [ -n "$ZT_REMOVED" ] && [ "$(uci -q get "firewall.$LAN_ZONE.setup_zt_lan")" = 1 ]; then
+	uci -q delete "firewall.$LAN_ZONE.setup_zt_lan"
+	[ "$ZT_MARK" = borrowed ] && uci add_list "firewall.$LAN_ZONE.device=zt+"
+fi
+if [ -n "$ZT" ]; then
+	# Input accepted (the router's own services, as from the LAN); no
+	# forwarding anywhere: other devices, the internet and the VPN stay out.
+	uci batch >/dev/null <<-EOF
+		add firewall zone
+		set firewall.@zone[-1].setup='1'
+		set firewall.@zone[-1].name='zerotier'
+		set firewall.@zone[-1].input='ACCEPT'
+		set firewall.@zone[-1].output='ACCEPT'
+		set firewall.@zone[-1].forward='REJECT'
+		add_list firewall.@zone[-1].device='zt+'
+	EOF
 fi
 # Software flow offloading works with SQM; hardware offloading moves packets
 # past the queues SQM shapes, so it is switched to software.
@@ -1082,16 +1111,26 @@ fi
 if [ -n "$ZT" ]; then
 	/etc/init.d/zerotier enable; /etc/init.d/zerotier restart >/dev/null 2>&1
 	zt_net() { zerotier-cli -j listnetworks 2>/dev/null | jsonfilter -e "@[@.id='$ZEROTIER_NETWORK'].$1"; }
-	i=0; until [ "$(zerotier-cli -j info 2>/dev/null | jsonfilter -e @.online)" = true ] || [ $i -ge 60 ]; do sleep 1; i=$((i + 1)); done
+	online() { [ "$(zerotier-cli -j info 2>/dev/null | jsonfilter -e @.online)" = true ]; }
+	i=0; until online || [ $i -ge 60 ]; do sleep 1; i=$((i + 1)); done
 	i=0; until case $(zt_net status) in ''|REQUESTING_CONFIGURATION) false ;; esac || [ $i -ge 20 ]; do sleep 1; i=$((i + 1)); done
 	node=$(zerotier-cli -j info 2>/dev/null | jsonfilter -e @.address)
-	case $(zt_net status) in
+	st=$(zt_net status); online || st=offline
+	# A public network lets anyone with its ID in: leave it.
+	if [ "$(zt_net type)" = PUBLIC ]; then
+		zerotier-cli leave "$ZEROTIER_NETWORK" >/dev/null 2>&1
+		uci -q delete zerotier.oneclick; uci commit zerotier
+		st=public
+	fi
+	case $st in
+		public) fail "ZeroTier: network $ZEROTIER_NETWORK is public (anyone with its ID could reach the router): left it; set Access Control to Private at my.zerotier.com and run the setup again" ;;
+		offline) fail "ZeroTier: the router can't reach ZeroTier's servers (UDP 9993 out; see: logread -e zerotier)" ;;
 		OK) a=$(zt_net 'assignedAddresses[*]' | grep -v : | head -1 | cut -d/ -f1)
 			pass "ZeroTier: router $node is in network $ZEROTIER_NETWORK${a:+ at $a}${a:-, without an IPv4 address (turn on IPv4 auto-assign for the network)}" ;;
 		ACCESS_DENIED|REQUESTING_CONFIGURATION)
 			info "ZeroTier: router $node waits for approval in network $ZEROTIER_NETWORK (my.zerotier.com > Members)" ;;
 		NOT_FOUND) fail "ZeroTier: network $ZEROTIER_NETWORK does not exist (check the ID at my.zerotier.com)" ;;
-		'') fail "ZeroTier: not online (see: logread -e zerotier)" ;;
+		'') fail "ZeroTier: network $ZEROTIER_NETWORK not joined (see: logread -e zerotier)" ;;
 		*) info "ZeroTier: network $ZEROTIER_NETWORK: $(zt_net status)" ;;
 	esac
 fi

@@ -40,11 +40,11 @@ Optional (asked on the first run):
 | Family filtering | Safe search forced on Google (all its country domains, from Google's own list), Bing, DuckDuckGo, Brave, Startpage and Yandex (refreshed every 30 minutes); Hagezi NSFW, "no safe search" and DoH/VPN/proxy bypass lists; anime/manga NSFW sites from [safe-otaku](https://github.com/5wHN28Dg/safe-otaku); every [listed Redlib instance](https://github.com/redlib-org/redlib-instances) except the ones you allow (refreshed daily); DoT and common VPN protocols blocked from the LAN; banIP `doh` and `vpn` feeds. |
 | VPN for chosen sites | Any WireGuard provider (Proton VPN, Mullvad, ...): give it the provider's `.conf` file. Only the domains and IP ranges you list go through the VPN (policy-based routing with `pbr`). IPv6 to those domains never goes around the VPN: it is routed through the VPN when the provider's config has an IPv6 address, otherwise their IPv6 answers are suppressed so devices use IPv4 through the VPN. |
 | Telegram through the VPN | With the VPN on: Telegram's own list of address ranges ([core.telegram.org/resources/cidr.txt](https://core.telegram.org/resources/cidr.txt)) and its web domains (`t.me`, `telegram.org`, `telegram.me`, `telegram.dog`, `telesco.pe`, `telegra.ph`, `graph.org`, `tdesktop.com`, `fragment.com`) go through the VPN. `telegram-ranges` refreshes the list daily at 04:20, downloading it through the VPN (where Telegram is blocked, telegram.org is too) and directly only as a fallback. Every range is checked strictly; a failed or odd download keeps the previous list, and if pbr refuses a new list the previous one comes back. When the VPN has no IPv6, Telegram's IPv6 ranges are rejected from the LAN, so apps switch to IPv4 through the VPN at once. The setup starts from a copy of the list in the repo. No proxy or extra program: pbr already routes by address. |
-| Telegram proxy | With Telegram through the VPN: a SOCKS5 proxy on the router ([microsocks](https://github.com/rofl0r/microsocks), 7 KB) for phones, set once in Telegram (Settings > Data and Storage > Proxy). It answers on the router's LAN address and any ZeroTier address (the firewall keeps it off the internet), needs a password (made by the setup, in `private/config.env`), runs as its own user, and that user can only reach Telegram's addresses (kept current with the list). The router sends its Telegram traffic through the VPN too. Useful away from home where routes into the home network aren't possible, such as ZeroTier's free plan; the setup doesn't install ZeroTier, and its interface (`zt…`) must be in the router's lan zone for the proxy to answer there. New connections from the proxy are allowed only to Telegram's IPv4 ranges, and only leaving through the VPN (checked after routing), plus the router's filtered DNS: with the VPN or pbr down it doesn't work rather than going around it, and it can't reach the router's other services or other devices. Telegram's web pages (`t.me` and the like) are not proxied, only the app's connections. |
+| Telegram proxy | With Telegram through the VPN: a SOCKS5 proxy on the router ([microsocks](https://github.com/rofl0r/microsocks), 7 KB) for phones, set once in Telegram (Settings > Data and Storage > Proxy). It answers on the router's LAN address and any ZeroTier address (the firewall keeps it off the internet), needs a password (made by the setup, in `private/config.env`), runs as its own user, and that user can only reach Telegram's addresses (kept current with the list). The router sends its Telegram traffic through the VPN too. Useful away from home where routes into the home network aren't possible, such as ZeroTier's free plan; with the [ZeroTier](#zerotier) option the proxy also answers on the router's ZeroTier address. New connections from the proxy are allowed only to Telegram's IPv4 ranges, and only leaving through the VPN (checked after routing), plus the router's filtered DNS: with the VPN or pbr down it doesn't work rather than going around it, and it can't reach the router's other services or other devices. Telegram's web pages (`t.me` and the like) are not proxied, only the app's connections. |
 | MangaDex safe-mode reader | The [safe-otaku](https://github.com/5wHN28Dg/safe-otaku) reader at `http://manga.lan`. |
 | Private Redlib | [Redlib](https://github.com/redlib-org/redlib) (Reddit without ads, tracking or the app) at `http://reddit.lan`, for the LAN and remote-access devices. Adult posts are hidden (Redlib's SFW-only mode) while family filtering is on, and off by default otherwise. If your own block list blocks Reddit, devices stay blocked: only Redlib fetches it. See [Redlib](#redlib). |
 | Remote access | Reach your home network and `manga.lan` from anywhere through a WireGuard tunnel to the router. Each device you name (e.g. `phone laptop`) gets its own key; its config file lands in `private/remote/` for the WireGuard app (`qrencode -t ansiutf8 < private/remote/phone.conf` shows it as a QR code for phones). Only the tunnel and your home network go through it, and the device uses the router's DNS, so blocking and family filtering apply. See [Remote access](#remote-access) for what your line needs. |
-| ZeroTier | Remote access that also works when your provider shares one public address among many customers (carrier-grade NAT), where the WireGuard option can't be reached: the router joins your ZeroTier network (free plan) and devices reach the router itself at its ZeroTier address: LuCI, the MangaDex app (`http://<address>/mangadex-safe/`) and the Telegram proxy (not Redlib or other devices at home: the free plan has no routes). About 1 MB of storage and 8 MB of RAM (measured on a Redmi AX6S). See [ZeroTier](#zerotier). |
+| ZeroTier | Remote access that also works when your provider shares one public address among many customers (carrier-grade NAT), where the WireGuard option can't be reached: the router joins your ZeroTier network (free plan) and devices reach the router itself at its ZeroTier address: LuCI, the MangaDex app (`http://<address>/mangadex-safe/`) and the Telegram proxy (nothing behind it: ZeroTier gets its own firewall zone that forwards nowhere). About 1 MB of storage and 8 MB of RAM (measured on a Redmi AX6S). See [ZeroTier](#zerotier). |
 
 Separately, `./kids.sh` gives chosen devices fixed addresses and turns their
 internet off at night, along with the router's own pages (`reddit.lan`,
@@ -165,11 +165,23 @@ Away from home, with the app on, the phone reaches the router at its
 ZeroTier address (the setup prints it once approved). ZeroTier's free plan
 has no managed routes or DNS, so `manga.lan`, `reddit.lan` and the other
 devices at home aren't reachable that way: use the router's ZeroTier address.
-The router's interface joins the lan zone (the same firewall rules as the
-LAN). The setup saves the router's ZeroTier identity in
+
+ZeroTier gets its own firewall zone: members reach the router's own services
+(LuCI, SSH, the MangaDex app, the Telegram proxy, its filtered DNS) and
+nothing behind it, so even a member that adds its own route can't reach other
+devices at home or use your line or VPN. The setup refuses a network whose
+access control is Public (anyone with its ID could join). The kids' night
+rules match devices at home by MAC address, not ZeroTier members: approve
+only your own devices.
+
+If ZeroTier was already set up on the router by hand, the setup only borrows
+it: the router's identity and its other networks stay as they are (a `zt+`
+in the lan zone moves to the ZeroTier zone while the option is on), and
+turning the option off removes only what the setup added. Otherwise the setup saves the router's ZeroTier identity in
 `private/zerotier/identity.secret` and gives it back on re-installs, so a
-reset router doesn't need approving again. Turning the option off removes the
-package and its settings (the identity stays in `private/`).
+reset router doesn't need approving again (one `private/` folder is for one
+router: two routers with the same identity clash). Turning the option off
+removes the package and its settings (the identity stays in `private/`).
 
 ## Proton VPN server choice
 
