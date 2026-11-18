@@ -174,6 +174,21 @@ wizard() {
 	else
 		ENABLE_REMOTE=0
 	fi
+
+	say ""
+	say "ZeroTier: remote access that also works when your provider shares one public"
+	say "address among many customers (CGNAT), where WireGuard can't be reached. Devices"
+	say "reach the router itself (LuCI, the MangaDex app, the Telegram proxy) at its"
+	say "ZeroTier address; the free plan has no routes into the rest of the home network."
+	say "  Create a network at https://my.zerotier.com first (with family filtering on,"
+	say "  that site is blocked at home: use mobile data)."
+	if ask_yn "Join the router to a ZeroTier network?" "$(yn "${ENABLE_ZEROTIER:-0}")"; then
+		ENABLE_ZEROTIER=1
+		ask ZEROTIER_NETWORK "Network ID (16 characters, from my.zerotier.com)" "${ZEROTIER_NETWORK-}"
+		ZEROTIER_NETWORK=$(printf '%s' "$ZEROTIER_NETWORK" | tr 'A-F' 'a-f')
+	else
+		ENABLE_ZEROTIER=0
+	fi
 }
 
 validate() { # stop before saving or using broken settings
@@ -281,6 +296,11 @@ if [ "${PROTON_AUTO:-0}" = 1 ] && [ "${ENABLE_VPN:-0}" = 1 ] && [ -f "$PRIV/prot
 	cp "$PRIV/proton-session" "$STAGE/b/private/"; SENT_SESSION=1
 fi
 [ -d "$PRIV/host_keys" ] && cp -R "$PRIV/host_keys" "$STAGE/b/private/host_keys"
+# The router's ZeroTier identity (saved after the first run): a reset router
+# comes back as the same, already approved, member of the network.
+if [ "${ENABLE_ZEROTIER-}" = 1 ] && [ -f "$PRIV/zerotier/identity.secret" ]; then
+	mkdir -p "$STAGE/b/private/zerotier"; cp "$PRIV/zerotier/identity.secret" "$STAGE/b/private/zerotier/"
+fi
 
 say "Copying settings to the router's RAM ..."
 tar -C "$STAGE/b" -czf - router private \
@@ -316,6 +336,29 @@ if [ "$USED" = "$CONF" ] && [ ! -f "$PRIV/host_keys/host_keys.pub" ] && [ "$rc" 
 		say "Saved the router's SSH host keys in private/host_keys (reused on re-install)."
 	else
 		rm -rf "$PRIV/host_keys"
+	fi
+fi
+
+# ZeroTier: keep the router's identity (only if settings are saved), and say
+# what to approve or where to reach the router.
+if [ "${ENABLE_ZEROTIER-}" = 1 ] && [ "$rc" != 1 ]; then
+	zt=$(ssh_r "uci -q get zerotier.global.secret; zerotier-cli -j listnetworks 2>/dev/null | jsonfilter -e \"@[@.id='$ZEROTIER_NETWORK'].assignedAddresses[*]\" | grep -v :" 2>/dev/null) || zt=
+	secret=$(printf '%s\n' "$zt" | sed -n 1p | grep -xE '[0-9a-f]{10}:0:[0-9a-f]{128}:[0-9a-f]{128}')
+	zt_ip=$(printf '%s\n' "$zt" | sed -n 2p); zt_ip=${zt_ip%/*}
+	if [ -n "$secret" ] && [ "$USED" = "$CONF" ] && [ ! -f "$PRIV/zerotier/identity.secret" ]; then
+		mkdir -p "$PRIV/zerotier"; chmod 700 "$PRIV/zerotier"
+		(umask 077; printf '%s\n' "$secret" > "$PRIV/zerotier/identity.secret")
+		say "Saved the router's ZeroTier identity in private/zerotier (reused on re-install)."
+	fi
+	say ""
+	if [ -n "$zt_ip" ]; then
+		say "ZeroTier: devices in network $ZEROTIER_NETWORK reach the router at $zt_ip"
+		say "  (LuCI; MangaDex app: http://$zt_ip/mangadex-safe/; Telegram proxy server: $zt_ip)."
+	elif [ -n "$secret" ]; then
+		say "ZeroTier: approve the router at https://my.zerotier.com > network $ZEROTIER_NETWORK > Members:"
+		say "  tick Auth for ${secret%%:*}. It connects by itself; its address shows there afterwards."
+	else
+		say "ZeroTier: could not read the router's state (see: logread -e zerotier)."
 	fi
 fi
 

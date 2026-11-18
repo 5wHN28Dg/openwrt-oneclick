@@ -44,6 +44,7 @@ Optional (asked on the first run):
 | MangaDex safe-mode reader | The [safe-otaku](https://github.com/5wHN28Dg/safe-otaku) reader at `http://manga.lan`. |
 | Private Redlib | [Redlib](https://github.com/redlib-org/redlib) (Reddit without ads, tracking or the app) at `http://reddit.lan`, for the LAN and remote-access devices. Adult posts are hidden (Redlib's SFW-only mode) while family filtering is on, and off by default otherwise. If your own block list blocks Reddit, devices stay blocked: only Redlib fetches it. See [Redlib](#redlib). |
 | Remote access | Reach your home network and `manga.lan` from anywhere through a WireGuard tunnel to the router. Each device you name (e.g. `phone laptop`) gets its own key; its config file lands in `private/remote/` for the WireGuard app (`qrencode -t ansiutf8 < private/remote/phone.conf` shows it as a QR code for phones). Only the tunnel and your home network go through it, and the device uses the router's DNS, so blocking and family filtering apply. See [Remote access](#remote-access) for what your line needs. |
+| ZeroTier | Remote access that also works when your provider shares one public address among many customers (carrier-grade NAT), where the WireGuard option can't be reached: the router joins your ZeroTier network (free plan) and devices reach the router itself at its ZeroTier address: LuCI, the MangaDex app (`http://<address>/mangadex-safe/`) and the Telegram proxy (not Redlib or other devices at home: the free plan has no routes). About 1 MB of storage and 8 MB of RAM (measured on a Redmi AX6S). See [ZeroTier](#zerotier). |
 
 Separately, `./kids.sh` gives chosen devices fixed addresses and turns their
 internet off at night, along with the router's own pages (`reddit.lan`,
@@ -143,6 +144,32 @@ Devices outside need to find your home:
 - On a network that uses the same address range as your home (often
   192.168.1.x), the device can't tell the two apart: give your router's LAN an
   uncommon range in LuCI (e.g. 192.168.47.1) if you use remote access a lot.
+
+## ZeroTier
+
+For lines where the router can't be reached from outside (the provider gives
+it a shared, carrier-grade NAT address such as 100.64.x.x), WireGuard remote
+access can't work; ZeroTier does, because the router and your devices both
+connect out to ZeroTier's servers.
+
+1. Create a network at [my.zerotier.com](https://my.zerotier.com) (free
+   plan). With family filtering on, that site is blocked at home (the
+   VPN-bypass list blocks ZeroTier for devices): use mobile data. Keep its
+   access control on Private.
+2. Run `./setup.sh --reconfigure` and give the 16-character network ID.
+3. Approve the router under Members (the setup prints its node ID), then
+   install the ZeroTier One app on your phone, join the same network and
+   approve the phone too.
+
+Away from home, with the app on, the phone reaches the router at its
+ZeroTier address (the setup prints it once approved). ZeroTier's free plan
+has no managed routes or DNS, so `manga.lan`, `reddit.lan` and the other
+devices at home aren't reachable that way: use the router's ZeroTier address.
+The router's interface joins the lan zone (the same firewall rules as the
+LAN). The setup saves the router's ZeroTier identity in
+`private/zerotier/identity.secret` and gives it back on re-installs, so a
+reset router doesn't need approving again. Turning the option off removes the
+package and its settings (the identity stays in `private/`).
 
 ## Proton VPN server choice
 

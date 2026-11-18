@@ -149,10 +149,11 @@ P1=$T/priv1
 # time zone, PPPoE?, PPPoE user, PPPoE password x2, link type number,
 # family filtering?, Redlib allow, VPN?, wg path, VPN iface, domains, subnets, Telegram?, Telegram proxy?,
 # Proton picks the server?, Proton countries, MangaDex?, Redlib?, remote access?, public name, port, devices,
+# ZeroTier?, network ID,
 # create settings? (first) / save? (last)
 printf '%s\n' y "Home Net" "pa'ss word1" "pa'ss word1" adminpw adminpw "$HOME/.ssh/test_key" y \
 	Europe/Berlin "" y "user@isp" ppppass ppppass 7 y "safereddit.com" y "$T/proton.conf" protonvpn \
-	"archive.org newegg.com" "91.108.4.0/22" y y y "pl ch" y y y home.example.org "" "phone tablet" y \
+	"archive.org newegg.com" "91.108.4.0/22" y y y "pl ch" y y y home.example.org "" "phone tablet" y CF719FD540F66C50 y \
 	| ONECLICK_PRIVATE=$P1 "$HERE/setup.sh" --settings-only >"$T/w1.out" 2>&1
 eq "wizard (all on) exit" "$?" 0
 eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config.env")" 600
@@ -186,6 +187,10 @@ eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config
 	PROTON_API='' ENABLE_VPN=0; eq "Proton server choice is ignored without the VPN" "$(check_settings | grep -c PROTON)" 0
 	eq "w1 remote" "$ENABLE_REMOTE|$REMOTE_HOST|$REMOTE_PORT|$REMOTE_NET" "1|home.example.org|51820|10.77.0.0/24"
 	eq "w1 remote devices" "$(remote_devices)" "phone tablet"
+	eq "w1 ZeroTier (ID lower-cased)" "$ENABLE_ZEROTIER|$ZEROTIER_NETWORK" "1|cf719fd540f66c50"
+	ZEROTIER_NETWORK=cf719fd540f66c5; eq "short ZeroTier ID rejected" "$(check_settings | grep -c ZEROTIER_NETWORK)" 1
+	ZEROTIER_NETWORK="cf719fd540f6';x"; eq "unsafe ZeroTier ID rejected" "$(check_settings | grep -c ZEROTIER_NETWORK)" 1
+	ZEROTIER_NETWORK=cf719fd540f66c50
 	eq "w1 remote addresses" "$(printf '%s\n' "$REMOTE_PEERS" | cut -d'|' -f2 | tr '\n' ' ')" "2 3 "
 	is_wg_key "$REMOTE_SERVER_KEY" && ok "w1 remote server key" || bad "w1 remote server key: $REMOTE_SERVER_KEY"
 ) | tee "$T/w1.res"
@@ -194,7 +199,7 @@ fails=$((fails + $(grep -c '^FAIL' "$T/w1.res"))); n=$((n + $(wc -l < "$T/w1.res
 P2=$T/priv2
 # Everything optional off; existing key; save.
 printf '%s\n' y "Flat" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" \
-	UTC us n 9 n n n n n y \
+	UTC us n 9 n n n n n n y \
 	| ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w2.out" 2>&1
 eq "wizard (all off) exit" "$?" 0
 (
@@ -208,12 +213,13 @@ eq "wizard (all off) exit" "$?" 0
 	eq "w2 redlib off" "$ENABLE_REDLIB" 0
 	eq "w2 VPN off: Telegram off" "$TELEGRAM_VIA_VPN|$TELEGRAM_PROXY" "0|0"
 	eq "w2 remote off" "$ENABLE_REMOTE|${REMOTE_PEERS-}" "0|"
+	eq "w2 ZeroTier off" "$ENABLE_ZEROTIER" 0
 ) | tee "$T/w2.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/w2.res"))); n=$((n + $(wc -l < "$T/w2.res")))
 
 # Declining to save keeps nothing on disk.
 P3=$T/priv3
-printf '%s\n' y "X" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n n n \
+printf '%s\n' y "X" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n n n n \
 	| ONECLICK_PRIVATE=$P3 "$HERE/setup.sh" --settings-only >"$T/w3.out" 2>&1
 eq "decline save: exit" "$?" 0
 eq "decline save: nothing written" "$(ls -A "$P3" 2>/dev/null)" ""
@@ -229,11 +235,11 @@ eq "missing link type asked and saved" "$(. "$P2/config.env"; echo "$LINK_TYPE")
 ADBLOCK_EXTRA_LISTS="oisd:big" BANIP_FEEDS="tiktok"
 write_config "$P2/config.env"
 # reconfigure: keep Wi-Fi, keep admin pw, key path, tz, pppoe n, link (keep), family y, redlib, vpn n, mangadex n, remote n
-printf '%s\n' "" n n "" "" "" n "" y "" n n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w5.out" 2>&1
+printf '%s\n' "" n n "" "" "" n "" y "" n n n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w5.out" 2>&1
 eq "family on later: exit" "$?" 0
 eq "family on later: lists" "$(. "$P2/config.env"; echo "$ADBLOCK_EXTRA_LISTS")" "oisd:big hagezi:nsfw hagezi:nosafesearch hagezi:doh-vpn-proxy-bypass"
 eq "family on later: feeds" "$(. "$P2/config.env"; echo "$BANIP_FEEDS")" "tiktok doh vpn"
-printf '%s\n' "" n n "" "" "" n "" n n n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w6.out" 2>&1
+printf '%s\n' "" n n "" "" "" n "" n n n n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w6.out" 2>&1
 eq "family off later: lists" "$(. "$P2/config.env"; echo "$ADBLOCK_EXTRA_LISTS")" "oisd:big"
 eq "family off later: feeds" "$(. "$P2/config.env"; echo "$BANIP_FEEDS")" "tiktok"
 
@@ -259,7 +265,7 @@ eq "interrupt saves nothing" "$(ls -A "$T/priv-int" 2>/dev/null)" ""
 	REDLIB_ALLOW=ok.example; eq "valid settings pass" "$(check_settings)" ""
 ) | tee "$T/v.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/v.res"))); n=$((n + $(wc -l < "$T/v.res")))
-printf '%s\n' y "X" "short" "short" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n n y \
+printf '%s\n' y "X" "short" "short" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n n n y \
 	| ONECLICK_PRIVATE=$T/priv-short "$HERE/setup.sh" --settings-only >"$T/short.out" 2>&1
 rc=$?
 if [ "$rc" -ne 0 ] && grep -q "WIFI_KEY must be" "$T/short.out" && [ -z "$(ls -A "$T/priv-short" 2>/dev/null)" ]; then ok "wizard refuses a short Wi-Fi key, saves nothing"; else bad "wizard refuses a short Wi-Fi key (rc $rc)"; fi
@@ -298,7 +304,7 @@ eq "country for Asia/Baghdad" "$(country_for_tz Asia/Baghdad)" IQ
 
 # --- changing the SSH key keeps the old one for the next login --------------------
 ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/new_key"
-printf '%s\n' "" n n "$HOME/.ssh/new_key" "" "" n "" n n n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/k.out" 2>&1
+printf '%s\n' "" n n "$HOME/.ssh/new_key" "" "" n "" n n n n n n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/k.out" 2>&1
 (
 	. "$P2/config.env"
 	eq "new key saved" "$SSH_KEY" "$HOME/.ssh/new_key"
@@ -320,7 +326,7 @@ eq "old ADBLOCK_LISTS: base lists dropped, additions kept" "$(. "$P2/config.env"
 
 # --- remote access ------------------------------------------------------------------
 # Turned on later with a name, then "-" goes back to the router's own address.
-printf '%s\n' "" n n "" "" "" n "" n n n n y home.example.org "" "tv" | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/r1.out" 2>&1
+printf '%s\n' "" n n "" "" "" n "" n n n n y home.example.org "" "tv" n | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/r1.out" 2>&1
 eq "remote on later" "$(. "$P2/config.env"; echo "$ENABLE_REMOTE|$REMOTE_HOST|$(remote_devices)")" "1|home.example.org|tv"
 printf '%s\n' "" n n "" "" "" n "" n n n n y - "" "" | ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/r2.out" 2>&1
 eq "remote host cleared with -" "$(. "$P2/config.env"; echo "$REMOTE_HOST|$(remote_devices)")" "|tv"

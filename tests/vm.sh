@@ -145,6 +145,8 @@ make_private() { # dir full|minimal
 laptop|3|$(wg_genkey)|$(wg_psk)"
 			for i in 4 5 6 7 8 9 10 11 12; do REMOTE_PEERS="$REMOTE_PEERS
 dev$i|$i|$(wg_genkey)|$(wg_psk)"; done
+			# A network whose controller doesn't exist: the router waits for approval.
+			ENABLE_ZEROTIER=1 ZEROTIER_NETWORK=$ZT_TEST_NET
 			SPEEDTEST_URL=$SPEED_URL
 		else
 			FAMILY_FILTER=0 ADBLOCK_EXTRA_LISTS='' BANIP_FEEDS='' ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0 ENABLE_REDLIB=0
@@ -452,12 +454,35 @@ upgrade_checks() {
 	[ -z "$r" ] && ok "after-upgrade fixes run once per firmware: a service switched off by hand stays off" || bad "after-upgrade on a later boot: $r"
 }
 
+# ZeroTier: joined (waiting for approval: the test network has no
+# controller), its interfaces in the lan zone, the public example network
+# gone, the identity saved on the laptop and only readable by root.
+ZT_TEST_NET=deadbeef00c0ffee
+zerotier_checks() {
+	r=$(vm_ssh "pidof zerotier-one >/dev/null && echo running
+		uci -q get zerotier.oneclick.id; uci show zerotier | grep -c '=network'
+		uci show zerotier | grep -c 8056c2e21c000001
+		stat -c %a /etc/config/zerotier
+		uci -q get firewall.@zone[0].device | grep -qw 'zt+' && echo in-lan
+		zerotier-cli -j listnetworks | jsonfilter -e '@[*].id'" 2>&1 | tr '\n' ' ')
+	[ "$r" = "running $ZT_TEST_NET 1 0 600 in-lan $ZT_TEST_NET " ] && ok "ZeroTier: joins the network, only that one, in the lan zone, settings readable by root only" \
+		|| bad "ZeroTier on the router (want 'running $ZT_TEST_NET 1 0 600 in-lan $ZT_TEST_NET'): $r"
+	grep -q "^INFO  ZeroTier: router [0-9a-f]\{10\} waits for approval" "$W/full.log" && ok "ZeroTier: report asks to approve the router" \
+		|| bad "ZeroTier report: $(grep ZeroTier "$W/full.log" | tr '\n' ' ')"
+	node=$(vm_ssh 'zerotier-cli -j info | jsonfilter -e @.address')
+	f=$P/zerotier/identity.secret
+	if [ -f "$f" ] && [ "$(stat -c %a "$f")" = 600 ] && [ "$(cut -d: -f1 "$f")" = "$node" ]; then ok "ZeroTier: the router's identity saved in private/ (mode 600)"
+	else bad "ZeroTier identity on the laptop: node $node, file $(ls -l "$f" 2>&1)"; fi
+	grep -q "approve the router at https://my.zerotier.com" "$W/full.log" && ok "ZeroTier: setup.sh says what to approve" || bad "ZeroTier: no approval hint from setup.sh"
+}
+
 scenario_full() {
 	echo "== full: every option on"
 	start_vm; P=$W/p-full; make_private "$P" full
 	shape_line
 	run_setup "$P" "$W/full.log"
 	abl_check
+	zerotier_checks
 	# SQM: 8 streams at 2.5 Mbit/s each = 20 Mbit/s down, shaped at 90%; the
 	# bounds allow for packet framing (counted, about 4%). Up: the 10 Mbit/s
 	# shaper (see shape_line) counts framing itself, so 90% is ~9000 and the
@@ -525,7 +550,13 @@ scenario_full() {
 	# Hardware flow offloading switched on by hand goes back to software (it bypasses SQM).
 	vm_ssh 'uci set firewall.@defaults[0].flow_offloading_hw=1; uci commit firewall'
 	printf "PROTON_UID='uid-test'\nPROTON_REFRESH='refresh-0'\n" > "$P/proton-session"   # an old copy
+	# ZeroTier: a router that lost its identity gets the saved one back; a
+	# network made by hand for the same ID is taken over, not doubled.
+	vm_ssh "uci delete zerotier.global.secret; uci set zerotier.home=network; uci set zerotier.home.id=$ZT_TEST_NET; uci commit zerotier"
 	run_setup "$P" "$W/full-rerun.log"
+	r=$(vm_ssh "zerotier-cli -j info | jsonfilter -e @.address; uci show zerotier | grep -c '=network'" | tr '\n' ' ')
+	[ "$r" = "$(cut -d: -f1 "$P/zerotier/identity.secret") 1 " ] && ok "ZeroTier re-run: the saved identity comes back, one network" \
+		|| bad "ZeroTier re-run (want '$(cut -d: -f1 "$P/zerotier/identity.secret") 1'): $r"
 	r=$(vm_ssh 'uci show pbr | grep -c "telegram=.1."; grep -c telegram-ranges /etc/crontabs/root' | tr '\n' ' ')
 	[ "$r" = "2 1 " ] && ok "re-run: two Telegram policies (devices, proxy), one daily job" || bad "re-run Telegram duplicates (policy cron): $r"
 	r=$(vm_ssh 'uci -q get firewall.@defaults[0].flow_offloading; uci -q get firewall.@defaults[0].flow_offloading_hw' | tr '\n' ' ')
@@ -604,7 +635,7 @@ scenario_full() {
 	# shellcheck disable=SC2034  # write_config reads the settings through eval
 	(
 		. "$P/config.env"
-		ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0 ENABLE_REDLIB=0
+		ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0 ENABLE_REDLIB=0 ENABLE_ZEROTIER=0
 		SSH_KEY_OLD=$SSH_KEY SSH_PUBKEYS_OLD=$SSH_PUBKEYS SSH_KEY=$W/key2 SSH_PUBKEYS=$(cat "$W/key2.pub")
 		write_config "$P/config.env"
 	)
@@ -631,6 +662,9 @@ scenario_full() {
 		ip -4 addr | grep -q "192.168.1.254" && echo ip
 		true' | tr '\n' ' ')
 	[ -z "$left" ] && ok "Redlib turned off: program, files, user, address, rules, cron and name removed" || bad "Redlib leftovers: $left"
+	left=$(vm_ssh 'pidof zerotier-one >/dev/null && echo running; apk info -e zerotier >/dev/null 2>&1 && echo package
+		[ -e /etc/config/zerotier ] && echo config; uci -q get firewall.@zone[0].device | grep -q zt && echo in-lan; true' | tr '\n' ' ')
+	[ -z "$left" ] && ok "ZeroTier turned off: package, settings with the private key, lan-zone entry removed" || bad "ZeroTier leftovers: $left"
 	left=$(vm_ssh 'ls -d /etc/proton /etc/proton-pick.conf /usr/sbin/proton-pick 2>/dev/null; grep -c proton /etc/crontabs/root /etc/rc.local /etc/sysupgrade.conf' | tr '\n' ' ')
 	[ "$left" = "/etc/crontabs/root:0 /etc/rc.local:0 /etc/sysupgrade.conf:0 " ] && ok "VPN turned off: Proton session, settings and jobs removed" || bad "Proton leftovers: $left"
 	left=$(vm_ssh 'uci show network | grep -c "remote"; uci show firewall | grep -c "remote\|Remote"; wg show remote 2>/dev/null | grep -c peer' | tr '\n' ' ')
@@ -669,6 +703,7 @@ scenario_minimal() {
 		uci -q get network.remote >/dev/null && echo "remote interface"
 		[ -e /etc/init.d/redlib ] && echo "redlib"
 		apk info -e microsocks >/dev/null 2>&1 && echo "microsocks"
+		apk info -e zerotier >/dev/null 2>&1 && echo "zerotier"
 		apk info -e bind-dig >/dev/null 2>&1 && echo "bind-dig"
 		apk info -e openssl-util >/dev/null 2>&1 && echo "openssl-util"
 		true')

@@ -49,6 +49,11 @@ lan_st=$(ubus call network.interface.lan status)
 lan_sub=$(echo "$lan_st" | jsonfilter -e '@["ipv4-address"][0].address')/$(echo "$lan_st" | jsonfilter -e '@["ipv4-address"][0].mask')
 case $lan_sub in /*|*/) lan_sub=$LAN_IP/24 ;; esac
 
+# ZeroTier: the network ID goes into uci and a jsonfilter expression.
+if [ -n "$ZT" ]; then
+	printf '%s\n' "${ZEROTIER_NETWORK-}" | grep -qxE '[0-9a-f]{16}' || { echo "ZEROTIER_NETWORK must be the 16-character network ID"; exit 1; }
+	[ -n "$LAN_ZONE" ] || { echo "no firewall zone named lan, needed for ZeroTier"; exit 1; }
+fi
 # Remote access: everything that can stop it is checked before anything changes.
 REMOTE=; on "${ENABLE_REMOTE:-0}" && REMOTE=1
 if [ -n "$REMOTE" ]; then
@@ -102,6 +107,10 @@ PACKAGES="luci luci-ssl luci-app-attendedsysupgrade owut luci-app-banip luci-app
 # Telegram proxy for phones (SOCKS5, 7 KB): only with Telegram through the VPN.
 TG_PROXY=''; [ -n "$VPN" ] && on "${TELEGRAM_VIA_VPN:-0}" && on "${TELEGRAM_PROXY:-0}" && TG_PROXY=1
 [ -n "$TG_PROXY" ] && PACKAGES="$PACKAGES microsocks"
+# ZeroTier (about 1 MB, 8 MB of RAM on a Redmi AX6S): remote access where the
+# provider's shared address (CGNAT) leaves WireGuard unreachable.
+ZT=''; on "${ENABLE_ZEROTIER:-0}" && ZT=1
+[ -n "$ZT" ] && PACKAGES="$PACKAGES zerotier"
 [ "${WAN_PROTO:-dhcp}" = pppoe ] && PACKAGES="$PACKAGES ppp-mod-pppoe luci-proto-ppp"
 
 # Copy files only: never apply directory modes to system directories like /etc.
@@ -514,6 +523,57 @@ if [ -n "$REMOTE" ]; then
 	pass "WireGuard server on UDP $REMOTE_PORT, $REMOTE_N devices in $REMOTE_NET, reaching $lan_sub"
 fi
 
+# ---------------------------------------------------------------- ZeroTier
+# Remote access behind a provider's shared address: the router and the
+# devices both connect out to ZeroTier. Devices reach the router itself at its
+# ZeroTier address (LuCI, the MangaDex app, the Telegram proxy); the free plan
+# has no routes or DNS into the rest of the home network. Its interfaces
+# (zt...) join the lan zone below. The identity from
+# private/zerotier/identity.secret (setup.sh saves it after the first run)
+# keeps a reset router an approved member.
+ZT_EARTH=8056c2e21c000001   # ZeroTier's public network, in the package's example config
+ZT_REMOVED=''
+if [ -n "$ZT" ]; then
+	step "ZeroTier"
+	touch /etc/config/zerotier
+	if [ -f "$PRIV/zerotier/identity.secret" ]; then
+		secret=$(tr -d '\n' < "$PRIV/zerotier/identity.secret")
+		if printf '%s\n' "$secret" | grep -qxE '[0-9a-f]{10}:0:[0-9a-f]{128}:[0-9a-f]{128}'; then
+			uci set zerotier.global=zerotier
+			uci set zerotier.global.secret="$secret"
+		else
+			fail "private/zerotier/identity.secret is not a ZeroTier identity: the router keeps its own"
+		fi
+	fi
+	# Earlier runs' network, the public one, and one made by hand for the same ID go first.
+	for s in $(uci -q show zerotier | sed -n "s/^zerotier\.\([^.]*\)=network$/\1/p" | sort -t'[' -k2 -n -r); do
+		case "$(uci -q get "zerotier.$s.setup")|$(uci -q get "zerotier.$s.id")" in
+			1\|*|*\|$ZT_EARTH|*\|$ZEROTIER_NETWORK) uci delete "zerotier.$s" ;;
+		esac
+	done
+	uci batch >/dev/null <<-EOF
+		set zerotier.global=zerotier
+		set zerotier.global.enabled='1'
+		set zerotier.global.setup_oneclick='1'
+		set zerotier.oneclick=network
+		set zerotier.oneclick.setup='1'
+		set zerotier.oneclick.id='$ZEROTIER_NETWORK'
+		set zerotier.oneclick.allow_managed='1'
+		set zerotier.oneclick.allow_global='0'
+		set zerotier.oneclick.allow_default='0'
+		set zerotier.oneclick.allow_dns='0'
+	EOF
+	uci commit zerotier
+	chmod 600 /etc/config/zerotier   # it holds the identity's private key
+	pass "ZeroTier: joins network $ZEROTIER_NETWORK, its interface in the lan zone"
+elif [ "$(uci -q get zerotier.global.setup_oneclick)" = 1 ]; then
+	# Turned off since an earlier run: only a ZeroTier this setup made is removed.
+	/etc/init.d/zerotier stop >/dev/null 2>&1; /etc/init.d/zerotier disable >/dev/null 2>&1
+	if [ $PKG = apk ]; then apk del zerotier >/dev/null 2>&1; else opkg remove zerotier >/dev/null 2>&1; fi
+	rm -f /etc/config/zerotier   # kept by the package manager, and it holds the private key
+	ZT_REMOVED=1
+fi
+
 # ---------------------------------------------------------------- Redlib address
 # A /32 address on the LAN bridge: devices reach it directly, and DHCP keeps
 # handing out the router's main address (dnsmasq only uses addresses whose
@@ -539,6 +599,10 @@ for s in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.setup='1'$/\1/
 uci -q delete firewall.dns_int
 uci -q delete firewall.dot_fwd
 [ -n "$LAN_ZONE" ] && uci -q del_list "firewall.$LAN_ZONE.network=remote"
+if [ -n "$LAN_ZONE" ] && [ -n "$ZT$ZT_REMOVED" ]; then
+	uci -q del_list "firewall.$LAN_ZONE.device=zt+"
+	[ -n "$ZT" ] && uci add_list "firewall.$LAN_ZONE.device=zt+"
+fi
 # Software flow offloading works with SQM; hardware offloading moves packets
 # past the queues SQM shapes, so it is switched to software.
 uci batch >/dev/null <<-EOF
@@ -1006,6 +1070,21 @@ if [ -n "$REDLIB" ]; then
 	fi
 fi
 /etc/init.d/cron enable; /etc/init.d/cron restart
+if [ -n "$ZT" ]; then
+	/etc/init.d/zerotier enable; /etc/init.d/zerotier restart >/dev/null 2>&1
+	zt_net() { zerotier-cli -j listnetworks 2>/dev/null | jsonfilter -e "@[@.id='$ZEROTIER_NETWORK'].$1"; }
+	i=0; until [ "$(zerotier-cli -j info 2>/dev/null | jsonfilter -e @.online)" = true ] || [ $i -ge 60 ]; do sleep 1; i=$((i + 1)); done
+	i=0; until case $(zt_net status) in ''|REQUESTING_CONFIGURATION) false ;; esac || [ $i -ge 20 ]; do sleep 1; i=$((i + 1)); done
+	node=$(zerotier-cli -j info 2>/dev/null | jsonfilter -e @.address)
+	case $(zt_net status) in
+		OK) pass "ZeroTier: router $node is in network $ZEROTIER_NETWORK at $(zt_net 'assignedAddresses[*]' | grep -v : | head -1 | cut -d/ -f1)" ;;
+		ACCESS_DENIED|REQUESTING_CONFIGURATION)
+			info "ZeroTier: router $node waits for approval in network $ZEROTIER_NETWORK (my.zerotier.com > Members)" ;;
+		NOT_FOUND) fail "ZeroTier: network $ZEROTIER_NETWORK does not exist (check the ID at my.zerotier.com)" ;;
+		'') fail "ZeroTier: not online (see: logread -e zerotier)" ;;
+		*) info "ZeroTier: network $ZEROTIER_NETWORK: $(zt_net status)" ;;
+	esac
+fi
 /etc/init.d/banip enable; /etc/init.d/banip restart >/dev/null 2>&1
 if [ -n "$VPN" ]; then
 	/etc/init.d/pbr enable; /etc/init.d/pbr restart >/dev/null 2>&1
