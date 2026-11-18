@@ -50,6 +50,7 @@ lan_sub=$(echo "$lan_st" | jsonfilter -e '@["ipv4-address"][0].address')/$(echo 
 case $lan_sub in /*|*/) lan_sub=$LAN_IP/24 ;; esac
 
 # ZeroTier: the network ID goes into uci and a jsonfilter expression.
+ZT=''; on "${ENABLE_ZEROTIER:-0}" && ZT=1
 if [ -n "$ZT" ]; then
 	printf '%s\n' "${ZEROTIER_NETWORK-}" | grep -qxE '[0-9a-f]{16}' || { echo "ZEROTIER_NETWORK must be the 16-character network ID"; exit 1; }
 	[ -n "$LAN_ZONE" ] || { echo "no firewall zone named lan, needed for ZeroTier"; exit 1; }
@@ -109,7 +110,6 @@ TG_PROXY=''; [ -n "$VPN" ] && on "${TELEGRAM_VIA_VPN:-0}" && on "${TELEGRAM_PROX
 [ -n "$TG_PROXY" ] && PACKAGES="$PACKAGES microsocks"
 # ZeroTier (about 1 MB, 8 MB of RAM on a Redmi AX6S): remote access where the
 # provider's shared address (CGNAT) leaves WireGuard unreachable.
-ZT=''; on "${ENABLE_ZEROTIER:-0}" && ZT=1
 [ -n "$ZT" ] && PACKAGES="$PACKAGES zerotier"
 [ "${WAN_PROTO:-dhcp}" = pppoe ] && PACKAGES="$PACKAGES ppp-mod-pppoe luci-proto-ppp"
 
@@ -551,10 +551,15 @@ if [ -n "$ZT" ]; then
 			1\|*|*\|$ZT_EARTH|*\|$ZEROTIER_NETWORK) uci delete "zerotier.$s" ;;
 		esac
 	done
+	# A ZeroTier that was already running (set up by hand) is only borrowed:
+	# turning the option off later removes this setup's network, not ZeroTier.
+	if [ -z "$(uci -q get zerotier.global.setup_oneclick)" ]; then
+		if [ "$(uci -q get zerotier.global.enabled)" = 1 ]; then uci set zerotier.global.setup_oneclick=borrowed
+		else uci set zerotier.global.setup_oneclick=1; fi
+	fi
 	uci batch >/dev/null <<-EOF
 		set zerotier.global=zerotier
 		set zerotier.global.enabled='1'
-		set zerotier.global.setup_oneclick='1'
 		set zerotier.oneclick=network
 		set zerotier.oneclick.setup='1'
 		set zerotier.oneclick.id='$ZEROTIER_NETWORK'
@@ -567,11 +572,15 @@ if [ -n "$ZT" ]; then
 	chmod 600 /etc/config/zerotier   # it holds the identity's private key
 	pass "ZeroTier: joins network $ZEROTIER_NETWORK, its interface in the lan zone"
 elif [ "$(uci -q get zerotier.global.setup_oneclick)" = 1 ]; then
-	# Turned off since an earlier run: only a ZeroTier this setup made is removed.
+	# Turned off since an earlier run: a ZeroTier this setup installed goes.
 	/etc/init.d/zerotier stop >/dev/null 2>&1; /etc/init.d/zerotier disable >/dev/null 2>&1
 	if [ $PKG = apk ]; then apk del zerotier >/dev/null 2>&1; else opkg remove zerotier >/dev/null 2>&1; fi
 	rm -f /etc/config/zerotier   # kept by the package manager, and it holds the private key
 	ZT_REMOVED=1
+elif [ "$(uci -q get zerotier.global.setup_oneclick)" = borrowed ]; then
+	# One that was there before: only this setup's network leaves it.
+	uci -q delete zerotier.oneclick; uci -q delete zerotier.global.setup_oneclick
+	uci commit zerotier; /etc/init.d/zerotier restart >/dev/null 2>&1
 fi
 
 # ---------------------------------------------------------------- Redlib address
@@ -1077,7 +1086,8 @@ if [ -n "$ZT" ]; then
 	i=0; until case $(zt_net status) in ''|REQUESTING_CONFIGURATION) false ;; esac || [ $i -ge 20 ]; do sleep 1; i=$((i + 1)); done
 	node=$(zerotier-cli -j info 2>/dev/null | jsonfilter -e @.address)
 	case $(zt_net status) in
-		OK) pass "ZeroTier: router $node is in network $ZEROTIER_NETWORK at $(zt_net 'assignedAddresses[*]' | grep -v : | head -1 | cut -d/ -f1)" ;;
+		OK) a=$(zt_net 'assignedAddresses[*]' | grep -v : | head -1 | cut -d/ -f1)
+			pass "ZeroTier: router $node is in network $ZEROTIER_NETWORK${a:+ at $a}${a:-, without an IPv4 address (turn on IPv4 auto-assign for the network)}" ;;
 		ACCESS_DENIED|REQUESTING_CONFIGURATION)
 			info "ZeroTier: router $node waits for approval in network $ZEROTIER_NETWORK (my.zerotier.com > Members)" ;;
 		NOT_FOUND) fail "ZeroTier: network $ZEROTIER_NETWORK does not exist (check the ID at my.zerotier.com)" ;;

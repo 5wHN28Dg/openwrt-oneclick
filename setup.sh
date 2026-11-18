@@ -342,9 +342,9 @@ fi
 # ZeroTier: keep the router's identity (only if settings are saved), and say
 # what to approve or where to reach the router.
 if [ "${ENABLE_ZEROTIER-}" = 1 ] && [ "$rc" != 1 ]; then
-	zt=$(ssh_r "uci -q get zerotier.global.secret; zerotier-cli -j listnetworks 2>/dev/null | jsonfilter -e \"@[@.id='$ZEROTIER_NETWORK'].assignedAddresses[*]\" | grep -v :" 2>/dev/null) || zt=
-	secret=$(printf '%s\n' "$zt" | sed -n 1p | grep -xE '[0-9a-f]{10}:0:[0-9a-f]{128}:[0-9a-f]{128}')
-	zt_ip=$(printf '%s\n' "$zt" | sed -n 2p); zt_ip=${zt_ip%/*}
+	secret=$(ssh_r 'uci -q get zerotier.global.secret' 2>/dev/null | grep -xE '[0-9a-f]{10}:0:[0-9a-f]{128}:[0-9a-f]{128}')
+	zt_ip=$(ssh_r "zerotier-cli -j listnetworks 2>/dev/null | jsonfilter -e \"@[@.id='$ZEROTIER_NETWORK'].assignedAddresses[*]\"" 2>/dev/null | grep -v : | head -1)
+	zt_ip=${zt_ip%/*}
 	if [ -n "$secret" ] && [ "$USED" = "$CONF" ] && [ ! -f "$PRIV/zerotier/identity.secret" ]; then
 		mkdir -p "$PRIV/zerotier"; chmod 700 "$PRIV/zerotier"
 		(umask 077; printf '%s\n' "$secret" > "$PRIV/zerotier/identity.secret")

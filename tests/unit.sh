@@ -189,7 +189,7 @@ eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config
 	eq "w1 remote devices" "$(remote_devices)" "phone tablet"
 	eq "w1 ZeroTier (ID lower-cased)" "$ENABLE_ZEROTIER|$ZEROTIER_NETWORK" "1|cf719fd540f66c50"
 	ZEROTIER_NETWORK=cf719fd540f66c5; eq "short ZeroTier ID rejected" "$(check_settings | grep -c ZEROTIER_NETWORK)" 1
-	ZEROTIER_NETWORK="cf719fd540f6';x"; eq "unsafe ZeroTier ID rejected" "$(check_settings | grep -c ZEROTIER_NETWORK)" 1
+	ZEROTIER_NETWORK="cf719fd540f6';xy"; eq "unsafe ZeroTier ID rejected" "$(check_settings | grep -c ZEROTIER_NETWORK)" 1
 	ZEROTIER_NETWORK=cf719fd540f66c50
 	eq "w1 remote addresses" "$(printf '%s\n' "$REMOTE_PEERS" | cut -d'|' -f2 | tr '\n' ' ')" "2 3 "
 	is_wg_key "$REMOTE_SERVER_KEY" && ok "w1 remote server key" || bad "w1 remote server key: $REMOTE_SERVER_KEY"

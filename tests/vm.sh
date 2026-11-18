@@ -708,6 +708,23 @@ scenario_minimal() {
 		apk info -e openssl-util >/dev/null 2>&1 && echo "openssl-util"
 		true')
 	[ -z "$r" ] && ok "nothing optional installed" || bad "optional parts present: $(echo $r)"
+	# A ZeroTier set up by hand is only borrowed: turning the option off again
+	# takes this setup's network out and leaves the rest (package, own network).
+	vm_ssh 'apk add zerotier >/dev/null 2>&1; uci set zerotier.global.enabled=1; uci set zerotier.mine=network
+		uci set zerotier.mine.id=feedfacecafe0001; uci commit zerotier; /etc/init.d/zerotier restart' >/dev/null 2>&1
+	# shellcheck disable=SC2034  # write_config reads the settings through eval
+	(. "$P/config.env"; ENABLE_ZEROTIER=1 ZEROTIER_NETWORK=$ZT_TEST_NET; write_config "$P/config.env")
+	run_setup "$P" "$W/minimal-zt.log"
+	r=$(vm_ssh 'uci -q get zerotier.oneclick.id; uci -q get zerotier.global.setup_oneclick' | tr '\n' ' ')
+	[ "$r" = "$ZT_TEST_NET borrowed " ] && ok "ZeroTier set up by hand: the setup adds its network, marks ZeroTier as borrowed" || bad "ZeroTier borrowed: $r"
+	# shellcheck disable=SC2034
+	(. "$P/config.env"; ENABLE_ZEROTIER=0; write_config "$P/config.env")
+	run_setup "$P" "$W/minimal-zt-off.log"
+	r=$(vm_ssh 'apk info -e zerotier >/dev/null 2>&1 && echo package; uci -q get zerotier.mine.id
+		uci -q get zerotier.oneclick.id || echo no-oneclick; uci -q get zerotier.global.setup_oneclick || echo no-mark
+		pidof zerotier-one >/dev/null && echo running' | tr '\n' ' ')
+	[ "$r" = "package feedfacecafe0001 no-oneclick no-mark running " ] && ok "ZeroTier set up by hand, option off again: only the setup's network removed" \
+		|| bad "ZeroTier borrowed then off (want 'package feedfacecafe0001 no-oneclick no-mark running'): $r"
 }
 
 case ${1:-both} in
