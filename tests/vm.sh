@@ -149,7 +149,7 @@ dev$i|$i|$(wg_genkey)|$(wg_psk)"; done
 			ENABLE_ZEROTIER=1 ZEROTIER_NETWORK=$ZT_TEST_NET
 			SPEEDTEST_URL=$SPEED_URL
 		else
-			FAMILY_FILTER=0 ADBLOCK_EXTRA_LISTS='' BANIP_FEEDS='' ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0 ENABLE_REDLIB=0
+			FAMILY_FILTER=0 ADBLOCK_EXTRA_LISTS='' BANIP_FEEDS='' ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0 ENABLE_REDLIB=0 ENABLE_ZEROTIER=0
 			unset PROTON_AUTO PROTON_COUNTRIES PROTON_API
 			SQM_DOWN=50000 SQM_UP=10000   # fixed rates: nothing is measured
 		fi
@@ -463,7 +463,7 @@ zerotier_checks() {
 		zerotier-cli -j info | jsonfilter -e @.online
 		uci -q get zerotier.oneclick.id; uci show zerotier | grep -c '=network'
 		uci show zerotier | grep -c 8056c2e21c000001
-		stat -c %a /etc/config/zerotier
+		ls -l /etc/config/zerotier | cut -c1-10
 		uci -q get firewall.@zone[0].device | grep -q zt && echo in-lan
 		z=\$(uci show firewall | sed -n \"s/^firewall\\.\\([^.]*\\)\\.name='zerotier'\$/\\1/p\")
 		echo zone=\$(uci -q get firewall.\$z.device)/\$(uci -q get firewall.\$z.input)/\$(uci -q get firewall.\$z.forward)
@@ -471,7 +471,7 @@ zerotier_checks() {
 		nft list chain inet fw4 forward_zerotier >/dev/null 2>&1 && echo chain
 		nft list chain inet fw4 forward_zerotier 2>/dev/null | grep -c accept_to
 		zerotier-cli -j listnetworks | jsonfilter -e '@[*].id'" 2>&1 | tr '\n' ' ')
-	want="running true $ZT_TEST_NET 1 0 600 zone=zt+/ACCEPT/REJECT 0 chain 0 $ZT_TEST_NET "
+	want="running true $ZT_TEST_NET 1 0 -rw------- zone=zt+/ACCEPT/REJECT 0 chain 0 $ZT_TEST_NET "
 	[ "$r" = "$want" ] && ok "ZeroTier: online, joins only that network, own zone that forwards nowhere, settings readable by root only" \
 		|| bad "ZeroTier on the router (want '$want'): $r"
 	grep -q "^INFO  ZeroTier: router [0-9a-f]\{10\} waits for approval" "$W/full.log" && ok "ZeroTier: report asks to approve the router" \
