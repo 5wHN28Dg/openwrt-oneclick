@@ -71,7 +71,13 @@ if [ -n "$ZT" ]; then
 			case " $zt_ifs " in *" $n "*) ztbad="$ztbad $z:$n" ;; esac
 		done
 	done
-	[ -z "$ztbad" ] || { echo "ZeroTier interfaces are in firewall zones this tool doesn't manage ($ztbad ): take them out there first (the setup gives ZeroTier its own zone)"; exit 1; }
+	# ... or bridged into a network device, or named in rules and forwardings
+	# this tool didn't make (they would apply to the new zone).
+	for d in $(uci -q show network | sed -n "s/^network\.\([^.]*\)\.ports=.*'zt.*/\1/p"); do ztbad="$ztbad bridge:$d"; done
+	for r in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.\(src\|dest\)='zerotier'$/\1/p"); do
+		[ "$(uci -q get "firewall.$r.setup")" = 1 ] || ztbad="$ztbad rule:$r"
+	done
+	[ -z "$ztbad" ] || { echo "ZeroTier interfaces are in firewall zones, bridges or rules this tool doesn't manage ($ztbad ): take them out there first (the setup gives ZeroTier its own zone)"; exit 1; }
 fi
 # Remote access: everything that can stop it is checked before anything changes.
 REMOTE=; on "${ENABLE_REMOTE:-0}" && REMOTE=1
@@ -616,7 +622,12 @@ uci -q delete firewall.dot_fwd
 [ -n "$LAN_ZONE" ] && uci -q del_list "firewall.$LAN_ZONE.network=remote"
 # ZeroTier: its own zone (made again below while the option is on). A zt+
 # put in the lan zone by hand moves there (an interface matches one zone).
-[ -n "$LAN_ZONE" ] && [ -n "$ZT$ZT_REMOVED" ] && uci -q del_list "firewall.$LAN_ZONE.device=zt+"
+# (as a list entry or a single option: fw4 reads both)
+if [ -n "$LAN_ZONE" ] && [ -n "$ZT$ZT_REMOVED" ]; then
+	uci -q del_list "firewall.$LAN_ZONE.device=zt+"
+	[ "$(uci -q get "firewall.$LAN_ZONE.device")" = 'zt+' ] && uci -q delete "firewall.$LAN_ZONE.device"
+	uci -q get "firewall.$LAN_ZONE.device" | grep -qw 'zt+' && die "could not take zt+ out of the lan zone"
+fi
 if [ -n "$ZT" ]; then
 	# Input accepted (the router's own services, as from the LAN); no
 	# forwarding anywhere: other devices, the internet and the VPN stay out.

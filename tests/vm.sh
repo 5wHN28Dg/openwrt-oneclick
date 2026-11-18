@@ -455,7 +455,7 @@ upgrade_checks() {
 }
 
 # ZeroTier: joined (waiting for approval: the test network has no
-# controller), its interfaces in the lan zone, the public example network
+# controller), its interfaces in their own zone, the public example network
 # gone, the identity saved on the laptop and only readable by root.
 ZT_TEST_NET=deadbeef00c0ffee
 zerotier_checks() {
@@ -720,7 +720,7 @@ scenario_minimal() {
 	# settings' network, zt+ moved to the ZeroTier zone).
 	vm_ssh 'apk add zerotier >/dev/null 2>&1; uci set zerotier.global.enabled=1; uci set zerotier.mine=network
 		uci set zerotier.mine.id=feedfacecafe0001; uci commit zerotier; /etc/init.d/zerotier restart
-		uci add_list firewall.@zone[0].device=zt+; uci commit firewall; fw4 reload' >/dev/null 2>&1
+		uci set firewall.@zone[0].device=zt+; uci commit firewall; fw4 reload' >/dev/null 2>&1   # a single option, not a list
 	i=0 node=''; until [ -n "$node" ] || [ $i -ge 30 ]; do sleep 1; i=$((i + 1)); node=$(vm_ssh 'uci -q get zerotier.global.secret | cut -d: -f1'); done
 	# shellcheck disable=SC2034  # write_config reads the settings through eval
 	(. "$P/config.env"; ENABLE_ZEROTIER=1 ZEROTIER_NETWORK=$ZT_TEST_NET; write_config "$P/config.env")
@@ -733,7 +733,8 @@ scenario_minimal() {
 	vm_ssh 'uci set network.ztif=interface; uci set network.ztif.proto=none; uci set network.ztif.device=zt1234567890
 		uci commit network; uci add_list firewall.@zone[0].network=ztif; uci commit firewall'
 	out=$(ONECLICK_PRIVATE=$P timeout 600 "$W/setup.sh" 127.0.0.1 "$PORT" 2>&1); rc=$?
-	case $out in *"ZeroTier interfaces are in firewall zones"*) [ $rc = 1 ] && ok "ZeroTier interface added to the lan zone by hand: setup stops before changing anything" || bad "ZeroTier in lan zone: exit $rc" ;;
+	case $out in *"ZeroTier interfaces are in firewall zones"*) case $out in *"==> Packages"*) bad "ZeroTier in lan zone: refused only after changes began" ;;
+			*) [ $rc = 1 ] && ok "ZeroTier interface added to the lan zone by hand: setup stops before changing anything" || bad "ZeroTier in lan zone: exit $rc" ;; esac ;;
 		*) bad "ZeroTier interface in the lan zone not refused (exit $rc)" ;; esac
 	vm_ssh 'uci del_list firewall.@zone[0].network=ztif; uci commit firewall; uci delete network.ztif; uci commit network'
 	# shellcheck disable=SC2034

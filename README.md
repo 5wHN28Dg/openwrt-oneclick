@@ -179,7 +179,8 @@ With the option on, the setup manages ZeroTier on the router: it joins the
 one network from the settings and drops other networks set up there by hand;
 a `zt+` put in the lan zone by hand moves to the ZeroTier zone. If ZeroTier
 interfaces sit in a firewall zone in another form (for example a network
-interface added to the lan zone in LuCI), the setup stops before changing
+interface added to the lan zone in LuCI), in a bridge, or in firewall rules
+it didn't make, the setup stops before changing
 anything, since that zone would keep giving them its access. The setup saves the router's ZeroTier identity in
 `private/zerotier/identity.secret` and gives it back on re-installs, so a
 reset router doesn't need approving again (one `private/` folder is for one
