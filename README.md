@@ -170,14 +170,17 @@ ZeroTier gets its own firewall zone: members reach the router's own services
 (LuCI, SSH, the MangaDex app, the Telegram proxy, its filtered DNS) and
 nothing behind it, so even a member that adds its own route can't reach other
 devices at home or use your line or VPN. The setup refuses a network whose
-access control is Public (anyone with its ID could join). The kids' night
+access control is Public (anyone with its ID could join); keep it Private
+(a network switched to Public later is only caught on the next setup run). The kids' night
 rules match devices at home by MAC address, not ZeroTier members: approve
 only your own devices.
 
-If ZeroTier was already set up on the router by hand, the setup only borrows
-it: the router's identity and its other networks stay as they are (a `zt+`
-in the lan zone moves to the ZeroTier zone while the option is on), and
-turning the option off removes only what the setup added. Otherwise the setup saves the router's ZeroTier identity in
+With the option on, the setup manages ZeroTier on the router: it joins the
+one network from the settings and drops other networks set up there by hand;
+a `zt+` put in the lan zone by hand moves to the ZeroTier zone. If ZeroTier
+interfaces sit in a firewall zone in another form (for example a network
+interface added to the lan zone in LuCI), the setup stops before changing
+anything, since that zone would keep giving them its access. The setup saves the router's ZeroTier identity in
 `private/zerotier/identity.secret` and gives it back on re-installs, so a
 reset router doesn't need approving again (one `private/` folder is for one
 router: two routers with the same identity clash). Turning the option off

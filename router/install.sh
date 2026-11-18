@@ -57,9 +57,22 @@ if [ -n "$ZT" ]; then
 	if [ -n "$z" ] && [ "$(uci -q get "firewall.$z.setup")" != 1 ]; then
 		echo "a firewall zone named zerotier exists that this tool did not make; rename it first"; exit 1
 	fi
+	# ZeroTier goes into its own zone. One put into another zone by hand would
+	# keep that zone's access (fw4 uses the first zone that matches): stop.
+	# Only a plain zt+ in the lan zone (the usual hand setup) is moved over.
+	zt_ifs=$(uci -q show network | sed -n "s/^network\.\([^.]*\)\.device='zt[^']*'$/\1/p" | tr '\n' ' ')
+	ztbad=''
+	for z in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)=zone$/\1/p"); do
+		[ "$(uci -q get "firewall.$z.setup")" = 1 ] && continue
+		for d in $(uci -q get "firewall.$z.device"); do
+			case $d in zt*) [ "$z" = "$LAN_ZONE" ] && [ "$d" = 'zt+' ] || ztbad="$ztbad $z:$d" ;; esac
+		done
+		for n in $(uci -q get "firewall.$z.network"); do
+			case " $zt_ifs " in *" $n "*) ztbad="$ztbad $z:$n" ;; esac
+		done
+	done
+	[ -z "$ztbad" ] || { echo "ZeroTier interfaces are in firewall zones this tool doesn't manage ($ztbad ): take them out there first (the setup gives ZeroTier its own zone)"; exit 1; }
 fi
-# Was ZeroTier on this router before this setup touched it (installed by hand)?
-ZT_HAD=''; [ -s /etc/config/zerotier ] && [ -z "$(uci -q get zerotier.global.setup_oneclick)" ] && ZT_HAD=1
 # Remote access: everything that can stop it is checked before anything changes.
 REMOTE=; on "${ENABLE_REMOTE:-0}" && REMOTE=1
 if [ -n "$REMOTE" ]; then
@@ -535,20 +548,15 @@ fi
 # Telegram proxy) and nothing behind it: their own firewall zone (below)
 # forwards nowhere, so no member can reach other devices at home or use the
 # home line or the VPN, even with a route of their own.
-# A ZeroTier that was here before (set up by hand) is only borrowed: its
-# identity, its networks and a hand-made network for the same ID are left as
-# they are, and turning the option off takes out only what this setup added.
-# Otherwise the identity from private/zerotier/identity.secret (setup.sh saves
-# it after the first run) keeps a reset router an approved member.
-ZT_EARTH=8056c2e21c000001   # ZeroTier's public network, in the package's example config
-ZT_REMOVED='' ZT_MARK=$(uci -q get zerotier.global.setup_oneclick)
+# With the option on, the setup manages ZeroTier on the router: the one
+# network from the settings (other networks set up by hand are dropped), the
+# identity from private/zerotier/identity.secret (saved by setup.sh after the
+# first run, so a reset router stays an approved member), or the router's own.
+ZT_REMOVED=''
 if [ -n "$ZT" ]; then
 	step "ZeroTier"
 	touch /etc/config/zerotier; chmod 600 /etc/config/zerotier   # it holds the identity's private key
-	if [ -z "$ZT_MARK" ]; then
-		ZT_MARK=1; [ -n "$ZT_HAD" ] && ZT_MARK=borrowed
-	fi
-	if [ "$ZT_MARK" = 1 ] && [ -f "$PRIV/zerotier/identity.secret" ]; then
+	if [ -f "$PRIV/zerotier/identity.secret" ]; then
 		secret=$(tr -d '\n' < "$PRIV/zerotier/identity.secret")
 		if printf '%s\n' "$secret" | grep -qxE '[0-9a-f]{10}:0:[0-9a-f]{128}:[0-9a-f]{128}'; then
 			# through stdin: a command line would show the private key in the process list
@@ -557,21 +565,14 @@ if [ -n "$ZT" ]; then
 			fail "private/zerotier/identity.secret is not a ZeroTier identity: the router keeps its own"
 		fi
 	fi
-	# Earlier runs' network and the public example go; a network made by hand
-	# for the same ID stays and is used as it is.
-	own=1
 	for s in $(uci -q show zerotier | sed -n "s/^zerotier\.\([^.]*\)=network$/\1/p" | sort -t'[' -k2 -n -r); do
-		case "$(uci -q get "zerotier.$s.setup")|$(uci -q get "zerotier.$s.id")" in
-			1\|*|*\|$ZT_EARTH) uci delete "zerotier.$s" ;;
-			*\|$ZEROTIER_NETWORK) own='' ;;
-		esac
+		uci delete "zerotier.$s"
 	done
-	uci set zerotier.global=zerotier
-	uci set zerotier.global.enabled='1'
-	uci set zerotier.global.setup_oneclick="$ZT_MARK"
-	[ -n "$own" ] && uci batch >/dev/null <<-EOF
+	uci batch >/dev/null <<-EOF
+		set zerotier.global=zerotier
+		set zerotier.global.enabled='1'
+		set zerotier.global.setup_oneclick='1'
 		set zerotier.oneclick=network
-		set zerotier.oneclick.setup='1'
 		set zerotier.oneclick.id='$ZEROTIER_NETWORK'
 		set zerotier.oneclick.allow_managed='1'
 		set zerotier.oneclick.allow_global='0'
@@ -579,17 +580,12 @@ if [ -n "$ZT" ]; then
 		set zerotier.oneclick.allow_dns='0'
 	EOF
 	uci commit zerotier
-	pass "ZeroTier: joins network $ZEROTIER_NETWORK${own:- (as set up by hand)}; members reach the router only"
-elif [ "$ZT_MARK" = 1 ]; then
-	# Turned off since an earlier run: a ZeroTier this setup installed goes.
+	pass "ZeroTier: joins network $ZEROTIER_NETWORK; members reach the router only"
+elif [ "$(uci -q get zerotier.global.setup_oneclick)" = 1 ]; then
+	# Turned off since an earlier run: ZeroTier goes.
 	/etc/init.d/zerotier stop >/dev/null 2>&1; /etc/init.d/zerotier disable >/dev/null 2>&1
 	if [ $PKG = apk ]; then apk del zerotier >/dev/null 2>&1; else opkg remove zerotier >/dev/null 2>&1; fi
 	rm -f /etc/config/zerotier   # kept by the package manager, and it holds the private key
-	ZT_REMOVED=1
-elif [ "$ZT_MARK" = borrowed ]; then
-	# One that was there before: only this setup's network leaves it.
-	uci -q delete zerotier.oneclick; uci -q delete zerotier.global.setup_oneclick
-	uci commit zerotier; /etc/init.d/zerotier restart >/dev/null 2>&1
 	ZT_REMOVED=1
 fi
 
@@ -618,16 +614,9 @@ for s in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.setup='1'$/\1/
 uci -q delete firewall.dns_int
 uci -q delete firewall.dot_fwd
 [ -n "$LAN_ZONE" ] && uci -q del_list "firewall.$LAN_ZONE.network=remote"
-# ZeroTier: its own zone (made again below while the option is on). An
-# interface can be in one zone only: a zt+ put in the lan zone by hand moves
-# there, and back when the option is turned off.
-if [ -n "$LAN_ZONE" ] && [ -n "$ZT" ] && uci -q get "firewall.$LAN_ZONE.device" | grep -qw 'zt+'; then
-	uci -q del_list "firewall.$LAN_ZONE.device=zt+"; uci set "firewall.$LAN_ZONE.setup_zt_lan=1"
-fi
-if [ -n "$LAN_ZONE" ] && [ -n "$ZT_REMOVED" ] && [ "$(uci -q get "firewall.$LAN_ZONE.setup_zt_lan")" = 1 ]; then
-	uci -q delete "firewall.$LAN_ZONE.setup_zt_lan"
-	[ "$ZT_MARK" = borrowed ] && uci add_list "firewall.$LAN_ZONE.device=zt+"
-fi
+# ZeroTier: its own zone (made again below while the option is on). A zt+
+# put in the lan zone by hand moves there (an interface matches one zone).
+[ -n "$LAN_ZONE" ] && [ -n "$ZT$ZT_REMOVED" ] && uci -q del_list "firewall.$LAN_ZONE.device=zt+"
 if [ -n "$ZT" ]; then
 	# Input accepted (the router's own services, as from the LAN); no
 	# forwarding anywhere: other devices, the internet and the VPN stay out.
