@@ -11,7 +11,8 @@ WG_ENDPOINT_HOST WG_ENDPOINT_PORT WG_ALLOWED_IPS WG_KEEPALIVE VPN_ROUTE_DOMAINS 
 TELEGRAM_PROXY TELEGRAM_PROXY_PORT TELEGRAM_PROXY_USER TELEGRAM_PROXY_PASS
 PROTON_AUTO PROTON_COUNTRIES PROTON_API
 ENABLE_MANGADEX ENABLE_REDLIB ULA_PREFIX
-ENABLE_REMOTE REMOTE_HOST REMOTE_PORT REMOTE_NET REMOTE_SERVER_KEY REMOTE_PEERS'
+ENABLE_REMOTE REMOTE_HOST REMOTE_PORT REMOTE_NET REMOTE_SERVER_KEY REMOTE_PEERS
+ENABLE_ZEROTIER ZEROTIER_NETWORK'
 
 # Link types from https://openwrt.org/docs/guide-user/network/traffic-shaping/sqm
 # (Link Layer Adaptation table): id|description|linklayer|overhead|mpu
@@ -147,6 +148,10 @@ check_settings() {
 	case ${ULA_PREFIX-} in *[!0-9A-Fa-f:/]*) echo "ULA_PREFIX must look like fdxx:xxxx:xxxx::/48" ;; esac
 	case ${BANIP_FEEDS-} in *[!a-z0-9_\ -]*) echo "BANIP_FEEDS has unexpected characters" ;; esac
 	case ${ADBLOCK_EXTRA_LISTS-} in *[!A-Za-z0-9:._/\ -]*) echo "ADBLOCK_EXTRA_LISTS has unexpected characters" ;; esac
+	if [ "${ENABLE_ZEROTIER-}" = 1 ]; then
+		case ${ZEROTIER_NETWORK-} in ????????????????) case $ZEROTIER_NETWORK in *[!0-9a-f]*) echo "ZEROTIER_NETWORK must be the 16-character network ID (0-9, a-f)" ;; esac ;;
+			*) echo "ZEROTIER_NETWORK must be the 16-character network ID (0-9, a-f)" ;; esac
+	fi
 	if [ "${ENABLE_REMOTE-}" = 1 ]; then
 		case ${REMOTE_HOST-} in
 			*:*) case $REMOTE_HOST in *[!0-9A-Fa-f:]*) echo "REMOTE_HOST is not a host name or address (no port: that is REMOTE_PORT)" ;; esac ;;
