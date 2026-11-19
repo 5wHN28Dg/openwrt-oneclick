@@ -330,7 +330,8 @@ eq "old ADBLOCK_LISTS: base lists dropped, additions kept" "$(. "$P2/config.env"
 # --- Tailscale -----------------------------------------------------------------------
 . "$HERE/lib/tailscale.sh"
 for a in "aarch64_cortex-a53|arm64" "x86_64|amd64" "mipsel_24kc|mipsle softfloat" "mips_24kc|mips softfloat" \
-	"arm_cortex-a7_neon-vfpv4|arm 7" "arm_cortex-a9|arm 7" "arm_arm926ej-s|arm 5" "i386_pentium4|386"; do
+	"arm_cortex-a7_neon-vfpv4|arm 7" "arm_cortex-a9_vfpv3-d16|arm 7" "arm_cortex-a9|arm 5" "arm_cortex-a7|arm 5" \
+	"arm_arm1176jzf-s_vfp|arm 6" "arm_arm926ej-s|arm 5" "i386_pentium4|386"; do
 	eq "Tailscale build for ${a%%|*}" "$(ts_goarch "${a%%|*}")" "${a#*|}"
 done
 if ts_goarch powerpc_464fp >/dev/null; then bad "no Tailscale build for an unknown processor"; else ok "no Tailscale build for an unknown processor"; fi

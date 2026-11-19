@@ -26,8 +26,11 @@ ts_goarch() {
 		aarch64*) echo arm64 ;;
 		x86_64) echo amd64 ;;
 		i386*) echo 386 ;;
-		arm_cortex-a*|arm_*neon*|arm_*vfp*) echo 'arm 7' ;;
-		arm_*) echo 'arm 5' ;;
+		arm_*)
+			# As OpenWrt's own Go packages (golang-values.mk): by the FPU in the
+			# name (arm_<cpu>_<fpu>): none -> GOARM=5, vfp/vfpv2 -> 6, else 7.
+			_fpu=${1#arm_}; case $_fpu in *_*) _fpu=${_fpu#*_} ;; *) _fpu='' ;; esac
+			case $_fpu in '') echo 'arm 5' ;; vfp|vfpv2) echo 'arm 6' ;; *) echo 'arm 7' ;; esac ;;
 		mipsel_*) echo 'mipsle softfloat' ;;
 		mips_*) echo 'mips softfloat' ;;
 		mips64el_*) echo mips64le ;;
@@ -42,7 +45,8 @@ ts_build() {
 	_ga=$(ts_goarch "$1") || { echo "no Tailscale build for the router's processor ($1)" >&2; return 1; }
 	_goarch=${_ga% *} _sub=''; [ "$_ga" = "$_goarch" ] || _sub=${_ga#* }
 	_dir=${XDG_CACHE_HOME:-$HOME/.cache}/openwrt-oneclick/tailscale
-	_out=$_dir/tailscaled-$TS_VERSION-$_goarch${_sub:+-$_sub}
+	# (the commit and features in the name: changing either builds anew)
+	_out=$_dir/tailscaled-$TS_VERSION-$(printf '%s %s' "$TS_COMMIT" "$TS_FEATURES" | cksum | cut -d' ' -f1)-$_goarch${_sub:+-$_sub}
 	[ -x "$_out" ] && { echo "$_out"; return 0; }
 	for _t in git curl tar; do
 		command -v $_t >/dev/null || { echo "building Tailscale needs $_t" >&2; return 1; }

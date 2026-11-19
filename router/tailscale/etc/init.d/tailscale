@@ -4,8 +4,10 @@
 # network device and routes) in its own group "tailscale": that group's DNS
 # lookups skip the block lists (/etc/nftables.d/32-oneclick-tailscale-dns.nft),
 # which block tailscale.com for every device at home.
-# Memory: Go's garbage collector runs early (GOGC=50) and aims to stay under
-# 12 MiB of heap (GOMEMLIMIT, a target, not a hard limit).
+# Memory: Go's garbage collector runs early (GOGC=50) and aims to keep the
+# memory Go manages under 12 MiB (GOMEMLIMIT, a target, not a hard limit;
+# measured: about 7 MiB of its own while carrying traffic, the rest of its
+# 21-26 MB is the program itself).
 # State (the router's Tailscale identity and login): /etc/tailscale.
 
 # Read by /etc/rc.common, which runs this file.

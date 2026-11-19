@@ -417,16 +417,17 @@ fi
 # saved): a reset router comes back as the same device, without a new key.
 if [ "${ENABLE_TAILSCALE-}" = 1 ] && [ "$rc" != 1 ]; then
 	ts_ip=$(ssh_r '/usr/sbin/tailscale ip -4 2>/dev/null | head -1' 2>/dev/null | grep -xE '100\.[0-9.]+') || ts_ip=''
-	if [ -n "$ts_ip" ] && [ "$USED" = "$CONF" ] && [ ! -s "$PRIV/tailscale/tailscaled.state" ]; then
+	# (refreshed whenever the router's differs: a new login replaces the old)
+	if [ -n "$ts_ip" ] && [ "$USED" = "$CONF" ]; then
 		mkdir -p "$PRIV/tailscale"; chmod 700 "$PRIV/tailscale"
 		if (umask 077; ssh_r 'cat /etc/tailscale/tailscaled.state' > "$PRIV/tailscale/tailscaled.state.tmp") \
-			&& grep -q '"_machinekey"' "$PRIV/tailscale/tailscaled.state.tmp"; then
+			&& grep -q '"_machinekey"' "$PRIV/tailscale/tailscaled.state.tmp" \
+			&& ! cmp -s "$PRIV/tailscale/tailscaled.state.tmp" "$PRIV/tailscale/tailscaled.state"; then
 			mv "$PRIV/tailscale/tailscaled.state.tmp" "$PRIV/tailscale/tailscaled.state"
-			say "Saved the router's Tailscale identity in private/tailscale (reused on re-install)."
+			say "Saved the router's Tailscale identity and login in private/tailscale (reused on re-install)."
 			[ -f "$PRIV/tailscale-authkey" ] && say "  The auth key in private/tailscale-authkey is used up: you can delete it."
-		else
-			rm -f "$PRIV/tailscale/tailscaled.state.tmp"
 		fi
+		rm -f "$PRIV/tailscale/tailscaled.state.tmp"
 	fi
 	say ""
 	if [ -n "$ts_ip" ]; then
@@ -438,6 +439,12 @@ if [ "${ENABLE_TAILSCALE-}" = 1 ] && [ "$rc" != 1 ]; then
 	else
 		say "Tailscale: the router is not logged in (see the report above)."
 	fi
+fi
+
+# Tailscale off: the router logged out, so its saved login is no good any more.
+if [ "${ENABLE_TAILSCALE-}" != 1 ] && [ "$rc" != 1 ] && [ -f "$PRIV/tailscale/tailscaled.state" ]; then
+	rm -f "$PRIV/tailscale/tailscaled.state"; rmdir "$PRIV/tailscale" 2>/dev/null
+	say "Tailscale is off: removed its saved (now logged-out) state from private/tailscale."
 fi
 
 if [ -n "${SSH_KEY_OLD-}" ] && [ "$USED" = "$CONF" ] && [ "$rc" != 1 ]; then

@@ -495,9 +495,9 @@ zerotier_checks() {
 	grep -q "approve the router at https://my.zerotier.com" "$W/full.log" && ok "ZeroTier: setup.sh says what to approve" || bad "ZeroTier: no approval hint from setup.sh"
 }
 
-# Tailscale: running in its own group (whose DNS skips the block lists: the
-# router reached Tailscale's servers although tailscale.com is blocked for
-# the LAN), its own zone forwarding only into the VPN, its files kept across
+# Tailscale: running in its own group, whose DNS lookups go past the block
+# lists (the rule's counter rose: Tailscale also has built-in fallback
+# addresses, so reaching its servers alone wouldn't show it), its own zone forwarding only into the VPN, its files kept across
 # upgrades. Then a stand-in for the tailscale0 device (a veth with a "phone"
 # behind it, 100.100.100.2): Telegram goes into the VPN (a counter on that
 # forwarding rises), other addresses are refused, and with pbr stopped Telegram is
@@ -512,8 +512,9 @@ tailscale_checks() {
 		echo zone=$(uci -q get firewall.$z.device)/$(uci -q get firewall.$z.input)/$(uci -q get firewall.$z.forward)
 		uci show firewall | grep -c "src=.tailscale."
 		nft list chain inet fw4 forward_tailscale | grep -c "jump accept_to_testvpn"
-		nft list chain inet fw4 oneclick_tailscale_dns | grep -q "skgid.*redirect to :5354" && echo dns-rule' 2>&1 | tr '\n' ' ')
-	want="running own-group enabled drwx------ zone=tailscale0/ACCEPT/REJECT 1 1 dns-rule "
+		nft list chain inet fw4 oneclick_tailscale_dns | grep -q "skgid.*redirect to :5354" && echo dns-rule
+		nft list chain inet fw4 oneclick_tailscale_dns | grep -q "counter packets [1-9]" && echo dns-used' 2>&1 | tr '\n' ' ')
+	want="running own-group enabled drwx------ zone=tailscale0/ACCEPT/REJECT 1 1 dns-rule dns-used "
 	[ "$r" = "$want" ] && ok "Tailscale: runs in its own group, own zone that forwards only into the VPN, state readable by root only" \
 		|| bad "Tailscale on the router (want '$want'): $r"
 	if [ -n "${TS_TEST_AUTHKEY_FILE-}" ]; then
@@ -528,13 +529,14 @@ tailscale_checks() {
 		/etc/init.d/tailscale stop; sleep 2; ip link del tailscale0 2>/dev/null
 		ip link add tailscale0 type veth peer name tsp; ip link set tailscale0 up
 		ip netns add ph; ip link set tsp netns ph; ip -n ph link set lo up; ip -n ph link set tsp up
-		ip -n ph addr add 100.100.100.2/32 dev tsp; ip -n ph route add default dev tsp
+		ip -n ph addr add 100.100.100.2/32 dev tsp; ip addr add 100.100.100.1/32 dev tailscale0
+		ip -n ph route add 100.100.100.1 dev tsp; ip -n ph route add default via 100.100.100.1
 		ip route add 100.100.100.2/32 dev tailscale0
 		w() { i=0; until ip route show table pbr_testvpn 2>/dev/null | grep -q default || [ \$i -ge 30 ]; do sleep 1; i=\$((i + 1)); done; sleep 2; }
 		nft insert rule inet fw4 forward_tailscale oifname testvpn counter   # a probe: packets forwarded into the VPN
 		tx() { nft list chain inet fw4 forward_tailscale | sed -n 's/.*oifname \"testvpn\" counter packets \([0-9]*\).*/\1/p'; }
 		t() { ip netns exec ph curl -s -m 4 -o /dev/null http://\$1/; echo \"\$2=\$?\"; }
-		w; a=\$(tx); ip netns exec ph curl -s -m 4 -o /dev/null http://149.154.167.99/; [ \"\$(tx)\" -gt \"\$a\" ] && echo telegram-into-vpn
+		w; a=\$(tx); ip netns exec ph curl -s -m 4 -o /dev/null http://149.154.167.99/; c=\$?; [ \"\$(tx)\" -gt \"\$a\" ] && echo telegram-into-vpn || echo \"telegram=\$c probe=\$a/\$(tx)\"
 		a=\$(tx); t 198.18.0.1 other; [ \"\$(tx)\" = \"\$a\" ] && echo other-not-in-vpn
 		/etc/init.d/pbr stop >/dev/null 2>&1; a=\$(tx); t 149.154.167.99 telegram-without-pbr; [ \"\$(tx)\" = \"\$a\" ] && echo not-in-vpn
 		/etc/init.d/pbr start >/dev/null 2>&1; w

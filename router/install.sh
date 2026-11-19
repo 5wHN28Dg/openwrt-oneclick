@@ -652,7 +652,7 @@ if [ -n "$TS" ]; then
 	[ "$(awk -F: -v g="$gid" '$3 == g' /etc/group | wc -l)" = 1 ] || die "another group shares the tailscale group's number $gid"
 	# Users whose main group it is would share the DNS exception.
 	[ -z "$(awk -F: -v g="$gid" '$4 == g' /etc/passwd)" ] || die "a user has the tailscale group as its own"
-	[ -x /etc/init.d/tailscale ] && /etc/init.d/tailscale stop >/dev/null 2>&1
+	# (not stopped here: if the run stops early it keeps running; restarted below)
 	put_tree "$ROUTER/tailscale"
 	cp "$TS_BIN" /usr/sbin/tailscaled.new && chmod 755 /usr/sbin/tailscaled.new && mv /usr/sbin/tailscaled.new /usr/sbin/tailscaled
 	ln -sf tailscaled /usr/sbin/tailscale   # one program: run as "tailscale" it is the command-line tool
@@ -666,7 +666,11 @@ if [ -n "$TS" ]; then
 	pass "Tailscale $(/usr/sbin/tailscaled --version 2>/dev/null | head -1) (trimmed build from the laptop)"
 elif ts_ours || [ -f $TS_NFT ]; then
 	# Turned off since an earlier run: everything goes (the device logs out,
-	# so it leaves the tailnet).
+	# so it leaves the tailnet; the daemon must run for that).
+	if ! pidof tailscaled >/dev/null && [ -x /etc/init.d/tailscale ]; then
+		/etc/init.d/tailscale start >/dev/null 2>&1
+		i=0; until /usr/sbin/tailscale status >/dev/null 2>&1 || [ $i -ge 15 ]; do sleep 1; i=$((i + 1)); done
+	fi
 	/usr/sbin/tailscale logout >/dev/null 2>&1
 	/etc/init.d/tailscale stop >/dev/null 2>&1; /etc/init.d/tailscale disable >/dev/null 2>&1
 	/usr/sbin/tailscaled --cleanup >/dev/null 2>&1

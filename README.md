@@ -251,8 +251,10 @@ login) in `private/tailscale/` and gives it back on re-installs, so a reset
 router comes back as the same device without a new key (one `private/`
 folder is for one router). The program and state are kept across firmware
 upgrades, and `oneclick-after-upgrade` switches Tailscale on again after
-one. Turning the option off logs the router out and removes the program,
-its state, group, zone and rules.
+one. A new login (a new key after the option was off, or after the login
+expired) replaces the saved state. Turning the option off logs the router
+out and removes the program, its state (on the router and in `private/`),
+group, zone and rules; `kmod-tun` stays (40 KB, ZeroTier uses it too).
 
 ## Proton VPN server choice
 
