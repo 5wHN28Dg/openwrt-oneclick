@@ -149,11 +149,11 @@ P1=$T/priv1
 # time zone, PPPoE?, PPPoE user, PPPoE password x2, link type number,
 # family filtering?, Redlib allow, VPN?, wg path, VPN iface, domains, subnets, Telegram?, Telegram proxy?,
 # Proton picks the server?, Proton countries, MangaDex?, Redlib?, remote access?, public name, port, devices,
-# ZeroTier?, network ID,
+# ZeroTier?, network ID, Tailscale?, auth key,
 # create settings? (first) / save? (last)
 printf '%s\n' y "Home Net" "pa'ss word1" "pa'ss word1" adminpw adminpw "$HOME/.ssh/test_key" y \
 	Europe/Berlin "" y "user@isp" ppppass ppppass 7 y "safereddit.com" y "$T/proton.conf" protonvpn \
-	"archive.org newegg.com" "91.108.4.0/22" y y y "pl ch" y y y home.example.org "" "phone tablet" y CF719FD540F66C50 y \
+	"archive.org newegg.com" "91.108.4.0/22" y y y "pl ch" y y y home.example.org "" "phone tablet" y CF719FD540F66C50 y tskey-auth-kTEST11CNTRL-abcDEF123 y \
 	| ONECLICK_PRIVATE=$P1 "$HERE/setup.sh" --settings-only >"$T/w1.out" 2>&1
 eq "wizard (all on) exit" "$?" 0
 eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config.env")" 600
@@ -188,6 +188,8 @@ eq "settings file created" "$(test -f "$P1/config.env" && stat -c %a "$P1/config
 	eq "w1 remote" "$ENABLE_REMOTE|$REMOTE_HOST|$REMOTE_PORT|$REMOTE_NET" "1|home.example.org|51820|10.77.0.0/24"
 	eq "w1 remote devices" "$(remote_devices)" "phone tablet"
 	eq "w1 ZeroTier (ID lower-cased)" "$ENABLE_ZEROTIER|$ZEROTIER_NETWORK" "1|cf719fd540f66c50"
+	eq "w1 Tailscale" "$ENABLE_TAILSCALE" 1
+	eq "w1 Tailscale auth key saved, mode 600" "$(cat "$P1/tailscale-authkey")|$(stat -c %a "$P1/tailscale-authkey")" "tskey-auth-kTEST11CNTRL-abcDEF123|600"
 	ZEROTIER_NETWORK=cf719fd540f66c5; eq "short ZeroTier ID rejected" "$(check_settings | grep -c ZEROTIER_NETWORK)" 1
 	ZEROTIER_NETWORK="cf719fd540f6';xy"; eq "unsafe ZeroTier ID rejected" "$(check_settings | grep -c ZEROTIER_NETWORK)" 1
 	ZEROTIER_NETWORK=cf719fd540f66c50
@@ -199,7 +201,7 @@ fails=$((fails + $(grep -c '^FAIL' "$T/w1.res"))); n=$((n + $(wc -l < "$T/w1.res
 P2=$T/priv2
 # Everything optional off; existing key; save.
 printf '%s\n' y "Flat" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" \
-	UTC us n 9 n n n n n n y \
+	UTC us n 9 n n n n n n n y \
 	| ONECLICK_PRIVATE=$P2 "$HERE/setup.sh" --settings-only >"$T/w2.out" 2>&1
 eq "wizard (all off) exit" "$?" 0
 (
@@ -214,12 +216,13 @@ eq "wizard (all off) exit" "$?" 0
 	eq "w2 VPN off: Telegram off" "$TELEGRAM_VIA_VPN|$TELEGRAM_PROXY" "0|0"
 	eq "w2 remote off" "$ENABLE_REMOTE|${REMOTE_PEERS-}" "0|"
 	eq "w2 ZeroTier off" "$ENABLE_ZEROTIER" 0
+	eq "w2 Tailscale off" "$ENABLE_TAILSCALE" 0
 ) | tee "$T/w2.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/w2.res"))); n=$((n + $(wc -l < "$T/w2.res")))
 
 # Declining to save keeps nothing on disk.
 P3=$T/priv3
-printf '%s\n' y "X" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n n n n \
+printf '%s\n' y "X" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n n n n n \
 	| ONECLICK_PRIVATE=$P3 "$HERE/setup.sh" --settings-only >"$T/w3.out" 2>&1
 eq "decline save: exit" "$?" 0
 eq "decline save: nothing written" "$(ls -A "$P3" 2>/dev/null)" ""
@@ -265,7 +268,7 @@ eq "interrupt saves nothing" "$(ls -A "$T/priv-int" 2>/dev/null)" ""
 	REDLIB_ALLOW=ok.example; eq "valid settings pass" "$(check_settings)" ""
 ) | tee "$T/v.res"
 fails=$((fails + $(grep -c '^FAIL' "$T/v.res"))); n=$((n + $(wc -l < "$T/v.res")))
-printf '%s\n' y "X" "short" "short" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n n n y \
+printf '%s\n' y "X" "short" "short" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n n n n y \
 	| ONECLICK_PRIVATE=$T/priv-short "$HERE/setup.sh" --settings-only >"$T/short.out" 2>&1
 rc=$?
 if [ "$rc" -ne 0 ] && grep -q "WIFI_KEY must be" "$T/short.out" && [ -z "$(ls -A "$T/priv-short" 2>/dev/null)" ]; then ok "wizard refuses a short Wi-Fi key, saves nothing"; else bad "wizard refuses a short Wi-Fi key (rc $rc)"; fi
@@ -323,6 +326,23 @@ grep -v '^ADBLOCK_EXTRA_LISTS=' "$P2/config.env" > "$T/old" && mv "$T/old" "$P2/
 echo "ADBLOCK_LISTS='hagezi:pro hagezi:tif.mini oisd:big hagezi:nsfw'" >> "$P2/config.env"
 ONECLICK_PRIVATE=$P2 timeout 5 "$HERE/setup.sh" 127.0.0.1 1 >"$T/m.out" 2>&1 || true
 eq "old ADBLOCK_LISTS: base lists dropped, additions kept" "$(. "$P2/config.env"; echo "${ADBLOCK_EXTRA_LISTS-unset}|${ADBLOCK_LISTS-gone}")" "oisd:big hagezi:nsfw|gone"
+
+# --- Tailscale -----------------------------------------------------------------------
+. "$HERE/lib/tailscale.sh"
+for a in "aarch64_cortex-a53|arm64" "x86_64|amd64" "mipsel_24kc|mipsle softfloat" "mips_24kc|mips softfloat" \
+	"arm_cortex-a7_neon-vfpv4|arm 7" "arm_cortex-a9|arm 7" "arm_arm926ej-s|arm 5" "i386_pentium4|386"; do
+	eq "Tailscale build for ${a%%|*}" "$(ts_goarch "${a%%|*}")" "${a#*|}"
+done
+if ts_goarch powerpc_464fp >/dev/null; then bad "no Tailscale build for an unknown processor"; else ok "no Tailscale build for an unknown processor"; fi
+# Turned on later, with something that isn't an auth key: not saved.
+P4=$T/priv4; mkdir -p "$P4"; cp "$P2/config.env" "$P4/"
+printf '%s\n' "" n n "" "" "" n "" n n n n n n y 'not a key' | ONECLICK_PRIVATE=$P4 "$HERE/setup.sh" --settings-only >"$T/t1.out" 2>&1
+eq "Tailscale on later" "$(. "$P4/config.env"; echo "$ENABLE_TAILSCALE")" 1
+eq "Tailscale: a wrong auth key is not saved" "$(ls "$P4/tailscale-authkey" 2>/dev/null)|$(grep -c "doesn't look like an auth key" "$T/t1.out")" "|1"
+# With a saved identity it doesn't ask for a key.
+mkdir -p "$P4/tailscale"; echo '{"_machinekey":"x"}' > "$P4/tailscale/tailscaled.state"
+printf '%s\n' "" n n "" "" "" n "" n n n n n n y | ONECLICK_PRIVATE=$P4 "$HERE/setup.sh" --settings-only >"$T/t2.out" 2>&1
+eq "Tailscale: no key asked with a saved identity" "$(grep -c 'Auth key' "$T/t2.out")" 0
 
 # --- remote access ------------------------------------------------------------------
 # Turned on later with a name, then "-" goes back to the router's own address.

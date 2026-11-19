@@ -1,0 +1,10 @@
+# openwrt-oneclick: the block lists block tailscale.com for every device at
+# home (it would be a way around the family filter). The router's own
+# Tailscale has to reach it: DNS lookups of group "tailscale" (only
+# tailscaled runs in it; its number replaces TAILSCALE_GID when install.sh
+# writes this to /etc/nftables.d/32-oneclick-tailscale-dns.nft) go straight
+# to dnsproxy, the encrypted resolver behind dnsmasq's block lists.
+chain oneclick_tailscale_dns {
+	type nat hook output priority dstnat; policy accept;
+	meta skgid TAILSCALE_GID meta l4proto { tcp, udp } th dport 53 redirect to :5354
+}

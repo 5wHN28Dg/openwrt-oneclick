@@ -79,6 +79,43 @@ if [ -n "$ZT" ]; then
 	done
 	[ -z "$ztbad" ] || { echo "ZeroTier interfaces are in firewall zones, bridges or rules this tool doesn't manage ($ztbad ): take them out there first (the setup gives ZeroTier its own zone)"; exit 1; }
 fi
+# Tailscale: a trimmed build made on the laptop (lib/tailscale.sh), which
+# setup.sh puts in the bundle. Its init script marks it as this tool's.
+TS=''; on "${ENABLE_TAILSCALE:-0}" && TS=1
+TS_BIN=$ROUTER/../tailscale/tailscaled
+TS_NFT=/etc/nftables.d/32-oneclick-tailscale-dns.nft
+TS_FILES="/usr/sbin/tailscaled /usr/sbin/tailscale /etc/init.d/tailscale $TS_NFT /etc/tailscale/"
+ts_ours() { grep -q 'set up by openwrt-oneclick' /etc/init.d/tailscale 2>/dev/null; }
+if [ -n "$TS" ]; then
+	[ -s "$TS_BIN" ] || { echo "the Tailscale program is missing from the setup bundle (setup.sh builds it)"; exit 1; }
+	if { [ -e /etc/init.d/tailscale ] && ! ts_ours; } \
+		|| { command -v apk >/dev/null && apk info -e tailscale >/dev/null 2>&1; } \
+		|| { command -v opkg >/dev/null && opkg status tailscale 2>/dev/null | grep -q installed; }; then
+		echo "Tailscale is installed already (OpenWrt's package or by hand): remove it first (apk del tailscale); the setup installs its own, smaller build"; exit 1
+	fi
+	z=$(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='tailscale'$/\1/p" | head -1)
+	if [ -n "$z" ] && [ "$(uci -q get "firewall.$z.setup")" != 1 ]; then
+		echo "a firewall zone named tailscale exists that this tool did not make; rename it first"; exit 1
+	fi
+	# Its own zone decides what Tailscale devices reach; one in another zone
+	# (or in rules and bridges this tool doesn't manage) would keep that access.
+	tsbad=''
+	ts_ifs=$(uci -q show network | sed -n "s/^network\.\([^.]*\)\.device='tailscale[^']*'$/\1/p" | tr '\n' ' ')
+	for z in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)=zone$/\1/p"); do
+		[ "$(uci -q get "firewall.$z.setup")" = 1 ] && continue
+		for d in $(uci -q get "firewall.$z.device"); do case $d in tailscale*) tsbad="$tsbad $z:$d" ;; esac; done
+		for n in $(uci -q get "firewall.$z.network"); do case " $ts_ifs " in *" $n "*) tsbad="$tsbad $z:$n" ;; esac; done
+	done
+	for d in $(uci -q show network | sed -n "s/^network\.\([^.]*\)\.ports=.*'tailscale.*/\1/p"); do tsbad="$tsbad bridge:$d"; done
+	for r in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.\(src\|dest\)='tailscale'$/\1/p"); do
+		[ "$(uci -q get "firewall.$r.setup")" = 1 ] || tsbad="$tsbad rule:$r"
+	done
+	[ -z "$tsbad" ] || { echo "Tailscale's interface is in firewall zones, bridges or rules this tool doesn't manage ($tsbad ): take it out there first (the setup gives Tailscale its own zone)"; exit 1; }
+	# A login: the router's own, the one saved on the laptop, or an auth key.
+	if [ ! -s /etc/tailscale/tailscaled.state ] && [ ! -s "$PRIV/tailscale/tailscaled.state" ] && [ ! -s "$PRIV/tailscale-authkey" ]; then
+		echo "Tailscale needs an auth key the first time: save one in private/tailscale-authkey (see README, Tailscale)"; exit 1
+	fi
+fi
 # Remote access: everything that can stop it is checked before anything changes.
 REMOTE=; on "${ENABLE_REMOTE:-0}" && REMOTE=1
 if [ -n "$REMOTE" ]; then
@@ -135,6 +172,8 @@ TG_PROXY=''; [ -n "$VPN" ] && on "${TELEGRAM_VIA_VPN:-0}" && on "${TELEGRAM_PROX
 # ZeroTier (about 1 MB, 8 MB of RAM on a Redmi AX6S): remote access where the
 # provider's shared address (CGNAT) leaves WireGuard unreachable.
 [ -n "$ZT" ] && PACKAGES="$PACKAGES zerotier"
+# Tailscale's network device (the program itself comes from the laptop).
+[ -n "$TS" ] && PACKAGES="$PACKAGES kmod-tun"
 [ "${WAN_PROTO:-dhcp}" = pppoe ] && PACKAGES="$PACKAGES ppp-mod-pppoe luci-proto-ppp"
 
 # Copy files only: never apply directory modes to system directories like /etc.
@@ -595,6 +634,47 @@ elif [ "$(uci -q get zerotier.global.setup_oneclick)" = 1 ]; then
 	ZT_REMOVED=1
 fi
 
+# ---------------------------------------------------------------- Tailscale
+# Remote access behind a provider's shared address (CGNAT), like ZeroTier, and
+# the way to send a phone's Telegram (calls too) through the VPN when away:
+# with Telegram through the VPN on, the router offers Telegram's ranges to the
+# tailnet (approved once in Tailscale's admin console), and the phone's
+# Telegram traffic arrives here and leaves through the VPN. Tailscale devices
+# reach the router itself (its own zone, below), and through it only the VPN.
+# With the option on, the setup manages Tailscale on the router; the state
+# (identity and login) from private/tailscale/tailscaled.state, saved by
+# setup.sh after the first login, so a reset router stays the same device.
+if [ -n "$TS" ]; then
+	step "Tailscale"
+	( set +u; . /lib/functions.sh; group_exists tailscale || group_add_next tailscale >/dev/null )
+	gid=$(sed -n 's/^tailscale:[^:]*:\([0-9]*\):.*/\1/p' /etc/group)
+	case $gid in ''|*[!0-9]*) die "could not create the tailscale group" ;; esac
+	[ "$(awk -F: -v g="$gid" '$3 == g' /etc/group | wc -l)" = 1 ] || die "another group shares the tailscale group's number $gid"
+	# Users whose main group it is would share the DNS exception.
+	[ -z "$(awk -F: -v g="$gid" '$4 == g' /etc/passwd)" ] || die "a user has the tailscale group as its own"
+	[ -x /etc/init.d/tailscale ] && /etc/init.d/tailscale stop >/dev/null 2>&1
+	put_tree "$ROUTER/tailscale"
+	cp "$TS_BIN" /usr/sbin/tailscaled.new && chmod 755 /usr/sbin/tailscaled.new && mv /usr/sbin/tailscaled.new /usr/sbin/tailscaled
+	ln -sf tailscaled /usr/sbin/tailscale   # one program: run as "tailscale" it is the command-line tool
+	chmod 755 /etc/init.d/tailscale
+	sed "s/TAILSCALE_GID/$gid/" "$ROUTER/tailscale-dns.nft" > $TS_NFT.tmp && mv $TS_NFT.tmp $TS_NFT
+	mkdir -p /etc/tailscale; chmod 700 /etc/tailscale   # the state holds the router's private keys
+	if [ ! -s /etc/tailscale/tailscaled.state ] && [ -s "$PRIV/tailscale/tailscaled.state" ]; then
+		(umask 077; cp "$PRIV/tailscale/tailscaled.state" /etc/tailscale/tailscaled.state)
+		info "Tailscale: the router's saved identity put back (private/tailscale)"
+	fi
+	pass "Tailscale $(/usr/sbin/tailscaled --version 2>/dev/null | head -1) (trimmed build from the laptop)"
+elif ts_ours || [ -f $TS_NFT ]; then
+	# Turned off since an earlier run: everything goes (the device logs out,
+	# so it leaves the tailnet).
+	/usr/sbin/tailscale logout >/dev/null 2>&1
+	/etc/init.d/tailscale stop >/dev/null 2>&1; /etc/init.d/tailscale disable >/dev/null 2>&1
+	/usr/sbin/tailscaled --cleanup >/dev/null 2>&1
+	rm -rf $TS_FILES $TS_NFT.tmp /usr/sbin/tailscaled.new
+	sed -i '/^tailscale:/d' /etc/group
+	for f in $TS_FILES; do sed -i "\#^$f\$#d" /etc/sysupgrade.conf; done
+fi
+
 # ---------------------------------------------------------------- Redlib address
 # A /32 address on the LAN bridge: devices reach it directly, and DHCP keeps
 # handing out the router's main address (dnsmasq only uses addresses whose
@@ -627,6 +707,29 @@ if [ -n "$LAN_ZONE" ] && [ -n "$ZT$ZT_REMOVED" ]; then
 	uci -q del_list "firewall.$LAN_ZONE.device=zt+"
 	[ "$(uci -q get "firewall.$LAN_ZONE.device")" = 'zt+' ] && uci -q delete "firewall.$LAN_ZONE.device"
 	uci -q get "firewall.$LAN_ZONE.device" | grep -qw 'zt+' && die "could not take zt+ out of the lan zone"
+fi
+if [ -n "$TS" ]; then
+	# Input accepted (the router's own services, as from the LAN). Forwarded
+	# only into the VPN, and only what the VPN rules send there (Telegram's
+	# ranges, the VPN domains): with the VPN down or for anything else, the
+	# route is the WAN, where Tailscale devices may not go.
+	uci batch >/dev/null <<-EOF
+		add firewall zone
+		set firewall.@zone[-1].setup='1'
+		set firewall.@zone[-1].name='tailscale'
+		set firewall.@zone[-1].input='ACCEPT'
+		set firewall.@zone[-1].output='ACCEPT'
+		set firewall.@zone[-1].forward='REJECT'
+		add_list firewall.@zone[-1].device='tailscale0'
+	EOF
+	if [ -n "$VPN" ]; then
+		uci batch >/dev/null <<-EOF
+			add firewall forwarding
+			set firewall.@forwarding[-1].setup='1'
+			set firewall.@forwarding[-1].src='tailscale'
+			set firewall.@forwarding[-1].dest='$VPN'
+		EOF
+	fi
 fi
 if [ -n "$ZT" ]; then
 	# Input accepted (the router's own services, as from the LAN); no
@@ -882,6 +985,11 @@ fi
 # Not the Redlib program (11 MB in every upgrade backup): the updater
 # (oneclick-after-upgrade) reinstalls it after a firmware upgrade.
 [ -n "$REDLIB" ] && for f in $REDLIB_FILES; do
+	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
+done
+# Tailscale: the program too (5 MB compressed in the upgrade backup): the
+# router can't build it, and without it remote access would be gone.
+[ -n "$TS" ] && for f in $TS_FILES; do
 	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
 done
 [ -f /etc/proton-pick.conf ] && for f in /usr/sbin/proton-pick /usr/share/proton-pick/ /etc/proton/ /etc/proton-pick.conf; do
@@ -1163,6 +1271,50 @@ if [ -n "$VPN" ]; then
 elif [ -x /etc/init.d/pbr ]; then
 	/etc/init.d/pbr stop >/dev/null 2>&1; /etc/init.d/pbr disable
 fi
+if [ -n "$TS" ]; then
+	/etc/init.d/tailscale enable; /etc/init.d/tailscale restart >/dev/null 2>&1
+	ts_state() { /usr/sbin/tailscale status --json 2>/dev/null | jsonfilter -e @.BackendState; }
+	i=0; until [ -n "$(ts_state)" ] || [ $i -ge 30 ]; do sleep 1; i=$((i + 1)); done
+	# Offered to the tailnet: Telegram's IPv4 ranges, as the VPN rules have
+	# them now (telegram-ranges keeps them current, also here).
+	routes=''
+	if [ -n "$VPN" ] && on "${TELEGRAM_VIA_VPN:-0}"; then
+		p=$(uci -q show pbr | sed -n "s/^pbr\.\([^.]*\)\.name='Telegram through VPN'$/\1/p" | head -1)
+		routes=$(uci -q get "pbr.$p.dest_addr" | tr ' ' '\n' | grep -E '^[0-9.]+/[0-9]+$' | tr '\n' ',' | sed 's/,$//')
+	fi
+	# No DNS or routes from the tailnet; no firewall rules of its own (the zone above).
+	flags="--accept-dns=false --accept-routes=false --netfilter-mode=off --advertise-routes=$routes"
+	if [ "$(ts_state)" = NeedsLogin ] && [ -s "$PRIV/tailscale-authkey" ]; then
+		# The key goes in a file: a command line would show it in the process list.
+		(umask 077; tr -d ' \r\n' < "$PRIV/tailscale-authkey" > /tmp/setup-ts-key)
+		# shellcheck disable=SC2086
+		ts_out=$(/usr/sbin/tailscale up --auth-key=file:/tmp/setup-ts-key --timeout=90s $flags 2>&1); ts_rc=$?
+		rm -f /tmp/setup-ts-key
+	else
+		# shellcheck disable=SC2086
+		ts_out=$(/usr/sbin/tailscale set $flags 2>&1); ts_rc=$?
+	fi
+	if [ $ts_rc = 0 ] && [ -n "$routes" ]; then echo "$routes" > /etc/tailscale/oneclick-routes; else rm -f /etc/tailscale/oneclick-routes; fi
+	i=0; until case $(ts_state) in Running|NeedsMachineAuth) true ;; *) false ;; esac || [ $i -ge 20 ]; do sleep 1; i=$((i + 1)); done
+	ts_self() { /usr/sbin/tailscale status --json 2>/dev/null | jsonfilter -e "@.Self.$1"; }
+	case $(ts_state) in
+		Running)
+			TS_IP=$(/usr/sbin/tailscale ip -4 2>/dev/null | head -1)
+			pass "Tailscale: the router is $TS_IP in your tailnet ($(ts_self HostName)); devices there reach LuCI, SSH${ENABLE_MANGADEX:+$(on "$ENABLE_MANGADEX" && echo ", the MangaDex app (http://$TS_IP/mangadex-safe/)")}"
+			if [ -n "$routes" ]; then
+				if ts_self 'PrimaryRoutes[*]' | grep -qx 149.154.160.0/20; then
+					pass "Tailscale: Telegram's ranges offered and approved: phones with Tailscale on send Telegram (calls too) through $VPN"
+				else
+					info "Tailscale: approve the router's routes (Telegram's ranges) at https://login.tailscale.com/admin/machines > $(ts_self HostName) > Edit route settings"
+				fi
+			fi
+			[ -n "$(ts_self KeyExpiry)" ] && info "Tailscale: the router's login expires on $(ts_self KeyExpiry | cut -c1-10); turn that off at https://login.tailscale.com/admin/machines > $(ts_self HostName) > Disable key expiry"
+			;;
+		NeedsMachineAuth) info "Tailscale: approve the router at https://login.tailscale.com/admin/machines" ;;
+		NeedsLogin) fail "Tailscale: not logged in ($(echo "$ts_out" | grep -v -i 'warning\|ethtool\|^$' | tail -1 | cut -c1-200)); put a new auth key in private/tailscale-authkey and run the setup again" ;;
+		*) fail "Tailscale: $(ts_state) ($(echo "$ts_out" | tail -1 | cut -c1-200))" ;;
+	esac
+fi
 [ -n "$APS" ] && wifi reload
 if on "${FAMILY_FILTER:-0}"; then
 	/usr/sbin/redlib-block && pass "Redlib instance list fetched (allowed: ${REDLIB_ALLOW:-none})" \
@@ -1257,6 +1409,11 @@ if [ -n "$VPN" ]; then
 	fi
 	on "${TELEGRAM_VIA_VPN:-0}" && check "Telegram's ranges routed through $VPN (149.154.160.0/20 in pbr)" \
 		"nft list chain inet fw4 pbr_prerouting | grep -q '149.154.160.0/20.*Telegram through VPN'"
+fi
+if [ -n "$TS" ]; then
+	tpid=$(pidof tailscaled)
+	check "Tailscale runs in its own group (its DNS skips the block lists)" "[ -n '$tpid' ] && [ \"\$(awk '/^Gid:/ { print \$2 }' /proc/$tpid/status)\" = \"\$(sed -n 's/^tailscale:[^:]*:\([0-9]*\):.*/\1/p' /etc/group)\" ] && nft list chain inet fw4 oneclick_tailscale_dns | grep -q 'redirect to :5354'"
+	[ -n "$tpid" ] && info "Tailscale uses $(awk '/^VmRSS/ { printf "%d MB", $2 / 1024 }' /proc/$tpid/status) of memory"
 fi
 if [ -n "$REMOTE" ]; then
 	check "remote access: WireGuard listens on UDP $REMOTE_PORT" "[ \"\$(wg show remote listen-port)\" = $REMOTE_PORT ]"

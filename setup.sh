@@ -16,6 +16,7 @@ set -eu
 exec 3>&2   # the terminal, for questions asked while stderr is redirected
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib/laptop.sh"
+. "$HERE/lib/tailscale.sh"
 
 RECONF='' ONLY=''
 case ${1-} in
@@ -189,6 +190,34 @@ wizard() {
 	else
 		ENABLE_ZEROTIER=0
 	fi
+
+	say ""
+	say "Tailscale: remote access like ZeroTier, behind a shared address too. Devices in"
+	say "your tailnet reach the router itself; with Telegram through the VPN on, a phone"
+	say "with Tailscale on also sends Telegram (calls too) through the router's VPN when"
+	say "away. The router runs a trimmed Tailscale built on this computer (needs git and"
+	say "about 500 MB in ~/.cache the first time)."
+	if ask_yn "Set up Tailscale on the router?" "$(yn "${ENABLE_TAILSCALE:-0}")"; then
+		ENABLE_TAILSCALE=1
+		if [ ! -s "$PRIV/tailscale/tailscaled.state" ] && [ ! -s "$PRIV/tailscale-authkey" ]; then
+			say "  The router logs in once with an auth key: https://login.tailscale.com/admin/settings/keys"
+			say "  > Generate auth key (not reusable, not ephemeral). Paste it here (not shown);"
+			say "  it goes to private/tailscale-authkey. Enter alone: put it there yourself later."
+			_k=''; [ -t 0 ] && stty -echo
+			printf 'Auth key: ' >&2; IFS= read -r _k || _k=''
+			[ -t 0 ] && stty echo; printf '\n' >&2
+			case $_k in
+				'') ;;
+				tskey-*[!A-Za-z0-9_-]*|tskey-) say "  That doesn't look like an auth key (tskey-...); not saved." ;;
+				tskey-*) mkdir -p "$PRIV"; chmod 700 "$PRIV"
+					(umask 077; printf '%s\n' "$_k" > "$PRIV/tailscale-authkey"); say "  Saved in private/tailscale-authkey." ;;
+				*) say "  That doesn't look like an auth key (tskey-...); not saved." ;;
+			esac
+			unset _k
+		fi
+	else
+		ENABLE_TAILSCALE=0
+	fi
 }
 
 validate() { # stop before saving or using broken settings
@@ -275,6 +304,19 @@ until ssh_r true 2>/dev/null; do
 	sleep 3
 done
 
+# Tailscale: built here for the router's processor (cached after the first time).
+TS_PROG=''
+if [ "${ENABLE_TAILSCALE-}" = 1 ]; then
+	if [ ! -s "$PRIV/tailscale/tailscaled.state" ] && [ ! -s "$PRIV/tailscale-authkey" ] \
+		&& ! ssh_r '[ -s /etc/tailscale/tailscaled.state ]' 2>/dev/null; then
+		say "Tailscale needs an auth key the first time: save one in $PRIV/tailscale-authkey"
+		say "  (https://login.tailscale.com/admin/settings/keys > Generate auth key; not reusable, not ephemeral)."
+		exit 1
+	fi
+	arch=$(ssh_r 'cat /etc/apk/arch 2>/dev/null || opkg print-architecture 2>/dev/null | awk "END { print \$2 }"' 2>/dev/null) || arch=''
+	TS_PROG=$(ts_build "$arch") || { say "Could not build Tailscale for the router (see above)."; exit 1; }
+fi
+
 # ------------------------------------------------------------------ bundle
 mkdir -p "$STAGE/b/private"
 cp -R "$HERE/router" "$STAGE/b/router"
@@ -301,9 +343,18 @@ fi
 if [ "${ENABLE_ZEROTIER-}" = 1 ] && [ -f "$PRIV/zerotier/identity.secret" ]; then
 	mkdir -p "$STAGE/b/private/zerotier"; cp "$PRIV/zerotier/identity.secret" "$STAGE/b/private/zerotier/"
 fi
+# Tailscale: the program, and the router's saved identity or an auth key.
+mkdir -p "$STAGE/b/tailscale"
+if [ -n "$TS_PROG" ]; then
+	cp "$TS_PROG" "$STAGE/b/tailscale/tailscaled"
+	if [ -s "$PRIV/tailscale/tailscaled.state" ]; then
+		mkdir -p "$STAGE/b/private/tailscale"; cp "$PRIV/tailscale/tailscaled.state" "$STAGE/b/private/tailscale/"
+	fi
+	[ -s "$PRIV/tailscale-authkey" ] && cp "$PRIV/tailscale-authkey" "$STAGE/b/private/"
+fi
 
 say "Copying settings to the router's RAM ..."
-tar -C "$STAGE/b" -czf - router private \
+tar -C "$STAGE/b" -czf - router private tailscale \
 	| ssh_r 'rm -rf /tmp/setup && mkdir -m 700 /tmp/setup && tar -C /tmp/setup -xzf -'
 
 say "Running the installer on the router (5-10 minutes) ..."
@@ -359,6 +410,33 @@ if [ "${ENABLE_ZEROTIER-}" = 1 ] && [ "$rc" != 1 ]; then
 		say "  tick Auth for ${secret%%:*}. It connects by itself; its address shows there afterwards."
 	else
 		say "ZeroTier: could not read the router's state (see: logread -e zerotier)."
+	fi
+fi
+
+# Tailscale: keep the router's identity and login (only if settings are
+# saved): a reset router comes back as the same device, without a new key.
+if [ "${ENABLE_TAILSCALE-}" = 1 ] && [ "$rc" != 1 ]; then
+	ts_ip=$(ssh_r '/usr/sbin/tailscale ip -4 2>/dev/null | head -1' 2>/dev/null | grep -xE '100\.[0-9.]+') || ts_ip=''
+	if [ -n "$ts_ip" ] && [ "$USED" = "$CONF" ] && [ ! -s "$PRIV/tailscale/tailscaled.state" ]; then
+		mkdir -p "$PRIV/tailscale"; chmod 700 "$PRIV/tailscale"
+		if (umask 077; ssh_r 'cat /etc/tailscale/tailscaled.state' > "$PRIV/tailscale/tailscaled.state.tmp") \
+			&& grep -q '"_machinekey"' "$PRIV/tailscale/tailscaled.state.tmp"; then
+			mv "$PRIV/tailscale/tailscaled.state.tmp" "$PRIV/tailscale/tailscaled.state"
+			say "Saved the router's Tailscale identity in private/tailscale (reused on re-install)."
+			[ -f "$PRIV/tailscale-authkey" ] && say "  The auth key in private/tailscale-authkey is used up: you can delete it."
+		else
+			rm -f "$PRIV/tailscale/tailscaled.state.tmp"
+		fi
+	fi
+	say ""
+	if [ -n "$ts_ip" ]; then
+		say "Tailscale: devices in your tailnet reach the router at $ts_ip (LuCI, SSH$( [ "${ENABLE_MANGADEX-}" = 1 ] && echo "; MangaDex app: http://$ts_ip/mangadex-safe/"))."
+		if [ "${ENABLE_VPN-}" = 1 ] && [ "${TELEGRAM_VIA_VPN-}" = 1 ]; then
+			say "  Telegram through the VPN when away: approve the router's routes once (see the report),"
+			say "  then keep Tailscale on in the phone (Android: Use Tailscale subnets on)."
+		fi
+	else
+		say "Tailscale: the router is not logged in (see the report above)."
 	fi
 fi
 

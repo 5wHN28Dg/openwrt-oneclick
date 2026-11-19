@@ -3,10 +3,11 @@
 # files listed in /etc/sysupgrade.conf, but:
 # - the manga.lan redirect lives in /www/index.html, which belongs to LuCI:
 #   the new firmware brings LuCI's own copy;
-# - adblock-lean and Redlib come back switched off (an upgrade restores the
-#   start-at-boot links of packages only). adblock-lean would stay off until
-#   its 05:00 job, Redlib (its 11 MB program is left out of the backup) until
-#   its 03:40 update.
+# - adblock-lean, Redlib and Tailscale come back switched off (an upgrade
+#   restores the start-at-boot links of packages only). adblock-lean would
+#   stay off until its 05:00 job, Redlib (its 11 MB program is left out of the
+#   backup) until its 03:40 update, Tailscale (and remote access with it)
+#   for good.
 #
 #   oneclick-after-upgrade boot    from /etc/rc.local, at every boot
 #   oneclick-after-upgrade manga   the manga.lan redirect only (install.sh)
@@ -14,7 +15,7 @@
 #
 # At boot the redirect and Redlib's program are checked every time (cheap,
 # and so also put back after an upgrade that kept this firmware's number).
-# adblock-lean is switched on only on the first boot of a new firmware:
+# adblock-lean and Tailscale are switched on only on the first boot of a new firmware:
 # switched off by hand later, it stays off. The firmware it last did that
 # for is in /etc/oneclick-firmware, left out of /etc/sysupgrade.conf on
 # purpose, so a new firmware starts without it.
@@ -54,6 +55,12 @@ manga
 # One after the other: both need memory (as their nightly jobs are apart).
 fw=$(firmware)
 if [ "$(cat "$MARK" 2>/dev/null)" != "$fw" ]; then
+	# Tailscale first (it's the way in from outside; adblock-lean may take
+	# minutes). Only this tool's: OpenWrt's package comes back on by itself.
+	if grep -q 'set up by openwrt-oneclick' /etc/init.d/tailscale 2>/dev/null && ! /etc/init.d/tailscale enabled; then
+		/etc/init.d/tailscale enable; /etc/init.d/tailscale start
+		say "Tailscale switched on again"
+	fi
 	if [ -x /etc/init.d/adblock-lean ] && ! /etc/init.d/adblock-lean enabled; then
 		/etc/init.d/adblock-lean enable
 		if tries 5 120 /etc/init.d/adblock-lean start; then say "adblock-lean switched on again"
