@@ -524,7 +524,8 @@ tailscale_checks() {
 	fi
 	r=$(vm_ssh 'nslookup controlplane.tailscale.com 127.0.0.1 2>/dev/null | awk "/^Name:/{n=1} n && /^Address/" | grep -q . && echo resolves || echo blocked')
 	[ "$r" = blocked ] && ok "tailscale.com stays blocked for the LAN (the router's Tailscale alone skips the list)" || bad "tailscale.com for the LAN: $r"
-	r=$(vm_ssh "/etc/init.d/tailscale stop; sleep 2; ip link del tailscale0 2>/dev/null
+	r=$(vm_ssh "apk add ip-full >/dev/null 2>&1   # BusyBox ip can't make veth pairs
+		/etc/init.d/tailscale stop; sleep 2; ip link del tailscale0 2>/dev/null
 		ip link add tailscale0 type veth peer name tsp; ip link set tailscale0 up
 		ip netns add ph; ip link set tsp netns ph; ip -n ph link set lo up; ip -n ph link set tsp up
 		ip -n ph addr add 100.100.100.2/32 dev tsp; ip -n ph route add default dev tsp
@@ -656,7 +657,8 @@ scenario_full() {
 	vm_ssh 'echo "0.0.0.0 api.github.com" >> /etc/hosts'
 	ONECLICK_PRIVATE=$P timeout 1500 "$W/setup.sh" 127.0.0.1 "$PORT" > "$W/full-nogh.log" 2>&1; rc=$?
 	vm_ssh 'sed -i "/api.github.com/d" /etc/hosts; /etc/init.d/dnsmasq restart >/dev/null 2>&1'
-	other=$(grep '^FAIL' "$W/full-nogh.log" | sort -u | grep -v 'VPN WireGuard handshake\|SQM speed test failed.*429\|kept the installed adblock-lean')
+	other=$(grep '^FAIL' "$W/full-nogh.log" | sort -u | grep -v 'VPN WireGuard handshake\|SQM speed test failed.*429\|kept the installed adblock-lean' \
+		| { if [ -n "${TS_TEST_AUTHKEY_FILE-}" ]; then cat; else grep -v 'Tailscale: not logged in'; fi; })
 	if [ "$rc" = 2 ] && [ -z "$other" ] && grep -q '^FAIL.*kept the installed adblock-lean' "$W/full-nogh.log" \
 		&& grep -q '^PASS  adblock-lean blocklist loaded' "$W/full-nogh.log"; then
 		ok "GitHub unreachable: kept the installed adblock-lean, still blocking"

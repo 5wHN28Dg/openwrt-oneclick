@@ -45,6 +45,7 @@ Optional (asked on the first run):
 | Private Redlib | [Redlib](https://github.com/redlib-org/redlib) (Reddit without ads, tracking or the app) at `http://reddit.lan`, for the LAN and remote-access devices. Adult posts are hidden (Redlib's SFW-only mode) while family filtering is on, and off by default otherwise. If your own block list blocks Reddit, devices stay blocked: only Redlib fetches it. See [Redlib](#redlib). |
 | Remote access | Reach your home network and `manga.lan` from anywhere through a WireGuard tunnel to the router. Each device you name (e.g. `phone laptop`) gets its own key; its config file lands in `private/remote/` for the WireGuard app (`qrencode -t ansiutf8 < private/remote/phone.conf` shows it as a QR code for phones). Only the tunnel and your home network go through it, and the device uses the router's DNS, so blocking and family filtering apply. See [Remote access](#remote-access) for what your line needs. |
 | ZeroTier | Remote access that also works when your provider shares one public address among many customers (carrier-grade NAT), where the WireGuard option can't be reached: the router joins your ZeroTier network (free plan) and devices reach the router itself at its ZeroTier address: LuCI, the MangaDex app (`http://<address>/mangadex-safe/`) and the Telegram proxy (nothing behind it: ZeroTier gets its own firewall zone that forwards nowhere). About 1 MB of storage and 8 MB of RAM (measured on a Redmi AX6S). See [ZeroTier](#zerotier). |
+| Tailscale | Remote access behind a shared address too, in the same app many phones already run: devices in your tailnet reach the router itself (LuCI, SSH, the MangaDex app). With Telegram through the VPN on, the router also offers Telegram's address ranges to your tailnet, so a phone away from home sends Telegram, calls and group voice chats included, through the router's VPN (no proxy can carry calls). A trimmed Tailscale built on your computer: about 5 MB of flash and 21-26 MB of RAM (measured on the test VM; the stock build uses about 50 MB). See [Tailscale](#tailscale). |
 
 Separately, `./kids.sh` gives chosen devices fixed addresses and turns their
 internet off at night, along with the router's own pages (`reddit.lan`,
@@ -187,6 +188,72 @@ reset router doesn't need approving again (one `private/` folder is for one
 router: two routers with the same identity clash). Turning the option off
 removes the package and its settings (the identity stays in `private/`).
 
+## Tailscale
+
+Like [ZeroTier](#zerotier), Tailscale works where the router can't be reached
+from outside, because the router and your devices both connect out. It also
+gets a phone's Telegram calls through the VPN when away from home: Telegram
+never sends calls through a proxy (its call code uses UDP, which it doesn't
+pass to a SOCKS5 proxy), so the [Telegram proxy](#what-it-sets-up) carries
+messages only. With Tailscale the phone's Telegram traffic itself travels to
+the router, which sends it through the VPN like a device at home.
+
+1. In the [Tailscale admin console](https://login.tailscale.com/admin/settings/keys),
+   generate an auth key (not reusable, not ephemeral). With family filtering
+   on, tailscale.com is blocked at home (the VPN-bypass list): use mobile data.
+2. Run `./setup.sh --reconfigure`, say yes to Tailscale and paste the key (it
+   goes to `private/tailscale-authkey`; used once).
+3. In the admin console under Machines, for the router: Edit route settings
+   and approve its routes (Telegram's ranges), and Disable key expiry (or it
+   logs out after 180 days). The setup's report says when either is needed.
+4. On the phone, turn Tailscale on (Android: Use Tailscale subnets stays on).
+
+Away from home, with Tailscale on, the phone reaches the router at its
+Tailscale address (100.x.y.z, printed by the setup) and Telegram goes through
+the router's VPN. `manga.lan` and the other devices at home aren't reachable
+that way (no routes into the home network): use the router's address.
+
+**Why a trimmed build.** OpenWrt's `tailscale` package is the full program:
+26 MB of storage and about 50 MB of memory, a fifth of a 256 MB router.
+Tailscale can leave features out when it is built; `setup.sh` builds
+[Tailscale's release](https://github.com/tailscale/tailscale) (pinned version
+and commit, in `lib/tailscale.sh`) with only routing, NAT traversal, direct
+UDP, route advertising and the command-line tool, using Tailscale's own Go
+toolchain (downloaded into `~/.cache` the first time, about 500 MB; needs
+git and curl). It runs with Go's memory settings tuned (`GOGC=50`,
+`GOMEMLIMIT=12MiB`). Measured on the 256 MB test VM, logged in and carrying
+traffic:
+
+| Build | Program | Memory |
+|---|---|---|
+| Stock | 40 MB | 49-52 MB |
+| Trimmed (this setup) | 13 MB (about 5 MB compressed on flash) | 21-26 MB |
+
+The catch: updates are yours. OpenWrt doesn't update this build: for a new
+Tailscale release, change `TS_VERSION` and `TS_COMMIT` in `lib/tailscale.sh`
+and run the setup again.
+
+**What it can reach.** Tailscale gets its own firewall zone: devices in your
+tailnet reach the router's own services (LuCI, SSH, the MangaDex app, the
+Telegram proxy) and are forwarded only into the VPN. What goes into the VPN
+is decided by the VPN rules (Telegram's ranges, your VPN domains and ranges);
+anything else, and everything while the VPN rules are down, would leave
+through your line and is refused. The router takes no DNS or routes from the
+tailnet. The block lists block tailscale.com for every device at home; the
+router's own Tailscale runs in its own group, whose DNS lookups (and only
+those) go to the encrypted resolver behind the lists, as Redlib's do.
+
+With the option on, the setup manages Tailscale on the router. It stops
+before changing anything if OpenWrt's `tailscale` package is installed
+(remove it first) or Tailscale's device sits in a firewall zone, bridge or
+rule it didn't make. It saves the router's Tailscale state (identity and
+login) in `private/tailscale/` and gives it back on re-installs, so a reset
+router comes back as the same device without a new key (one `private/`
+folder is for one router). The program and state are kept across firmware
+upgrades, and `oneclick-after-upgrade` switches Tailscale on again after
+one. Turning the option off logs the router out and removes the program,
+its state, group, zone and rules.
+
 ## Proton VPN server choice
 
 With Proton VPN as the VPN, the router can keep the tunnel on a working, fast
@@ -250,6 +317,8 @@ Everything personal lives in `private/` (gitignored, mode 700):
 | `host_keys/` | The router's SSH host keys, saved after the first successful run and restored on re-install, so `ssh` keeps trusting it. |
 | `blocklist.txt`, `allowlist.txt` | Your own domains to block or always allow, one per line (optional). |
 | `remote/` | WireGuard configs for your remote-access devices (written after each run). |
+| `zerotier/identity.secret` | The router's ZeroTier identity (saved after the first run). |
+| `tailscale-authkey`, `tailscale/` | The Tailscale auth key you give once, then the router's Tailscale state (saved after the first login). |
 | `kids.conf` | Devices and times for `kids.sh`. |
 
 `./setup.sh --reconfigure` changes the saved answers before running;
@@ -279,8 +348,8 @@ firmware with your installed packages) keep everything the setup made: its
 files are listed in `/etc/sysupgrade.conf`. A minute after the first boot of
 the new firmware, `oneclick-after-upgrade` (started from `/etc/rc.local`)
 puts back what an upgrade can't keep: the `manga.lan` redirect in LuCI's
-start page, adblock-lean switched on, and the Redlib program (left out of the
-backup: 11 MB). A plain sysupgrade with a stock image loses the packages
+start page, adblock-lean and Tailscale switched on, and the Redlib program
+(left out of the backup: 11 MB). A plain sysupgrade with a stock image loses the packages
 (pbr, dnsmasq-full, microsocks, ...): run `setup.sh` again after one.
 
 ## Tests
