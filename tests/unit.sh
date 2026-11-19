@@ -226,6 +226,11 @@ printf '%s\n' y "X" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" UTC US
 	| ONECLICK_PRIVATE=$P3 "$HERE/setup.sh" --settings-only >"$T/w3.out" 2>&1
 eq "decline save: exit" "$?" 0
 eq "decline save: nothing written" "$(ls -A "$P3" 2>/dev/null)" ""
+# ... also with a Tailscale auth key given
+P3b=$T/priv3b
+printf '%s\n' y "X" "longenough" "longenough" pw pw "$HOME/.ssh/test_key" UTC US n 9 n n n n n n y tskey-auth-kTEST22CNTRL-xyz n \
+	| ONECLICK_PRIVATE=$P3b "$HERE/setup.sh" --settings-only >"$T/w3b.out" 2>&1
+eq "decline save with a Tailscale key: nothing written" "$(ls -A "$P3b" 2>/dev/null)" ""
 
 # A settings file without LINK_TYPE asks for it and saves it.
 grep -v '^LINK_TYPE=' "$P2/config.env" > "$T/nolink" && mv "$T/nolink" "$P2/config.env"

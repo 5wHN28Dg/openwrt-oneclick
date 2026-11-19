@@ -111,6 +111,17 @@ if [ -n "$TS" ]; then
 		[ "$(uci -q get "firewall.$r.setup")" = 1 ] || tsbad="$tsbad rule:$r"
 	done
 	[ -z "$tsbad" ] || { echo "Tailscale's interface is in firewall zones, bridges or rules this tool doesn't manage ($tsbad ): take it out there first (the setup gives Tailscale its own zone)"; exit 1; }
+	# Left behind by OpenWrt's package (apk del keeps its state) or made by
+	# hand: not adopted silently.
+	if ! ts_ours && [ -e /etc/tailscale/tailscaled.state ]; then
+		echo "/etc/tailscale holds a Tailscale state this tool didn't make (left by OpenWrt's package?): move it away first"; exit 1
+	fi
+	if ! ts_ours && grep -q '^tailscale:' /etc/group; then
+		echo "a group named tailscale exists that this tool did not make; rename it first"; exit 1
+	fi
+	# Tailscale devices may only go where its zone forwards (into the VPN);
+	# everything else falls to the default forward policy.
+	[ "$(uci -q get firewall.@defaults[0].forward)" = ACCEPT ] && { echo "the firewall's default forward policy is ACCEPT: Tailscale devices would reach the internet and the LAN; set it to REJECT first"; exit 1; }
 	# A login: the router's own, the one saved on the laptop, or an auth key.
 	if [ ! -s /etc/tailscale/tailscaled.state ] && [ ! -s "$PRIV/tailscale/tailscaled.state" ] && [ ! -s "$PRIV/tailscale-authkey" ]; then
 		echo "Tailscale needs an auth key the first time: save one in private/tailscale-authkey (see README, Tailscale)"; exit 1
@@ -1278,7 +1289,10 @@ fi
 if [ -n "$TS" ]; then
 	/etc/init.d/tailscale enable; /etc/init.d/tailscale restart >/dev/null 2>&1
 	ts_state() { /usr/sbin/tailscale status --json 2>/dev/null | jsonfilter -e @.BackendState; }
-	i=0; until [ -n "$(ts_state)" ] || [ $i -ge 30 ]; do sleep 1; i=$((i + 1)); done
+	# With a login already saved it starts in NoState and only learns from
+	# Tailscale's servers whether that login still holds (or has expired, or
+	# the device was deleted): wait for that answer before choosing.
+	i=0; until case $(ts_state) in ''|NoState|Starting) false ;; *) true ;; esac || [ $i -ge 60 ]; do sleep 1; i=$((i + 1)); done
 	# Offered to the tailnet: Telegram's IPv4 ranges, as the VPN rules have
 	# them now (telegram-ranges keeps them current, also here).
 	routes=''
@@ -1288,17 +1302,21 @@ if [ -n "$TS" ]; then
 	fi
 	# No DNS or routes from the tailnet; no firewall rules of its own (the zone above).
 	flags="--accept-dns=false --accept-routes=false --netfilter-mode=off --advertise-routes=$routes"
-	if [ "$(ts_state)" = NeedsLogin ] && [ -s "$PRIV/tailscale-authkey" ]; then
-		# The key goes in a file: a command line would show it in the process list.
-		(umask 077; tr -d ' \r\n' < "$PRIV/tailscale-authkey" > /tmp/setup-ts-key)
+	case $(ts_state) in Running|NeedsMachineAuth) ts_key='' ;; *) ts_key=$PRIV/tailscale-authkey ;; esac
+	if [ -n "$ts_key" ] && [ -s "$ts_key" ]; then
+		# Read from the bundle's private folder (mode 700; Tailscale trims the
+		# line end): a command line would show the key in the process list.
 		# shellcheck disable=SC2086
-		ts_out=$(/usr/sbin/tailscale up --auth-key=file:/tmp/setup-ts-key --timeout=90s $flags 2>&1); ts_rc=$?
-		rm -f /tmp/setup-ts-key
+		ts_out=$(/usr/sbin/tailscale up --auth-key="file:$ts_key" --timeout=90s $flags 2>&1); ts_rc=$?
 	else
 		# shellcheck disable=SC2086
 		ts_out=$(/usr/sbin/tailscale set $flags 2>&1); ts_rc=$?
 	fi
-	if [ $ts_rc = 0 ] && [ -n "$routes" ]; then echo "$routes" > /etc/tailscale/oneclick-routes; else rm -f /etc/tailscale/oneclick-routes; fi
+	# What it offers, for telegram-ranges; "pending" if this failed, so its
+	# next run hands the list over again.
+	if [ -z "$routes" ]; then rm -f /etc/tailscale/oneclick-routes
+	elif [ $ts_rc = 0 ]; then echo "$routes" > /etc/tailscale/oneclick-routes
+	else echo pending > /etc/tailscale/oneclick-routes; fi
 	i=0; until case $(ts_state) in Running|NeedsMachineAuth) true ;; *) false ;; esac || [ $i -ge 20 ]; do sleep 1; i=$((i + 1)); done
 	ts_self() { /usr/sbin/tailscale status --json 2>/dev/null | jsonfilter -e "@.Self.$1"; }
 	case $(ts_state) in

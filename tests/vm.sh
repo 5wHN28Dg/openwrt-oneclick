@@ -538,11 +538,12 @@ tailscale_checks() {
 		t() { ip netns exec ph curl -s -m 4 -o /dev/null http://\$1/; echo \"\$2=\$?\"; }
 		w; a=\$(tx); ip netns exec ph curl -s -m 4 -o /dev/null http://149.154.167.99/; c=\$?; [ \"\$(tx)\" -gt \"\$a\" ] && echo telegram-into-vpn || echo \"telegram=\$c probe=\$a/\$(tx)\"
 		a=\$(tx); t 198.18.0.1 other; [ \"\$(tx)\" = \"\$a\" ] && echo other-not-in-vpn
+		t 192.168.1.50 lan-device
 		/etc/init.d/pbr stop >/dev/null 2>&1; a=\$(tx); t 149.154.167.99 telegram-without-pbr; [ \"\$(tx)\" = \"\$a\" ] && echo not-in-vpn
 		/etc/init.d/pbr start >/dev/null 2>&1; w
 		ip netns del ph; ip link del tailscale0 2>/dev/null; fw4 reload >/dev/null 2>&1; /etc/init.d/tailscale start" 2>&1 | tr '\n' ' ')
-	want="telegram-into-vpn other=7 other-not-in-vpn telegram-without-pbr=7 not-in-vpn "
-	[ "$r" = "$want" ] && ok "Tailscale (stand-in device): Telegram goes into the VPN; other addresses, and Telegram without the VPN rules, are refused" \
+	want="telegram-into-vpn other=7 other-not-in-vpn lan-device=7 telegram-without-pbr=7 not-in-vpn "
+	[ "$r" = "$want" ] && ok "Tailscale (stand-in device): Telegram goes into the VPN; other addresses, LAN devices, and Telegram without the VPN rules, are refused" \
 		|| bad "Tailscale forwarding (want '$want'): $r"
 	r=$(vm_ssh "f=/etc/tailscale/oneclick-routes; [ -f \$f ] && cp \$f /tmp/routes.bak
 		i=0; until /usr/sbin/tailscale status --json >/dev/null 2>&1 || [ \$i -ge 30 ]; do sleep 1; i=\$((i + 1)); done

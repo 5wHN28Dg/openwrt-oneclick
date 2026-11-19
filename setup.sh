@@ -209,8 +209,7 @@ wizard() {
 			case $_k in
 				'') ;;
 				tskey-*[!A-Za-z0-9_-]*|tskey-) say "  That doesn't look like an auth key (tskey-...); not saved." ;;
-				tskey-*) mkdir -p "$PRIV"; chmod 700 "$PRIV"
-					(umask 077; printf '%s\n' "$_k" > "$PRIV/tailscale-authkey"); say "  Saved in private/tailscale-authkey." ;;
+				tskey-*) TS_NEWKEY=$_k ;;   # written once the settings are saved (or not)
 				*) say "  That doesn't look like an auth key (tskey-...); not saved." ;;
 			esac
 			unset _k
@@ -259,6 +258,18 @@ else
 	fi
 fi
 validate
+# A Tailscale auth key from the questions: in private/ only with the settings
+# saved there; otherwise only in this run's copy (gone at the end).
+TS_KEYFILE=$PRIV/tailscale-authkey
+if [ -n "${TS_NEWKEY-}" ]; then
+	if [ "$USED" = "$CONF" ]; then
+		mkdir -p "$PRIV"; chmod 700 "$PRIV"
+		(umask 077; printf '%s\n' "$TS_NEWKEY" > "$TS_KEYFILE"); say "Saved the Tailscale auth key in private/tailscale-authkey."
+	else
+		TS_KEYFILE=$STAGE/tailscale-authkey; (umask 077; printf '%s\n' "$TS_NEWKEY" > "$TS_KEYFILE")
+	fi
+	unset TS_NEWKEY
+fi
 [ -n "$ONLY" ] && exit 0
 if [ "${ENABLE_REMOTE-}" = 1 ]; then
 	OPENSSL=$(find_openssl) || { say "Remote access needs OpenSSL 1.1.1+ for its keys (macOS: brew install openssl@3)."; exit 1; }
@@ -307,7 +318,7 @@ done
 # Tailscale: built here for the router's processor (cached after the first time).
 TS_PROG=''
 if [ "${ENABLE_TAILSCALE-}" = 1 ]; then
-	if [ ! -s "$PRIV/tailscale/tailscaled.state" ] && [ ! -s "$PRIV/tailscale-authkey" ] \
+	if [ ! -s "$PRIV/tailscale/tailscaled.state" ] && [ ! -s "$TS_KEYFILE" ] \
 		&& ! ssh_r '[ -s /etc/tailscale/tailscaled.state ]' 2>/dev/null; then
 		say "Tailscale needs an auth key the first time: save one in $PRIV/tailscale-authkey"
 		say "  (https://login.tailscale.com/admin/settings/keys > Generate auth key; not reusable, not ephemeral)."
@@ -350,7 +361,7 @@ if [ -n "$TS_PROG" ]; then
 	if [ -s "$PRIV/tailscale/tailscaled.state" ]; then
 		mkdir -p "$STAGE/b/private/tailscale"; cp "$PRIV/tailscale/tailscaled.state" "$STAGE/b/private/tailscale/"
 	fi
-	[ -s "$PRIV/tailscale-authkey" ] && cp "$PRIV/tailscale-authkey" "$STAGE/b/private/"
+	[ -s "$TS_KEYFILE" ] && cp "$TS_KEYFILE" "$STAGE/b/private/tailscale-authkey"
 fi
 
 say "Copying settings to the router's RAM ..."
@@ -443,7 +454,7 @@ fi
 
 # Tailscale off: the router logged out, so its saved login is no good any more.
 if [ "${ENABLE_TAILSCALE-}" != 1 ] && [ "$rc" != 1 ] && [ -f "$PRIV/tailscale/tailscaled.state" ]; then
-	rm -f "$PRIV/tailscale/tailscaled.state"; rmdir "$PRIV/tailscale" 2>/dev/null
+	rm -f "$PRIV/tailscale/tailscaled.state"; rmdir "$PRIV/tailscale" 2>/dev/null || true
 	say "Tailscale is off: removed its saved (now logged-out) state from private/tailscale."
 fi
 
@@ -492,7 +503,7 @@ fi
 
 # Remote access off: its device configs no longer work.
 if [ "${ENABLE_REMOTE-}" != 1 ] && [ "$rc" != 1 ] && [ -d "$PRIV/remote" ]; then
-	rm -f "$PRIV"/remote/*.conf; rmdir "$PRIV/remote" 2>/dev/null
+	rm -f "$PRIV"/remote/*.conf; rmdir "$PRIV/remote" 2>/dev/null || true
 fi
 
 if [ -n "$SENT_SESSION" ]; then
