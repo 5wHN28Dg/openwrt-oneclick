@@ -379,7 +379,7 @@ What it costs and why each part is there:
 | A firewall rule, port 80 → 8080 on that address | Redlib runs as its own user, not root, and such a user can't open port 80. |
 | A firewall rule for its DNS | That user's lookups go to the encrypted resolver behind the block lists, so a Reddit block in your list keeps applying to every device but not to Redlib. |
 | First to go when memory runs out | The kernel kills Redlib before anything else (DNS, the firewall), and procd restarts it; if procd gives up, the nightly updater starts it again. |
-| `redlib-update`, daily at 03:40 | Takes the fork's build once it is at least 3 days old (broken builds have been replaced by then). The fork often changes daily, so with nothing from the fork installed yet, or the installed build over 14 days old, it takes the newest at once. It checks it against the SHA-256 GitHub publishes for the file, and puts the previous version back if the new one doesn't answer (that build is then skipped). New downloads are checked as the `redlib` user, never as root. |
+| `redlib-update`, daily at 03:40 | Takes the fork's build once it is at least 3 days old (broken builds have been replaced by then). The fork often changes daily, so with nothing from the fork installed yet, or the installed build over 14 days old, it takes the newest at once. It takes the file only from the fork's own release address, checks it against the SHA-256 GitHub publishes for it, and puts the previous version back if the new one doesn't answer within two minutes (that build is then skipped, and no other is tried for 7 days). New downloads are checked as the `redlib` user, never as root. |
 | Reddit sessions (optional), `private/redlib-sessions.txt` | Reddit serves full post pages only to logged-in visitors. Put the `reddit_session` cookie of a **throwaway** Reddit account in this file (one per line, `#` for comments; from a logged-in reddit.com browser: DevTools > Application > Cookies) and run the setup: it goes to `/etc/redlib/sessions`, owned by root and readable only by Redlib's group. Turn off "Show mature content" in that account's Reddit settings. Without it, listings work and post pages show Reddit's first batch of comments. The session lasts about six months; logging out on reddit.com ends it. Reddit may ban an account used this way, so never use your own. |
 
 Redlib works only as long as Reddit lets it in. Reddit announced in October
@@ -391,12 +391,12 @@ above.
 
 Redlib's SFW-only mode blocks adult communities and adult post pages. Two
 gaps remain, in Redlib itself (upstream and the fork alike):
-- Listings (the front page, `r/all`, user pages, ordinary communities) hide
-  adult posts through the visitor's own "Show NSFW posts" setting, which
-  SFW-only mode hides from the settings page but doesn't force off: someone
-  who sets it through its address sees adult posts and thumbnails there
-  (opening one is still blocked). Reddit sends few of them to visitors who
-  aren't logged in, or to an account with mature content off.
+- Listings and search hide adult posts through the visitor's own "Show NSFW
+  posts" setting, which SFW-only mode hides from the settings page but
+  doesn't force off. Someone who sets it through its address, and adds the
+  right option to a search, sees adult posts and thumbnails in listings and
+  search results (opening one is still blocked). The block lists and safe
+  search on the other sites don't cover this.
 - Its image and video pages (`/img/...`, `/vid/...`) still load media for
   anyone who already has the exact address of a file.
 

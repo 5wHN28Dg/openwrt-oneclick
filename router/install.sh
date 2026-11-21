@@ -330,11 +330,13 @@ if [ -n "$REDLIB" ]; then
 	# Optional Reddit sessions (throwaway accounts) for full post pages:
 	# readable by the redlib group only. Root owns the folder and the file,
 	# so Redlib can read them but change nothing there.
-	if [ -s "$PRIV/redlib-sessions.txt" ]; then
+	if grep -v '^[[:space:]]*#' "$PRIV/redlib-sessions.txt" 2>/dev/null | grep -q '[^[:space:]]'; then
 		mkdir -p /etc/redlib; chown root:redlib /etc/redlib; chmod 750 /etc/redlib
 		rm -f /etc/redlib/sessions.new
-		(umask 077; cp "$PRIV/redlib-sessions.txt" /etc/redlib/sessions.new) && chown root:redlib /etc/redlib/sessions.new \
-			&& chmod 640 /etc/redlib/sessions.new && mv /etc/redlib/sessions.new /etc/redlib/sessions
+		if ! { (umask 077; cp "$PRIV/redlib-sessions.txt" /etc/redlib/sessions.new) && chown root:redlib /etc/redlib/sessions.new \
+			&& chmod 640 /etc/redlib/sessions.new && mv /etc/redlib/sessions.new /etc/redlib/sessions; }; then
+			rm -f /etc/redlib/sessions.new; fail "Redlib: could not install the Reddit sessions (flash full?)"
+		fi
 	else
 		rm -rf /etc/redlib
 	fi
