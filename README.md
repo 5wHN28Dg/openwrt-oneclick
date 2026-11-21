@@ -374,13 +374,13 @@ What it costs and why each part is there:
 
 | Part | Why |
 |---|---|
-| The program: 14 MB of flash on your router's CPU type | The build for the router's CPU from [Nachtalb's fork](https://github.com/Nachtalb/redlib) (its `latest` release, rebuilt on every change). Upstream [redlib-org/redlib](https://github.com/redlib-org/redlib) stopped working when Reddit blocked it in October 2026; the fork gets past the blocking, shows the last good copy of a page while Reddit refuses (kept at 4 MB of RAM here; the fork's default is 32 MB), and adds many fixes ([its list](https://github.com/Nachtalb/redlib/blob/main/FORK.md)). Not kept in firmware-upgrade backups (they live in RAM during the upgrade); the updater puts it back and starts Redlib again a minute after the first boot of the new firmware. |
+| The program: 14-17 MB of flash, depending on your router's CPU type | The build for the router's CPU from [Nachtalb's fork](https://github.com/Nachtalb/redlib) (its `latest` release, rebuilt on every change). Upstream [redlib-org/redlib](https://github.com/redlib-org/redlib) stopped working when Reddit blocked it in October 2026; the fork gets past the blocking, shows the last good copy of a page while Reddit refuses (kept at 4 MB of RAM here; the fork's default is 32 MB), and adds many fixes ([its list](https://github.com/Nachtalb/redlib/blob/main/FORK.md)). Not kept in firmware-upgrade backups (they live in RAM during the upgrade); the updater puts it back and starts Redlib again a minute after the first boot of the new firmware. |
 | Its own address (the last one of the LAN, e.g. `192.168.1.254`) and `reddit.lan` | So it can serve on port 80 next to LuCI. DHCP keeps handing out the router's main address. The setup stops if that address is in the DHCP pool or a fixed lease. |
 | A firewall rule, port 80 → 8080 on that address | Redlib runs as its own user, not root, and such a user can't open port 80. |
 | A firewall rule for its DNS | That user's lookups go to the encrypted resolver behind the block lists, so a Reddit block in your list keeps applying to every device but not to Redlib. |
 | First to go when memory runs out | The kernel kills Redlib before anything else (DNS, the firewall), and procd restarts it; if procd gives up, the nightly updater starts it again. |
-| `redlib-update`, daily at 03:40 | Takes the fork's build once it is at least 3 days old (broken builds have been replaced by then; with nothing installed yet, at once), checks it against the SHA-256 GitHub publishes for the file, and puts the previous version back if the new one doesn't answer (that build is then skipped). New downloads are checked as the `redlib` user, never as root. |
-| Reddit sessions (optional), `private/redlib-sessions.txt` | Reddit serves full post pages only to logged-in visitors. Put the `reddit_session` cookie of a **throwaway** Reddit account in this file (one per line, `#` for comments; from a logged-in reddit.com browser: DevTools > Application > Cookies) and run the setup: it goes to `/etc/redlib/sessions`, readable only by the `redlib` user. Without it, listings work and post pages show Reddit's first batch of comments. The session lasts about six months; logging out on reddit.com ends it. Reddit may ban an account used this way, so never use your own. |
+| `redlib-update`, daily at 03:40 | Takes the fork's build once it is at least 3 days old (broken builds have been replaced by then). The fork often changes daily, so with nothing from the fork installed yet, or the installed build over 14 days old, it takes the newest at once. It checks it against the SHA-256 GitHub publishes for the file, and puts the previous version back if the new one doesn't answer (that build is then skipped). New downloads are checked as the `redlib` user, never as root. |
+| Reddit sessions (optional), `private/redlib-sessions.txt` | Reddit serves full post pages only to logged-in visitors. Put the `reddit_session` cookie of a **throwaway** Reddit account in this file (one per line, `#` for comments; from a logged-in reddit.com browser: DevTools > Application > Cookies) and run the setup: it goes to `/etc/redlib/sessions`, owned by root and readable only by Redlib's group. Turn off "Show mature content" in that account's Reddit settings. Without it, listings work and post pages show Reddit's first batch of comments. The session lasts about six months; logging out on reddit.com ends it. Reddit may ban an account used this way, so never use your own. |
 
 Redlib works only as long as Reddit lets it in. Reddit announced in October
 2026 that it is moving to a logged-in-only site and started blocking Redlib;
@@ -389,9 +389,16 @@ person's project: the setup trusts its builds as it trusts upstream's. If it
 stops working, `./setup.sh --reconfigure` with Redlib off removes all of the
 above.
 
-Redlib's SFW-only mode hides adult posts and communities. Its image and video
-pages (`/img/...`, `/vid/...`) still load media for anyone who already has the
-exact address of a file (Redlib itself doesn't show them for adult posts).
+Redlib's SFW-only mode blocks adult communities and adult post pages. Two
+gaps remain, in Redlib itself (upstream and the fork alike):
+- Listings (the front page, `r/all`, user pages, ordinary communities) hide
+  adult posts through the visitor's own "Show NSFW posts" setting, which
+  SFW-only mode hides from the settings page but doesn't force off: someone
+  who sets it through its address sees adult posts and thumbnails there
+  (opening one is still blocked). Reddit sends few of them to visitors who
+  aren't logged in, or to an account with mature content off.
+- Its image and video pages (`/img/...`, `/vid/...`) still load media for
+  anyone who already has the exact address of a file.
 
 ## Limits
 

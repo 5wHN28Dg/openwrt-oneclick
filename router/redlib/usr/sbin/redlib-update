@@ -6,8 +6,12 @@
 # on every change: a plain program per CPU, named after the build's commit.
 #
 # - Takes that build once it is at least 3 days old (a broken build has
-#   usually been replaced by then); with nothing installed yet, at once.
-#   Checks the download against the SHA-256 GitHub publishes for it.
+#   usually been replaced by then). The fork often changes daily, so that
+#   wait may never end: with nothing from the fork installed yet, or the
+#   installed build over 14 days old, it takes the newest at once.
+#   Checks the download against the SHA-256 GitHub publishes for it. A build
+#   is known by its commit and the start of its SHA-256 (a rebuild of the
+#   same commit is a new build).
 # - Installs it if it runs on this router (tried as the redlib user, never
 #   as root).
 # - Redlib only answers once Reddit has given it a token, so "not answering"
@@ -26,6 +30,7 @@ REJECTED=/etc/redlib.rejected
 NFT=/etc/nftables.d/30-oneclick-redlib-dns.nft
 API=${REDLIB_RELEASES_API:-'https://api.github.com/repos/Nachtalb/redlib/releases/latest'}   # tests: tests/vm.sh
 WAIT_DAYS=3
+STALE_DAYS=14
 D=''   # its own folder in /tmp (made below): no fixed names another user could create first
 
 say() { echo "redlib-update: $1"; logger -t redlib-update "$1"; }
@@ -60,6 +65,7 @@ answers() { # SECONDS: does Redlib answer within that time?
 }
 
 lock /var/lock/redlib-update   # the setup's run and the nightly one never overlap
+rm -f $BIN.new   # a download cut short (power cut) by an earlier run
 # Killed between the two renames of an earlier run: the previous version is there.
 [ ! -e $BIN ] && [ -x $BIN.old ] && mv $BIN.old $BIN
 
@@ -85,14 +91,16 @@ esac
 fetch "$API" "$D/release.json" || fail "can't reach GitHub"
 R=$D/release.json
 url=$(jsonfilter -i "$R" -e "@.assets[@.name='redlib-$T'].browser_download_url")
+[ -n "$url" ] || fail "the fork's release has no build for $T"
 sum=$(jsonfilter -i "$R" -e "@.assets[@.name='redlib-$T'].digest")
 made=$(jsonfilter -i "$R" -e "@.assets[@.name='redlib-$T'].created_at" | tr T ' ' | tr -d Z)
 # A build without a published SHA-256 is not trusted.
 case $sum in sha256:*) sum=${sum#sha256:} ;; *) fail "the build for $T has no published SHA-256" ;; esac
-# The build's name: its commit, from the release name "Latest build (856c6e0)".
-tag=$(jsonfilter -i "$R" -e @.name | sed -n 's/.*(\([0-9a-f]\{7,40\}\)).*/\1/p')
-[ -n "$tag" ] || tag=$(echo "$sum" | cut -c1-12)
-case $tag in ''|*[!A-Za-z0-9._-]*) fail "unexpected build name" ;; esac
+# The build's name: its commit (from the release name "Latest build
+# (856c6e0)") and the start of its SHA-256.
+commit=$(jsonfilter -i "$R" -e @.name | sed -n 's/.*(\([0-9a-f]\{7,40\}\)).*/\1/p')
+tag=${commit:-build}-$(echo "$sum" | cut -c1-8)
+case $tag in *[!A-Za-z0-9._-]*) fail "unexpected build name" ;; esac
 if [ -x $BIN ] && [ "$(cat $VERSION 2>/dev/null)" = "$tag" ]; then
 	say "$tag is current"; done_; exit 0
 fi
@@ -100,11 +108,18 @@ grep -qxF "$tag" $REJECTED 2>/dev/null && fail "$tag was rolled back before; wai
 age_ok=''
 [ -n "$made" ] && [ "$(date -u -d "$made" +%s 2>/dev/null || echo 9999999999)" -le $(( $(date +%s) - WAIT_DAYS * 86400 )) ] && age_ok=1
 if [ -z "$age_ok" ]; then
-	[ -x $BIN ] && fail "$tag is under $WAIT_DAYS days old; the installed one stays"
-	say "nothing installed yet: taking $tag although it is under $WAIT_DAYS days old"
+	# The installed build: from the fork (commit-sha256 name) and how old.
+	ours=''; grep -qxE '[0-9a-z]+-[0-9a-f]{8}' $VERSION 2>/dev/null && ours=1
+	if [ ! -x $BIN ] || [ -z "$ours" ]; then
+		say "nothing from the fork installed yet: taking $tag although it is under $WAIT_DAYS days old"
+	elif [ -n "$(find $VERSION -mtime +$STALE_DAYS 2>/dev/null)" ]; then
+		say "the installed build is over $STALE_DAYS days old: taking $tag although it is under $WAIT_DAYS days old"
+	else
+		fail "$tag is under $WAIT_DAYS days old; the installed one stays"
+	fi
 fi
 
-# 14 MB: make sure the flash has room for it next to the old one (it goes
+# 14-17 MB: make sure the flash has room for it next to the old one (it goes
 # straight there, not through RAM).
 free_kb=$(df -k /overlay 2>/dev/null | awk 'NR == 2 { print $4 }')
 [ "${free_kb:-0}" -gt 18000 ] || fail "not enough flash space (${free_kb:-?} KB free, 18 MB needed)"

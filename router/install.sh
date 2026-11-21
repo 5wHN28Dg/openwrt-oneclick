@@ -328,11 +328,13 @@ if [ -n "$REDLIB" ]; then
 	SFW=off; on "${FAMILY_FILTER:-0}" && SFW=on
 	printf 'ADDRESS=%s\nSFW=%s\n' "$REDLIB_IP" "$SFW" > /etc/redlib.conf
 	# Optional Reddit sessions (throwaway accounts) for full post pages:
-	# readable by the redlib user only.
+	# readable by the redlib group only. Root owns the folder and the file,
+	# so Redlib can read them but change nothing there.
 	if [ -s "$PRIV/redlib-sessions.txt" ]; then
-		mkdir -p /etc/redlib; chown redlib /etc/redlib; chmod 700 /etc/redlib
-		(umask 077; cp "$PRIV/redlib-sessions.txt" /etc/redlib/sessions.new) && chown redlib /etc/redlib/sessions.new \
-			&& mv /etc/redlib/sessions.new /etc/redlib/sessions
+		mkdir -p /etc/redlib; chown root:redlib /etc/redlib; chmod 750 /etc/redlib
+		rm -f /etc/redlib/sessions.new
+		(umask 077; cp "$PRIV/redlib-sessions.txt" /etc/redlib/sessions.new) && chown root:redlib /etc/redlib/sessions.new \
+			&& chmod 640 /etc/redlib/sessions.new && mv /etc/redlib/sessions.new /etc/redlib/sessions
 	else
 		rm -rf /etc/redlib
 	fi
@@ -1230,7 +1232,7 @@ if [ -n "$REDLIB" ]; then
 	/etc/init.d/redlib enable
 	if /usr/sbin/redlib-update >/tmp/setup-redlib.log 2>&1; then
 		/etc/init.d/redlib restart   # also when it was current: settings may have changed
-		pass "Redlib $(cat /etc/redlib.version) at http://reddit.lan ($REDLIB_IP), adult content $( [ "$SFW" = on ] && echo 'locked off' || echo 'off by default'); $( [ -s /etc/redlib/sessions ] && echo ', with Reddit sessions'); Nachtalb's fork, updates daily 03:40 to builds 3+ days old"
+		pass "Redlib $(cat /etc/redlib.version) at http://reddit.lan ($REDLIB_IP), adult content $( [ "$SFW" = on ] && echo 'locked off' || echo 'off by default')$( [ -s /etc/redlib/sessions ] && echo ', with Reddit sessions'); Nachtalb's fork, updates daily 03:40 to builds 3+ days old"
 	elif [ -x /usr/sbin/redlib ]; then
 		# The installed one keeps running; only the update check failed.
 		/etc/init.d/redlib restart

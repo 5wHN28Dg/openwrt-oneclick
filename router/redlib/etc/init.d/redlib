@@ -8,7 +8,7 @@
 # (the fork's "stale cache", 32 MB by default) is kept at 4 MB.
 # Reddit serves full post pages only to logged-in sessions: with a throwaway
 # account's session in /etc/redlib/sessions (from private/redlib-sessions.txt,
-# readable by the redlib user only), Redlib uses it.
+# readable by the redlib group only, owned by root), Redlib uses it.
 
 # Read by /etc/rc.common, which runs this file.
 export START=99 USE_PROCD=1
