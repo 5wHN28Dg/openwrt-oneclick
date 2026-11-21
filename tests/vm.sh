@@ -14,7 +14,9 @@
 #   OPENWRT_VERSION     release to test (default 25.12.5; must use apk, so 25.12 or later)
 #   TEST_DNS_UPSTREAM   plain DNS server for dnsproxy inside the VM, for
 #                       networks that block DoH for their own LAN clients
-#                       (the VM is such a client); e.g. 10.0.2.3:53
+#                       (the VM is such a client); e.g. 10.0.2.3:53. Reddit's
+#                       hosts then come from a hosts file (such networks may
+#                       block Reddit): REDDIT_TEST_IP, default 151.101.1.140
 #   VM_SSH_PORT         localhost port for the VM's SSH (default 2222)
 #   SPEED_PORT          localhost port for the stand-in speed test server
 #                       (default 18080)
@@ -83,6 +85,14 @@ if [ -n "${TEST_DNS_UPSTREAM-}" ]; then
 	f=$W/router/files/etc/config/dnsproxy
 	sed -i "/list upstream/d; /list bootstrap/d; /list fallback/d" "$f"
 	sed -i "/config dnsproxy 'servers'/a\\	list upstream '$TEST_DNS_UPSTREAM'\n\tlist bootstrap '$TEST_DNS_UPSTREAM'" "$f"
+	# Such a network may filter Reddit too (a home router with family
+	# filtering): Redlib's lookups, which go to dnsproxy, get Reddit's
+	# address from a hosts file instead (REDDIT_TEST_IP, default Reddit's
+	# Fastly address).
+	sed -i "/config dnsproxy 'hosts'/,/^\$/{s/option enabled '0'/option enabled '1'/; s|list hosts_files ''|list hosts_files '/etc/oneclick-test-reddit.hosts'|}" "$f"
+	for h in reddit.com www.reddit.com oauth.reddit.com accounts.reddit.com gql.reddit.com gql-fed.reddit.com old.reddit.com; do
+		echo "${REDDIT_TEST_IP:-151.101.1.140} $h"
+	done > "$W/router/files/etc/oneclick-test-reddit.hosts"
 fi
 ssh-keygen -q -t ed25519 -N '' -f "$W/key"
 # The VM reaches this computer's localhost as 10.0.2.2.
@@ -98,22 +108,32 @@ SRV_PRIV=$(wg_genkey) && SRV_PUB=$(wg_pubkey "$SRV_PRIV") || { echo "cannot make
 python3 -I "$HERE/tests/protonsrv.py" "$XPORT" "$SRV_PUB" & XPID=$!
 sleep 1
 kill -0 "$XPID" 2>/dev/null || { XPID=''; echo "Proton API stand-in did not start (port $XPORT in use?)"; exit 1; }
-# Stand-in for Redlib's release list (redlib-update's decisions): a release
-# only a day old, one whose SHA-256 doesn't match, and "releases" that run
-# but never answer (fake.tgz), as v9.9.9 and v9.9.8.
-mkdir -p "$W/rel/fake"
-rel() { # file age-days digest tag archive
-	printf '[{"tag_name":"%s","published_at":"%s","draft":false,"prerelease":false,"assets":[{"name":"redlib-x86_64-unknown-linux-musl.tar.gz","browser_download_url":"http://10.0.2.2:%s/%s","digest":"sha256:%s"}]}]\n' \
-		"$4" "$(date -u -d "-$2 days" +%Y-%m-%dT%H:%M:%SZ)" "$RPORT" "$5" "$3" > "$W/rel/$1"
+# Stand-in for the Redlib fork's "latest" release (redlib-update's
+# decisions), as the fork names its builds: a build a day old, one whose
+# SHA-256 doesn't match, builds that run but never answer (each its own
+# program, as builds are known by their SHA-256), and one whose download
+# address would pass curl an option. Programs are in folders: the file name
+# is the fork's (redlib-<CPU>).
+TS_ASSET=redlib-x86_64-unknown-linux-musl
+rel() { # file age-days digest commit folder [address]
+	printf '{"name":"Latest build (%s)","tag_name":"latest","assets":[{"name":"%s","created_at":"%s","browser_download_url":"%s","digest":"sha256:%s"}]}\n' \
+		"$4" "$TS_ASSET" "$(date -u -d "-$2 days" +%Y-%m-%dT%H:%M:%SZ)" "${6:-http://10.0.2.2:$RPORT/$5/$TS_ASSET}" "$3" > "$W/rel/$1"
 }
-printf 'not a release\n' | gzip > "$W/rel/redlib.tgz"
-printf '#!/bin/sh\n[ "$1" = --version ] && { echo "redlib 9.9.9"; exit 0; }\nexec sleep 600\n' > "$W/rel/fake/redlib"
-chmod 755 "$W/rel/fake/redlib"; tar -C "$W/rel/fake" -czf "$W/rel/fake.tgz" redlib
-zeros=$(printf '0%.0s' $(seq 64)) fake=$(sha256sum "$W/rel/fake.tgz" | cut -d' ' -f1)
-rel too-new.json 1 "$zeros" v9.9.9 redlib.tgz
-rel bad-sum.json 10 "$zeros" v9.9.9 redlib.tgz
-rel silent.json 10 "$fake" v9.9.9 fake.tgz
-rel silent-too.json 10 "$fake" v9.9.8 fake.tgz
+mkdir -p "$W/rel/g" "$W/rel/f1" "$W/rel/f2" "$W/rel/f3" "$W/rel/f4"
+printf 'not a program\n' > "$W/rel/g/$TS_ASSET"
+for i in 1 2 3 4; do
+	printf '#!/bin/sh\n# build %s\n[ "$1" = --version ] && { echo "redlib 9.9.9"; exit 0; }\nexec sleep 600\n' "$i" > "$W/rel/f$i/$TS_ASSET"
+done
+sha() { sha256sum "$W/rel/$1/$TS_ASSET" | cut -d' ' -f1; }
+zeros=$(printf '0%.0s' $(seq 64))
+rel too-new.json 1 "$zeros" 1111111 g
+rel bad-sum.json 10 "$zeros" 2222222 g
+rel silent.json 10 "$(sha f1)" 9999999 f1
+rel silent-too.json 10 "$(sha f2)" 9999998 f2
+rel young.json 1 "$(sha f3)" 7777777 f3
+rel stale-young.json 1 "$(sha f4)" 6666666 f4
+rel evil.json 10 "$(sha f1)" 5555555 f1 '-K/tmp/x'
+V_SILENT_TOO=$(sha f2 | cut -c1-12) V_YOUNG=$(sha f3 | cut -c1-12)
 # Stand-ins for Telegram's list: an error page, and a list with one new range
 # and lines that aren't ranges.
 printf '<html><body>Service unavailable</body></html>\n' > "$W/rel/tg-junk.txt"
@@ -163,6 +183,7 @@ dev$i|$i|$(wg_genkey)|$(wg_psk)"; done
 	)
 	if [ "$2" = full ]; then
 		printf 'example.net\n' > "$1/blocklist.txt"
+		printf '# test\nreddit_session=testonly\n' > "$1/redlib-sessions.txt"
 		if [ -n "${TS_TEST_AUTHKEY_FILE-}" ]; then (umask 077; cp "$TS_TEST_AUTHKEY_FILE" "$1/tailscale-authkey")
 		else echo tskey-auth-kTESTonlyCNTRL-0000000000000000000000000000000000 > "$1/tailscale-authkey"; fi
 		printf "PROTON_UID='uid-test'\nPROTON_REFRESH='refresh-0'\n" > "$1/proton-session"
@@ -328,23 +349,46 @@ redlib_checks() {
 		/etc/init.d/redlib enabled && echo enabled; pidof redlib >/dev/null && echo running' 2>&1 | tr '\n' ' ')
 	[ "$r" = "enabled running " ] && ok "Redlib: stopped and disabled (as after a firmware upgrade), the nightly update starts it again" \
 		|| bad "Redlib not restarted by the update (want 'enabled running'): $r"
-	for c in too-new bad-sum silent silent; do
-		r=$(vm_ssh "v=\$(cat /etc/redlib.version); REDLIB_RELEASES_API=http://10.0.2.2:$RPORT/$c.json /usr/sbin/redlib-update; echo rc=\$?; [ \"\$(cat /etc/redlib.version)\" = \"\$v\" ] && { i=0; until uclient-fetch -qO- http://192.168.1.254:8080/settings 2>/dev/null | grep -q Redlib || [ \$i -ge 30 ]; do sleep 1; i=\$((i + 1)); done; [ \$i -lt 30 ]; } && echo kept" 2>&1 | tr '\n' ' ')
+	for c in too-new bad-sum evil silent silent stale-young; do
+		# (installed 20 days ago, and the rollback before over a week ago)
+		[ $c = stale-young ] && vm_ssh 'for f in /etc/redlib.version /etc/redlib.rejected; do touch -d "$(date -d @$(( $(date +%s) - 20 * 86400 )) "+%Y-%m-%d %H:%M:%S")" $f; done'
+		r=$(vm_ssh "v=\$(cat /etc/redlib.version); REDLIB_DOWNLOAD_BASE=http://10.0.2.2:$RPORT/ REDLIB_RELEASES_API=http://10.0.2.2:$RPORT/$c.json /usr/sbin/redlib-update; echo rc=\$?; [ \"\$(cat /etc/redlib.version)\" = \"\$v\" ] && { i=0; until uclient-fetch -qO- http://192.168.1.254:8080/settings 2>/dev/null | grep -q Redlib || [ \$i -ge 120 ]; do sleep 1; i=\$((i + 1)); done; [ \$i -lt 120 ]; } && echo kept" 2>&1 | tr '\n' ' ')
 		case $c:$r in
-			too-new:*"no release at least 3 days old"*"rc=1 kept "*) ok "Redlib update: a release under 3 days old is not taken, the running one stays" ;;
+			too-new:*"under 3 days old; the installed one stays"*"rc=0 kept "*) ok "Redlib update: a build under 3 days old is not taken, the running one stays" ;;
 			bad-sum:*"does not match GitHub's SHA-256"*"rc=1 kept "*) ok "Redlib update: a download that doesn't match its SHA-256 is refused, the running one stays" ;;
+			evil:*"unexpected download address"*"rc=1 kept "*) ok "Redlib update: a download address that isn't the fork's (here a curl option) is refused" ;;
 			silent:*"put that back"*"rc=1 kept "*) ok "Redlib update: a release that doesn't answer while the old one did is rolled back" ;;
-			silent:*"no release at least 3 days old"*"rc=1 kept "*) ok "Redlib update: a rolled-back release is not tried again" ;;
+			silent:*"was rolled back before"*"rc=1 kept "*) ok "Redlib update: a rolled-back build is not tried again" ;;
+			stale-young:*"over 14 days old: taking"*"put that back"*"rc=1 kept "*) ok "Redlib update: with the installed build over 14 days old, a newer one is tried although young" ;;
 			*) bad "Redlib update ($c): $r" ;;
 		esac
 	done
 	# Not answering before the update either (as when Reddit refuses Redlib):
-	# the new release stays, nothing is deleted. Then the real one comes back.
-	r=$(vm_ssh "/etc/init.d/redlib stop; REDLIB_RELEASES_API=http://10.0.2.2:$RPORT/silent-too.json /usr/sbin/redlib-update; echo rc=\$?
+	# the new build stays, nothing is deleted. With nothing installed, a build
+	# under 3 days old is taken. Then the real one comes back (also taken at
+	# once, whatever its age: nothing is installed).
+	r=$(vm_ssh "/etc/init.d/redlib stop; REDLIB_DOWNLOAD_BASE=http://10.0.2.2:$RPORT/ REDLIB_RELEASES_API=http://10.0.2.2:$RPORT/silent-too.json /usr/sbin/redlib-update; echo rc=\$?
 		echo v=\$(cat /etc/redlib.version); [ -x /usr/sbin/redlib ] && echo present
-		rm -f /etc/redlib.rejected; /usr/sbin/redlib-update >/dev/null 2>&1; { i=0; until uclient-fetch -qO- http://192.168.1.254:8080/settings 2>/dev/null | grep -q Redlib || [ \$i -ge 30 ]; do sleep 1; i=\$((i + 1)); done; [ \$i -lt 30 ]; } && echo real-back" 2>&1 | tr '\n' ' ')
-	case $r in *"not answering yet"*"rc=0 v=v9.9.8 present real-back "*) ok "Redlib update: when nothing answered before, a new release is kept, not deleted (then the real one is reinstalled)" ;;
+		/etc/init.d/redlib stop; rm -f /usr/sbin/redlib /etc/redlib.version
+		REDLIB_DOWNLOAD_BASE=http://10.0.2.2:$RPORT/ REDLIB_RELEASES_API=http://10.0.2.2:$RPORT/young.json /usr/sbin/redlib-update 2>&1 | grep -o 'nothing from the fork installed yet'; echo v=\$(cat /etc/redlib.version)
+		/etc/init.d/redlib stop; rm -f /usr/sbin/redlib /etc/redlib.version /etc/redlib.rejected
+		/usr/sbin/redlib-update >/dev/null 2>&1; { i=0; until uclient-fetch -qO- http://192.168.1.254:8080/settings 2>/dev/null | grep -q Redlib || [ \$i -ge 120 ]; do sleep 1; i=\$((i + 1)); done; [ \$i -lt 120 ]; } && echo real-back" 2>&1 | tr '\n' ' ')
+	case $r in *"not answering yet"*"rc=0 v=$V_SILENT_TOO present nothing from the fork installed yet v=$V_YOUNG real-back "*) ok "Redlib update: when nothing answered before, a new build is kept, not deleted; with nothing installed, a young build is taken (then the real one is reinstalled)" ;;
 		*) bad "Redlib update without a working version to compare: $r" ;; esac
+	# Reddit sessions: only the redlib user can read them; Redlib gets the file.
+	r=$(vm_ssh 'ls -ld /etc/redlib | awk "{print \$1, \$3, \$4}"; ls -l /etc/redlib/sessions | awk "{print \$1, \$3, \$4}"
+		start-stop-daemon -S -c redlib -x /bin/cat -- /etc/redlib/sessions 2>/dev/null | grep -q testonly && echo redlib-reads
+		start-stop-daemon -S -c nobody -x /bin/cat -- /etc/redlib/sessions 2>/dev/null | grep -q testonly && echo nobody-reads
+		tr "\0" "\n" < /proc/$(pidof redlib)/environ | grep -c "^REDLIB_REDDIT_COOKIE_FILE=/etc/redlib/sessions$"
+		[ "$(awk "/^Gid:/ { print \$2 }" /proc/$(pidof redlib)/status)" = "$(sed -n "s/^redlib:[^:]*:\([0-9]*\):.*/\1/p" /etc/group)" ] && echo in-group
+		grep -qxF /etc/redlib/ /etc/sysupgrade.conf && echo kept' 2>&1 | tr '\n' ' ')
+	want="drwxr-x--- root redlib -rw-r----- root redlib redlib-reads 1 in-group kept "
+	[ "$r" = "$want" ] && ok "Redlib: Reddit sessions owned by root, readable by Redlib only, passed to it, kept across upgrades" \
+		|| bad "Redlib sessions file (want '$want'): $r"
+	# The fork's build, with its page cache kept small.
+	r=$(vm_ssh 'p=$(pidof redlib); tr "\0" "\n" < /proc/$p/environ | grep -c "^REDLIB_STALE_CACHE_MB=4$"; cat /etc/redlib.version' 2>&1 | tr '\n' ' ')
+	case $r in "1 "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]" ") ok "Redlib: Nachtalb's fork (build $(echo "$r" | cut -d' ' -f2)), page cache at 4 MB" ;;
+		*) bad "Redlib fork build / cache setting: $r" ;; esac
 }
 
 # Telegram through the VPN: the policy holds Telegram's ranges and pbr routes
@@ -740,7 +784,7 @@ scenario_full() {
 		[ -e /etc/nftables.d/31-oneclick-telegram-proxy.nft ] && echo rules; uci show pbr | grep -q "chain=.output." && echo policy; true' | tr '\n' ' ')
 	[ -z "$left" ] && ok "VPN turned off: Telegram proxy, its rules and policy removed" || bad "Telegram proxy leftovers: $left"
 	left=$(vm_ssh 'pidof redlib >/dev/null && echo process
-		for f in /usr/sbin/redlib /usr/sbin/redlib-update /etc/init.d/redlib /etc/redlib.conf /etc/redlib.version /etc/nftables.d/30-oneclick-redlib-dns.nft; do [ -e $f ] && echo $f; done
+		for f in /usr/sbin/redlib /usr/sbin/redlib-update /etc/init.d/redlib /etc/redlib.conf /etc/redlib.version /etc/nftables.d/30-oneclick-redlib-dns.nft /etc/redlib; do [ -e $f ] && echo $f; done
 		grep -q "^redlib:" /etc/passwd /etc/group /etc/shadow && echo user
 		uci -q get network.redlib >/dev/null && echo address
 		uci show firewall | grep -q "name=.Redlib." && echo redirect

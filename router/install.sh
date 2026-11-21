@@ -311,7 +311,7 @@ if on "${ENABLE_MANGADEX:-0}"; then put_tree "$ROUTER/vendor/safe-otaku"; chmod 
 # Redlib: its own user (created before the firewall rule that names its number).
 # Turned off since an earlier run: everything goes, the rule before the user.
 REDLIB_NFT=/etc/nftables.d/30-oneclick-redlib-dns.nft
-REDLIB_FILES="/etc/init.d/redlib /usr/sbin/redlib-update $REDLIB_NFT /etc/redlib.conf /etc/redlib.rejected"
+REDLIB_FILES="/etc/init.d/redlib /usr/sbin/redlib-update $REDLIB_NFT /etc/redlib.conf /etc/redlib.rejected /etc/redlib/"
 if [ -n "$REDLIB" ]; then
 	# OpenWrt's helpers (in a subshell: they read variables this script's set -u rejects)
 	( set +u; . /lib/functions.sh
@@ -327,9 +327,22 @@ if [ -n "$REDLIB" ]; then
 	sed "s/REDLIB_UID/$uid/" "$ROUTER/redlib-dns.nft" > $REDLIB_NFT.tmp && mv $REDLIB_NFT.tmp $REDLIB_NFT
 	SFW=off; on "${FAMILY_FILTER:-0}" && SFW=on
 	printf 'ADDRESS=%s\nSFW=%s\n' "$REDLIB_IP" "$SFW" > /etc/redlib.conf
+	# Optional Reddit sessions (throwaway accounts) for full post pages:
+	# readable by the redlib group only. Root owns the folder and the file,
+	# so Redlib can read them but change nothing there.
+	if grep -v '^[[:space:]]*#' "$PRIV/redlib-sessions.txt" 2>/dev/null | grep -q '[^[:space:]]'; then
+		mkdir -p /etc/redlib; chown root:redlib /etc/redlib; chmod 750 /etc/redlib
+		rm -f /etc/redlib/sessions.new
+		if ! { (umask 077; cp "$PRIV/redlib-sessions.txt" /etc/redlib/sessions.new) && chown root:redlib /etc/redlib/sessions.new \
+			&& chmod 640 /etc/redlib/sessions.new && mv /etc/redlib/sessions.new /etc/redlib/sessions; }; then
+			rm -f /etc/redlib/sessions.new; fail "Redlib: could not install the Reddit sessions (flash full?)"
+		fi
+	else
+		rm -rf /etc/redlib
+	fi
 elif [ -e /etc/init.d/redlib ] || grep -q '^redlib:' /etc/passwd; then
 	/etc/init.d/redlib stop >/dev/null 2>&1; /etc/init.d/redlib disable >/dev/null 2>&1
-	rm -f $REDLIB_FILES $REDLIB_NFT.tmp /usr/sbin/redlib /usr/sbin/redlib.old /usr/sbin/redlib.new /etc/redlib.version /etc/redlib.rejected
+	rm -rf $REDLIB_FILES $REDLIB_NFT.tmp /usr/sbin/redlib /usr/sbin/redlib.old /usr/sbin/redlib.new /etc/redlib.version /etc/redlib.rejected
 	sed -i '/^redlib:/d' /etc/passwd /etc/shadow /etc/group
 	for f in $REDLIB_FILES; do sed -i "\#^$f\$#d" /etc/sysupgrade.conf; done
 fi
@@ -1221,7 +1234,7 @@ if [ -n "$REDLIB" ]; then
 	/etc/init.d/redlib enable
 	if /usr/sbin/redlib-update >/tmp/setup-redlib.log 2>&1; then
 		/etc/init.d/redlib restart   # also when it was current: settings may have changed
-		pass "Redlib $(cat /etc/redlib.version) at http://reddit.lan ($REDLIB_IP), adult content $( [ "$SFW" = on ] && echo 'locked off' || echo 'off by default'); updates daily 03:40 to releases 3+ days old"
+		pass "Redlib $(cat /etc/redlib.version) at http://reddit.lan ($REDLIB_IP), adult content $( [ "$SFW" = on ] && echo 'locked off' || echo 'off by default')$( [ -s /etc/redlib/sessions ] && echo ', with Reddit sessions'); Nachtalb's fork, updates daily 03:40 to builds 3+ days old"
 	elif [ -x /usr/sbin/redlib ]; then
 		# The installed one keeps running; only the update check failed.
 		/etc/init.d/redlib restart

@@ -342,6 +342,8 @@ cp -R "$HERE/router" "$STAGE/b/router"
 ) || exit 1
 link_params "$LINK_TYPE" | awk '{ printf "LINK_LL=%s\nLINK_OVERHEAD=%s\nLINK_MPU=%s\n", $1, $2, $3 }' >> "$STAGE/b/private/config.env"
 for f in blocklist.txt allowlist.txt; do [ -f "$PRIV/$f" ] && cp "$PRIV/$f" "$STAGE/b/private/"; done
+# Reddit sessions for Redlib (optional; see README, Redlib).
+[ "${ENABLE_REDLIB-}" = 1 ] && [ -s "$PRIV/redlib-sessions.txt" ] && cp "$PRIV/redlib-sessions.txt" "$STAGE/b/private/"
 # A Proton session from ./proton-login.sh goes to the router, which renews it
 # from then on (each renewal replaces the token, so the laptop copy goes stale).
 SENT_SESSION=

@@ -42,7 +42,7 @@ Optional (asked on the first run):
 | Telegram through the VPN | With the VPN on: Telegram's own list of address ranges ([core.telegram.org/resources/cidr.txt](https://core.telegram.org/resources/cidr.txt)) and its web domains (`t.me`, `telegram.org`, `telegram.me`, `telegram.dog`, `telesco.pe`, `telegra.ph`, `graph.org`, `tdesktop.com`, `fragment.com`) go through the VPN. `telegram-ranges` refreshes the list daily at 04:20, downloading it through the VPN (where Telegram is blocked, telegram.org is too) and directly only as a fallback. Every range is checked strictly; a failed or odd download keeps the previous list, and if pbr refuses a new list the previous one comes back. When the VPN has no IPv6, Telegram's IPv6 ranges are rejected from the LAN, so apps switch to IPv4 through the VPN at once. The setup starts from a copy of the list in the repo. No proxy or extra program: pbr already routes by address. |
 | Telegram proxy | With Telegram through the VPN: a SOCKS5 proxy on the router ([microsocks](https://github.com/rofl0r/microsocks), 7 KB) for phones, set once in Telegram (Settings > Data and Storage > Proxy). It answers on the router's LAN address and any ZeroTier address (the firewall keeps it off the internet), needs a password (made by the setup, in `private/config.env`), runs as its own user, and that user can only reach Telegram's addresses (kept current with the list). The router sends its Telegram traffic through the VPN too. Useful away from home where routes into the home network aren't possible, such as ZeroTier's free plan; with the [ZeroTier](#zerotier) option the proxy also answers on the router's ZeroTier address. New connections from the proxy are allowed only to Telegram's IPv4 ranges, and only leaving through the VPN (checked after routing), plus the router's filtered DNS: with the VPN or pbr down it doesn't work rather than going around it, and it can't reach the router's other services or other devices. Telegram's web pages (`t.me` and the like) are not proxied, only the app's connections. |
 | MangaDex safe-mode reader | The [safe-otaku](https://github.com/5wHN28Dg/safe-otaku) reader at `http://manga.lan`. |
-| Private Redlib | [Redlib](https://github.com/redlib-org/redlib) (Reddit without ads, tracking or the app) at `http://reddit.lan`, for the LAN and remote-access devices. Adult posts are hidden (Redlib's SFW-only mode) while family filtering is on, and off by default otherwise. If your own block list blocks Reddit, devices stay blocked: only Redlib fetches it. See [Redlib](#redlib). |
+| Private Redlib | [Redlib](https://github.com/redlib-org/redlib) (Reddit without ads, tracking or the app) at `http://reddit.lan`, from [Nachtalb's fork](https://github.com/Nachtalb/redlib), which gets past Reddit's blocking, for the LAN and remote-access devices. Adult posts are hidden (Redlib's SFW-only mode) while family filtering is on, and off by default otherwise. If your own block list blocks Reddit, devices stay blocked: only Redlib fetches it. See [Redlib](#redlib). |
 | Remote access | Reach your home network and `manga.lan` from anywhere through a WireGuard tunnel to the router. Each device you name (e.g. `phone laptop`) gets its own key; its config file lands in `private/remote/` for the WireGuard app (`qrencode -t ansiutf8 < private/remote/phone.conf` shows it as a QR code for phones). Only the tunnel and your home network go through it, and the device uses the router's DNS, so blocking and family filtering apply. See [Remote access](#remote-access) for what your line needs. |
 | ZeroTier | Remote access that also works when your provider shares one public address among many customers (carrier-grade NAT), where the WireGuard option can't be reached: the router joins your ZeroTier network (free plan) and devices reach the router itself at its ZeroTier address: LuCI, the MangaDex app (`http://<address>/mangadex-safe/`) and the Telegram proxy (nothing behind it: ZeroTier gets its own firewall zone that forwards nowhere). About 1 MB of storage and 8 MB of RAM (measured on a Redmi AX6S). See [ZeroTier](#zerotier). |
 | Tailscale | Remote access behind a shared address too, in the same app many phones already run: devices in your tailnet reach the router itself (LuCI, SSH, the MangaDex app). With Telegram through the VPN on, the router also offers Telegram's address ranges to your tailnet, so a phone away from home sends Telegram, calls and group voice chats included, through the router's VPN (no proxy can carry calls). A trimmed Tailscale built on your computer: about 5 MB of flash and 21-26 MB of RAM (measured on the test VM; the stock build uses about 50 MB). See [Tailscale](#tailscale). |
@@ -318,6 +318,7 @@ Everything personal lives in `private/` (gitignored, mode 700):
 | `config.env` | All answers, including passwords (the admin password is stored hashed), Wi-Fi key and WireGuard keys. |
 | `host_keys/` | The router's SSH host keys, saved after the first successful run and restored on re-install, so `ssh` keeps trusting it. |
 | `blocklist.txt`, `allowlist.txt` | Your own domains to block or always allow, one per line (optional). |
+| `redlib-sessions.txt` | Reddit sessions of throwaway accounts for Redlib (optional, see [Redlib](#redlib)). |
 | `remote/` | WireGuard configs for your remote-access devices (written after each run). |
 | `zerotier/identity.secret` | The router's ZeroTier identity (saved after the first run). |
 | `tailscale-authkey`, `tailscale/` | The Tailscale auth key you give once, then the router's Tailscale state (saved after the first login). |
@@ -373,23 +374,31 @@ What it costs and why each part is there:
 
 | Part | Why |
 |---|---|
-| The program: 11 MB of flash on your router's CPU type, about 10 MB of RAM when idle (measured on the test VM) | Redlib's own build for the router's CPU, from its GitHub releases. Not kept in firmware-upgrade backups (they live in RAM during the upgrade); the updater puts it back and starts Redlib again a minute after the first boot of the new firmware. |
+| The program: 14-17 MB of flash, depending on your router's CPU type | The build for the router's CPU from [Nachtalb's fork](https://github.com/Nachtalb/redlib) (its `latest` release, rebuilt on every change). Upstream [redlib-org/redlib](https://github.com/redlib-org/redlib) stopped working when Reddit blocked it in October 2026; the fork gets past the blocking, shows the last good copy of a page while Reddit refuses (kept at 4 MB of RAM here; the fork's default is 32 MB), and adds many fixes ([its list](https://github.com/Nachtalb/redlib/blob/main/FORK.md)). Not kept in firmware-upgrade backups (they live in RAM during the upgrade); the updater puts it back and starts Redlib again a minute after the first boot of the new firmware. |
 | Its own address (the last one of the LAN, e.g. `192.168.1.254`) and `reddit.lan` | So it can serve on port 80 next to LuCI. DHCP keeps handing out the router's main address. The setup stops if that address is in the DHCP pool or a fixed lease. |
 | A firewall rule, port 80 → 8080 on that address | Redlib runs as its own user, not root, and such a user can't open port 80. |
 | A firewall rule for its DNS | That user's lookups go to the encrypted resolver behind the block lists, so a Reddit block in your list keeps applying to every device but not to Redlib. |
 | First to go when memory runs out | The kernel kills Redlib before anything else (DNS, the firewall), and procd restarts it; if procd gives up, the nightly updater starts it again. |
-| `redlib-update`, daily at 03:40 | Takes the newest release that is at least 3 days old (broken releases have been replaced within a day), checks it against the SHA-256 GitHub publishes for the file, and puts the previous version back if the new one doesn't answer (that release is then skipped). New downloads are checked as the `redlib` user, never as root. |
+| `redlib-update`, daily at 03:40 | Takes the fork's build once it is at least 3 days old (broken builds have been replaced by then). The fork often changes daily, so with nothing from the fork installed yet, or the installed build over 14 days old, it takes the newest at once. It takes the file only from the fork's own release address, checks it against the SHA-256 GitHub publishes for it, and puts the previous version back if the new one doesn't answer within two minutes (that build is then skipped, and no other is tried for 7 days). New downloads are checked as the `redlib` user, never as root. |
+| Reddit sessions (optional), `private/redlib-sessions.txt` | Reddit serves full post pages only to logged-in visitors. Put the `reddit_session` cookie of a **throwaway** Reddit account in this file (one per line, `#` for comments; from a logged-in reddit.com browser: DevTools > Application > Cookies) and run the setup: it goes to `/etc/redlib/sessions`, owned by root and readable only by Redlib's group. Turn off "Show mature content" in that account's Reddit settings. Without it, listings work and post pages show Reddit's first batch of comments. The session lasts about six months; logging out on reddit.com ends it. Reddit may ban an account used this way, so never use your own. |
 
-Redlib reads Reddit without logging in, and works only as long as Reddit
-allows that. Reddit announced in October 2026 that it is moving to a
-logged-in-only site, starting with tests outside the U.S.; whether Redlib
-survives that is open ([issue #609](https://github.com/redlib-org/redlib/issues/609)).
-If it stops working, `./setup.sh --reconfigure` with Redlib off removes all of
-the above.
+Redlib works only as long as Reddit lets it in. Reddit announced in October
+2026 that it is moving to a logged-in-only site and started blocking Redlib;
+the fork keeps up with that, with sessions as its fallback. The fork is one
+person's project: the setup trusts its builds as it trusts upstream's. If it
+stops working, `./setup.sh --reconfigure` with Redlib off removes all of the
+above.
 
-Redlib's SFW-only mode hides adult posts and communities. Its image and video
-pages (`/img/...`, `/vid/...`) still load media for anyone who already has the
-exact address of a file (Redlib itself doesn't show them for adult posts).
+Redlib's SFW-only mode blocks adult communities and adult post pages. Two
+gaps remain, in Redlib itself (upstream and the fork alike):
+- Listings and search hide adult posts through the visitor's own "Show NSFW
+  posts" setting, which SFW-only mode hides from the settings page but
+  doesn't force off. Someone who sets it through its address, and adds the
+  right option to a search, sees adult posts and thumbnails in listings and
+  search results (opening one is still blocked). The block lists and safe
+  search on the other sites don't cover this.
+- Its image and video pages (`/img/...`, `/vid/...`) still load media for
+  anyone who already has the exact address of a file.
 
 ## Limits
 
