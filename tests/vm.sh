@@ -88,8 +88,12 @@ if [ -n "${TEST_DNS_UPSTREAM-}" ]; then
 	# Such a network may filter Reddit too (a home router with family
 	# filtering): Redlib's lookups, which go to dnsproxy, get Reddit's
 	# address from a hosts file instead (REDDIT_TEST_IP, default Reddit's
-	# Fastly address).
+	# Fastly address). The hosts file has no IPv6 address, so dnsproxy's
+	# IPv6 answers are off: otherwise it asks the filtering upstream for
+	# them, gets "no such name", and musl's resolver (Redlib's) then fails
+	# the whole lookup. The test VM has no IPv6 anyway.
 	sed -i "/config dnsproxy 'hosts'/,/^\$/{s/option enabled '0'/option enabled '1'/; s|list hosts_files ''|list hosts_files '/etc/oneclick-test-reddit.hosts'|}" "$f"
+	sed -i "s/option ipv6_disabled '0'/option ipv6_disabled '1'/" "$f"
 	for h in reddit.com www.reddit.com oauth.reddit.com accounts.reddit.com gql.reddit.com gql-fed.reddit.com old.reddit.com; do
 		echo "${REDDIT_TEST_IP:-151.101.1.140} $h"
 	done > "$W/router/files/etc/oneclick-test-reddit.hosts"
