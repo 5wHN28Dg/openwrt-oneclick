@@ -18,6 +18,10 @@
 #   VM_SSH_PORT         localhost port for the VM's SSH (default 2222)
 #   SPEED_PORT          localhost port for the stand-in speed test server
 #                       (default 18080)
+#   TS_TEST_AUTHKEY_FILE  a real Tailscale auth key (ephemeral, reusable) for
+#                       the full scenario; without it the router tries a dummy
+#                       key, which Tailscale refuses (an expected FAIL that
+#                       shows the router reached Tailscale)
 #
 # The full scenario measures the line against tests/speedsrv.py on this
 # computer (needs python3), which holds the eight streams to 20 Mbit/s down
@@ -29,6 +33,7 @@
 #     speed tests from one IP for about an hour; the saved rates are used.
 #   - "SQM latency under load" may pass or fail: qemu's user network has no
 #     real line behind it. The test only checks that it was measured.
+#   - "Tailscale: not logged in" (without TS_TEST_AUTHKEY_FILE): the dummy key.
 
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -147,9 +152,10 @@ laptop|3|$(wg_genkey)|$(wg_psk)"
 dev$i|$i|$(wg_genkey)|$(wg_psk)"; done
 			# A network whose controller doesn't exist: the router waits for approval.
 			ENABLE_ZEROTIER=1 ZEROTIER_NETWORK=$ZT_TEST_NET
+			ENABLE_TAILSCALE=1
 			SPEEDTEST_URL=$SPEED_URL
 		else
-			FAMILY_FILTER=0 ADBLOCK_EXTRA_LISTS='' BANIP_FEEDS='' ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0 ENABLE_REDLIB=0 ENABLE_ZEROTIER=0
+			FAMILY_FILTER=0 ADBLOCK_EXTRA_LISTS='' BANIP_FEEDS='' ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0 ENABLE_REDLIB=0 ENABLE_ZEROTIER=0 ENABLE_TAILSCALE=0
 			unset PROTON_AUTO PROTON_COUNTRIES PROTON_API
 			SQM_DOWN=50000 SQM_UP=10000   # fixed rates: nothing is measured
 		fi
@@ -157,6 +163,8 @@ dev$i|$i|$(wg_genkey)|$(wg_psk)"; done
 	)
 	if [ "$2" = full ]; then
 		printf 'example.net\n' > "$1/blocklist.txt"
+		if [ -n "${TS_TEST_AUTHKEY_FILE-}" ]; then (umask 077; cp "$TS_TEST_AUTHKEY_FILE" "$1/tailscale-authkey")
+		else echo tskey-auth-kTESTonlyCNTRL-0000000000000000000000000000000000 > "$1/tailscale-authkey"; fi
 		printf "PROTON_UID='uid-test'\nPROTON_REFRESH='refresh-0'\n" > "$1/proton-session"
 		printf '%s\n' "DEVICES='TV|02:00:00:00:00:01|192.168.1.150'" "CUTOFF_START='21:30:00'" "CUTOFF_STOP='05:30:00'" > "$1/kids.conf"
 	fi
@@ -173,7 +181,8 @@ run_setup() { # private-dir log
 	unexpected=$(grep '^FAIL' "$2" | sort -u \
 		| grep -v 'VPN WireGuard handshake' \
 		| grep -v 'SQM speed test failed.*HTTP codes: 429' \
-		| grep -v 'SQM latency under load' || true)
+		| grep -v 'SQM latency under load' \
+		| { if [ -n "${TS_TEST_AUTHKEY_FILE-}" ]; then cat; else grep -v 'Tailscale: not logged in'; fi; } || true)
 	# A crash prints no FAIL line: the report at the end must be there.
 	if [ -z "$unexpected" ] && [ "$rc" -le 2 ] && grep -q '^=* REPORT =*$' "$2"; then
 		ok "setup.sh ($(basename "$2" .log)): exit $rc, $(grep -c '^PASS' "$2") PASS, only expected FAILs"
@@ -424,8 +433,9 @@ upgrade_checks() {
 			/usr/sbin/redlib-update /usr/sbin/telegram-ranges /etc/rc.local /etc/oneclick-vpn-aaaa.applied /etc/crontabs/root \
 			/etc/redlib.conf /etc/nftables.d/30-oneclick-redlib-dns.nft /etc/nftables.d/31-oneclick-telegram-proxy.nft \
 			/usr/sbin/safesearch-hosts /usr/sbin/redlib-block /etc/redlib-block.allow /etc/banip/banip.custom.feeds \
+			/usr/sbin/tailscaled /usr/sbin/tailscale /etc/init.d/tailscale /etc/nftables.d/32-oneclick-tailscale-dns.nft \
 			$(find /etc/adblock-lean /usr/lib/adblock-lean /www/mangadex-safe /www/cgi-bin/md /etc/proton /usr/share/proton-pick \
-				/usr/sbin/proton-pick /etc/proton-pick.conf -type f 2>/dev/null); do
+				/usr/sbin/proton-pick /etc/proton-pick.conf /etc/tailscale -type f 2>/dev/null); do
 			grep -qxF "$f" /tmp/keep || echo "not-kept:$f"
 		done
 		grep -qxF /etc/oneclick-firmware /tmp/keep && echo mark-kept
@@ -433,6 +443,7 @@ upgrade_checks() {
 	[ "$r" = "1 " ] && ok "firmware upgrade: the backup keeps the setup's files; rc.local starts the after-upgrade fixes" \
 		|| bad "firmware upgrade keep list (want '1'): $r"
 	vm_ssh '/etc/init.d/redlib stop; /etc/init.d/redlib disable; /etc/init.d/adblock-lean stop; /etc/init.d/adblock-lean disable
+		/etc/init.d/tailscale stop; /etc/init.d/tailscale disable
 		rm -f /usr/sbin/redlib /etc/redlib.version /etc/oneclick-firmware; sed -i "/safe-otaku: manga.lan/d" /www/index.html
 		reboot' >/dev/null 2>&1
 	sleep 20; i=0 r=''
@@ -440,13 +451,14 @@ upgrade_checks() {
 		r=$(vm_ssh 'grep -q "safe-otaku: manga.lan" /www/index.html && echo redirect
 			/etc/init.d/adblock-lean enabled && /etc/init.d/adblock-lean status >/dev/null 2>&1 && echo adblock
 			/etc/init.d/redlib enabled && pidof redlib >/dev/null && echo redlib
+			/etc/init.d/tailscale enabled && pidof tailscaled >/dev/null && echo tailscale
 			[ "$(cat /etc/oneclick-firmware 2>/dev/null)" = "$(. /etc/openwrt_release; echo "$DISTRIB_REVISION")" ] && echo marked
 			true' 2>/dev/null | tr '\n' ' ')
-		[ "$r" = "redirect adblock redlib marked " ] && break
+		[ "$r" = "redirect adblock redlib tailscale marked " ] && break
 		sleep 10; i=$((i + 1))
 	done
-	[ "$r" = "redirect adblock redlib marked " ] && ok "firmware upgrade (simulated): after the reboot manga.lan redirect, adblock-lean and Redlib are back" \
-		|| bad "after the simulated upgrade (want 'redirect adblock redlib marked'; Redlib comes from GitHub, whose API allows 60 calls an hour): $r"
+	[ "$r" = "redirect adblock redlib tailscale marked " ] && ok "firmware upgrade (simulated): after the reboot manga.lan redirect, adblock-lean, Redlib and Tailscale are back" \
+		|| bad "after the simulated upgrade (want 'redirect adblock redlib tailscale marked'; Redlib comes from GitHub, whose API allows 60 calls an hour): $r"
 	# On later boots of the same firmware it changes nothing: adblock-lean
 	# switched off by hand stays off.
 	r=$(vm_ssh '/etc/init.d/adblock-lean disable; /usr/sbin/oneclick-after-upgrade boot; /etc/init.d/adblock-lean enabled && echo re-enabled
@@ -483,11 +495,79 @@ zerotier_checks() {
 	grep -q "approve the router at https://my.zerotier.com" "$W/full.log" && ok "ZeroTier: setup.sh says what to approve" || bad "ZeroTier: no approval hint from setup.sh"
 }
 
+# Tailscale: running in its own group, whose DNS lookups go past the block
+# lists (tailscale_dns_used, right after the setup run), its own zone forwarding only into the VPN, its files kept across
+# upgrades. Then a stand-in for the tailscale0 device (a veth with a "phone"
+# behind it, 100.100.100.2): Telegram goes into the VPN (a counter on that
+# forwarding rises), other addresses are refused, and with pbr stopped Telegram is
+# refused too (it would leave through the WAN). Then telegram-ranges hands a
+# changed list to Tailscale.
+# The DNS rule's counter rose during the setup run: Tailscale's lookups went
+# through it (it also has built-in fallback addresses, so reaching its
+# servers alone wouldn't show it). Read right after the run: firewall
+# reloads in later checks reset counters, and once connected Tailscale
+# looks nothing up again.
+tailscale_dns_used() {
+	vm_ssh 'nft list chain inet fw4 oneclick_tailscale_dns' 2>&1 | grep -q "counter packets [1-9]" \
+		&& ok "Tailscale's DNS lookups went through its own rule (past the block lists)" \
+		|| bad "Tailscale's DNS rule counted nothing: $(vm_ssh 'nft list chain inet fw4 oneclick_tailscale_dns' 2>&1 | grep counter)"
+}
+tailscale_checks() {
+	r=$(vm_ssh 'p=$(pidof tailscaled); [ -n "$p" ] && echo running
+		[ "$(awk "/^Gid:/ { print \$2 }" /proc/$p/status)" = "$(sed -n "s/^tailscale:[^:]*:\([0-9]*\):.*/\1/p" /etc/group)" ] && echo own-group
+		/etc/init.d/tailscale enabled && echo enabled
+		ls -ld /etc/tailscale | cut -c1-10
+		z=$(uci show firewall | sed -n "s/^firewall\.\([^.]*\)\.name=.tailscale.$/\1/p")
+		echo zone=$(uci -q get firewall.$z.device)/$(uci -q get firewall.$z.input)/$(uci -q get firewall.$z.forward)
+		uci show firewall | grep -c "src=.tailscale."
+		nft list chain inet fw4 forward_tailscale | grep -c "jump accept_to_testvpn"
+		nft list chain inet fw4 oneclick_tailscale_dns | grep -q "skgid.*redirect to :5354" && echo dns-rule' 2>&1 | tr '\n' ' ')
+	want="running own-group enabled drwx------ zone=tailscale0/ACCEPT/REJECT 1 1 dns-rule "
+	[ "$r" = "$want" ] && ok "Tailscale: runs in its own group, own zone that forwards only into the VPN, state readable by root only" \
+		|| bad "Tailscale on the router (want '$want'): $r"
+	if [ -n "${TS_TEST_AUTHKEY_FILE-}" ]; then
+		grep -q '^PASS  Tailscale: the router is 100\.' "$W/full.log" && ok "Tailscale: logged in with the test key" || bad "Tailscale login: $(grep 'Tailscale' "$W/full.log" | tr '\n' ' ')"
+	else
+		grep -qi '^FAIL  Tailscale: not logged in (.*invalid key' "$W/full.log" && ok "Tailscale: reached its servers (they refused the dummy key)" \
+			|| bad "Tailscale with the dummy key (want: refused as invalid): $(grep 'Tailscale' "$W/full.log" | tr '\n' ' ')"
+	fi
+	r=$(vm_ssh 'nslookup controlplane.tailscale.com 127.0.0.1 2>/dev/null | awk "/^Name:/{n=1} n && /^Address/" | grep -q . && echo resolves || echo blocked')
+	[ "$r" = blocked ] && ok "tailscale.com stays blocked for the LAN (the router's Tailscale alone skips the list)" || bad "tailscale.com for the LAN: $r"
+	r=$(vm_ssh "apk add ip-full >/dev/null 2>&1   # BusyBox ip can't make veth pairs
+		/etc/init.d/tailscale stop; sleep 2; ip link del tailscale0 2>/dev/null
+		ip link add tailscale0 type veth peer name tsp; ip link set tailscale0 up
+		ip netns add ph; ip link set tsp netns ph; ip -n ph link set lo up; ip -n ph link set tsp up
+		ip -n ph addr add 100.100.100.2/32 dev tsp; ip addr add 100.100.100.1/32 dev tailscale0
+		ip -n ph route add 100.100.100.1 dev tsp; ip -n ph route add default via 100.100.100.1
+		ip route add 100.100.100.2/32 dev tailscale0
+		w() { i=0; until ip route show table pbr_testvpn 2>/dev/null | grep -q default || [ \$i -ge 30 ]; do sleep 1; i=\$((i + 1)); done; sleep 2; }
+		nft insert rule inet fw4 forward_tailscale oifname testvpn counter   # a probe: packets forwarded into the VPN
+		tx() { nft list chain inet fw4 forward_tailscale | sed -n 's/.*oifname \"testvpn\" counter packets \([0-9]*\).*/\1/p'; }
+		t() { ip netns exec ph curl -s -m 4 -o /dev/null http://\$1/; echo \"\$2=\$?\"; }
+		w; a=\$(tx); ip netns exec ph curl -s -m 4 -o /dev/null http://149.154.167.99/; c=\$?; [ \"\$(tx)\" -gt \"\$a\" ] && echo telegram-into-vpn || echo \"telegram=\$c probe=\$a/\$(tx)\"
+		a=\$(tx); t 198.18.0.1 other; [ \"\$(tx)\" = \"\$a\" ] && echo other-not-in-vpn
+		t 192.168.1.50 lan-device
+		/etc/init.d/pbr stop >/dev/null 2>&1; a=\$(tx); t 149.154.167.99 telegram-without-pbr; [ \"\$(tx)\" = \"\$a\" ] && echo not-in-vpn
+		/etc/init.d/pbr start >/dev/null 2>&1; w
+		ip netns del ph; ip link del tailscale0 2>/dev/null; fw4 reload >/dev/null 2>&1; /etc/init.d/tailscale start" 2>&1 | tr '\n' ' ')
+	want="telegram-into-vpn other=7 other-not-in-vpn lan-device=7 telegram-without-pbr=7 not-in-vpn "
+	[ "$r" = "$want" ] && ok "Tailscale (stand-in device): Telegram goes into the VPN; other addresses, LAN devices, and Telegram without the VPN rules, are refused" \
+		|| bad "Tailscale forwarding (want '$want'): $r"
+	r=$(vm_ssh "f=/etc/tailscale/oneclick-routes; [ -f \$f ] && cp \$f /tmp/routes.bak
+		i=0; until /usr/sbin/tailscale status --json >/dev/null 2>&1 || [ \$i -ge 30 ]; do sleep 1; i=\$((i + 1)); done
+		echo 1.2.3.0/24 > \$f
+		uclient-fetch -qO /tmp/tg.txt http://10.0.2.2:$RPORT/tg-repo.txt && /usr/sbin/telegram-ranges /tmp/tg.txt >/dev/null 2>&1; rm -f /tmp/tg.txt
+		grep -c 149.154.160.0/20 \$f; grep -c 1.2.3.0 \$f
+		if [ -f /tmp/routes.bak ]; then mv /tmp/routes.bak \$f; else rm -f \$f; fi" 2>&1 | tr '\n' ' ')
+	[ "$r" = "1 0 " ] && ok "telegram-ranges hands a changed list to Tailscale" || bad "telegram-ranges -> Tailscale routes (want '1 0'): $r"
+}
+
 scenario_full() {
 	echo "== full: every option on"
 	start_vm; P=$W/p-full; make_private "$P" full
 	shape_line
 	run_setup "$P" "$W/full.log"
+	tailscale_dns_used
 	abl_check
 	zerotier_checks
 	# SQM: 8 streams at 2.5 Mbit/s each = 20 Mbit/s down, shaped at 90%; the
@@ -531,6 +611,7 @@ scenario_full() {
 	redlib_checks
 	telegram_checks
 	telegram_proxy_checks
+	tailscale_checks
 	upgrade_checks
 	# Family filtering with no Redlib instance allowed still blocks them all
 	# (BusyBox's grep -vxF -f dropped every line when the allow list was empty).
@@ -588,7 +669,8 @@ scenario_full() {
 	vm_ssh 'echo "0.0.0.0 api.github.com" >> /etc/hosts'
 	ONECLICK_PRIVATE=$P timeout 1500 "$W/setup.sh" 127.0.0.1 "$PORT" > "$W/full-nogh.log" 2>&1; rc=$?
 	vm_ssh 'sed -i "/api.github.com/d" /etc/hosts; /etc/init.d/dnsmasq restart >/dev/null 2>&1'
-	other=$(grep '^FAIL' "$W/full-nogh.log" | sort -u | grep -v 'VPN WireGuard handshake\|SQM speed test failed.*429\|kept the installed adblock-lean')
+	other=$(grep '^FAIL' "$W/full-nogh.log" | sort -u | grep -v 'VPN WireGuard handshake\|SQM speed test failed.*429\|kept the installed adblock-lean' \
+		| { if [ -n "${TS_TEST_AUTHKEY_FILE-}" ]; then cat; else grep -v 'Tailscale: not logged in'; fi; })
 	if [ "$rc" = 2 ] && [ -z "$other" ] && grep -q '^FAIL.*kept the installed adblock-lean' "$W/full-nogh.log" \
 		&& grep -q '^PASS  adblock-lean blocklist loaded' "$W/full-nogh.log"; then
 		ok "GitHub unreachable: kept the installed adblock-lean, still blocking"
@@ -642,7 +724,7 @@ scenario_full() {
 	# shellcheck disable=SC2034  # write_config reads the settings through eval
 	(
 		. "$P/config.env"
-		ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0 ENABLE_REDLIB=0 ENABLE_ZEROTIER=0
+		ENABLE_VPN=0 ENABLE_MANGADEX=0 ENABLE_REMOTE=0 ENABLE_REDLIB=0 ENABLE_ZEROTIER=0 ENABLE_TAILSCALE=0
 		SSH_KEY_OLD=$SSH_KEY SSH_PUBKEYS_OLD=$SSH_PUBKEYS SSH_KEY=$W/key2 SSH_PUBKEYS=$(cat "$W/key2.pub")
 		write_config "$P/config.env"
 	)
@@ -672,6 +754,11 @@ scenario_full() {
 	left=$(vm_ssh 'pidof zerotier-one >/dev/null && echo running; apk info -e zerotier >/dev/null 2>&1 && echo package
 		[ -e /etc/config/zerotier ] && echo config; uci show firewall | grep -q "zt+" && echo zone; true' | tr '\n' ' ')
 	[ -z "$left" ] && ok "ZeroTier turned off: package, settings with the private key, firewall zone removed" || bad "ZeroTier leftovers: $left"
+	left=$(vm_ssh 'pidof tailscaled >/dev/null && echo running; ip link show tailscale0 >/dev/null 2>&1 && echo device
+		for f in /usr/sbin/tailscaled /usr/sbin/tailscale /etc/init.d/tailscale /etc/tailscale /etc/nftables.d/32-oneclick-tailscale-dns.nft; do [ -e $f ] && echo $f; done
+		grep -q "^tailscale:" /etc/group && echo group; uci show firewall | grep -q "tailscale" && echo zone
+		nft list chain inet fw4 oneclick_tailscale_dns >/dev/null 2>&1 && echo dns-rule; grep -q tailscale /etc/sysupgrade.conf && echo sysupgrade; true' | tr '\n' ' ')
+	[ -z "$left" ] && ok "Tailscale turned off: program, state, group, zone, DNS rule and upgrade entries removed" || bad "Tailscale leftovers: $left"
 	left=$(vm_ssh 'ls -d /etc/proton /etc/proton-pick.conf /usr/sbin/proton-pick 2>/dev/null; grep -c proton /etc/crontabs/root /etc/rc.local /etc/sysupgrade.conf' | tr '\n' ' ')
 	[ "$left" = "/etc/crontabs/root:0 /etc/rc.local:0 /etc/sysupgrade.conf:0 " ] && ok "VPN turned off: Proton session, settings and jobs removed" || bad "Proton leftovers: $left"
 	left=$(vm_ssh 'uci show network | grep -c "remote"; uci show firewall | grep -c "remote\|Remote"; wg show remote 2>/dev/null | grep -c peer' | tr '\n' ' ')
@@ -711,6 +798,8 @@ scenario_minimal() {
 		[ -e /etc/init.d/redlib ] && echo "redlib"
 		apk info -e microsocks >/dev/null 2>&1 && echo "microsocks"
 		apk info -e zerotier >/dev/null 2>&1 && echo "zerotier"
+		[ -e /usr/sbin/tailscaled ] && echo "tailscale"
+		apk info -e kmod-tun >/dev/null 2>&1 && echo "kmod-tun"
 		apk info -e bind-dig >/dev/null 2>&1 && echo "bind-dig"
 		apk info -e openssl-util >/dev/null 2>&1 && echo "openssl-util"
 		true')
@@ -737,6 +826,19 @@ scenario_minimal() {
 			*) [ $rc = 1 ] && ok "ZeroTier interface added to the lan zone by hand: setup stops before changing anything" || bad "ZeroTier in lan zone: exit $rc" ;; esac ;;
 		*) bad "ZeroTier interface in the lan zone not refused (exit $rc)" ;; esac
 	vm_ssh 'uci del_list firewall.@zone[0].network=ztif; uci commit firewall; uci delete network.ztif; uci commit network'
+	# The same for Tailscale: its device put in the lan zone by hand.
+	vm_ssh 'uci add_list firewall.@zone[0].device=tailscale0; uci commit firewall'
+	echo tskey-auth-kTESTonlyCNTRL-0000 > "$P/tailscale-authkey"
+	# shellcheck disable=SC2034
+	(. "$P/config.env"; ENABLE_TAILSCALE=1; write_config "$P/config.env")
+	out=$(ONECLICK_PRIVATE=$P timeout 900 "$W/setup.sh" 127.0.0.1 "$PORT" 2>&1); rc=$?
+	case $out in *"Tailscale's interface is in firewall zones"*) case $out in *"==> Packages"*) bad "Tailscale in lan zone: refused only after changes began" ;;
+			*) [ $rc = 1 ] && ok "Tailscale's device added to the lan zone by hand: setup stops before changing anything" || bad "Tailscale in lan zone: exit $rc" ;; esac ;;
+		*) bad "Tailscale's device in the lan zone not refused (exit $rc): $(printf '%s\n' "$out" | tail -3 | tr '\n' ' ')" ;; esac
+	vm_ssh 'uci del_list firewall.@zone[0].device=tailscale0; uci commit firewall'
+	# shellcheck disable=SC2034
+	(. "$P/config.env"; ENABLE_TAILSCALE=0; write_config "$P/config.env")
+	rm -f "$P/tailscale-authkey"
 	# shellcheck disable=SC2034
 	(. "$P/config.env"; ENABLE_ZEROTIER=0; write_config "$P/config.env")
 	run_setup "$P" "$W/minimal-zt-off.log"

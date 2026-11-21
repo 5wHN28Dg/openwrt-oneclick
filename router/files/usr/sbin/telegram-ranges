@@ -12,6 +12,8 @@
 #   instead of waiting on a blocked connection.
 # - With the Telegram proxy (microsocks) set up, its user may reach only
 #   these ranges: kept current in /etc/nftables.d/31-oneclick-telegram-proxy.nft.
+# - With Tailscale set up (install.sh), the IPv4 ranges it offers to the
+#   tailnet follow too (/etc/tailscale/oneclick-routes: what it offers now).
 #
 #   telegram-ranges               download and apply
 #   telegram-ranges LIST-FILE     apply a file instead (install.sh, tests)
@@ -91,6 +93,7 @@ noreload=''; [ "${TELEGRAM_NO_RELOAD-}" = 1 ] && noreload=1
 # IPv6 that doesn't go through the VPN: rejected from the LAN; a rule without
 # ranges is switched off (with no address it would reject all IPv6).
 firewall_rules() {
+	tailscale_routes
 	fwchanged=''
 	for r in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.telegram='1'$/\1/p"); do
 		want=0; [ -n "$v6rule" ] && want=1
@@ -145,6 +148,19 @@ proxy_rules() {
 	} > "$PROXY_NFT.tmp"
 	if cmp -s "$PROXY_NFT.tmp" "$PROXY_NFT"; then rm -f "$PROXY_NFT.tmp"; return 1; fi
 	mv "$PROXY_NFT.tmp" "$PROXY_NFT"
+}
+# The ranges Tailscale offers (only where install.sh made it offer them).
+# A failure keeps the old file: the next run tries again.
+TS_ROUTES=/etc/tailscale/oneclick-routes
+tailscale_routes() {
+	[ -f "$TS_ROUTES" ] && [ -x /usr/sbin/tailscale ] || return 0
+	r=$(tr '\n' ',' < "$TMP.v4" | sed 's/,$//')
+	[ "$(cat "$TS_ROUTES")" = "$r" ] && return 0
+	if /usr/sbin/tailscale set --advertise-routes="$r" >/dev/null 2>&1; then
+		echo "$r" > "$TS_ROUTES"; say "Tailscale offers the new list"
+	else
+		say "could not give Tailscale the new list (is it running?); tried again next run"
+	fi
 }
 pbr_errors() { # pbr's current errors, one per line, sorted
 	ubus call service list '{"name":"pbr"}' 2>/dev/null \
