@@ -1,16 +1,27 @@
 #!/bin/sh
-# Installs or updates Redlib from its GitHub releases, set up by
-# openwrt-oneclick. Run daily by cron and by the setup.
+# Installs or updates Redlib from Nachtalb's fork (github.com/Nachtalb/redlib),
+# set up by openwrt-oneclick. Run daily by cron and by the setup. The fork
+# gets past Reddit's blocking (upstream redlib-org/redlib stopped working in
+# October 2026) and publishes its builds as one "latest" release, replaced
+# on every change: a plain program per CPU, named after the build's commit.
 #
-# - Takes the newest release that is at least 3 days old (a broken release
-#   has usually been replaced by then) and checks the download against the
-#   SHA-256 GitHub publishes for it.
+# - Takes that build once it is at least 3 days old (a broken build has
+#   usually been replaced by then). The fork often changes daily, so that
+#   wait may never end: with nothing from the fork installed yet, or the
+#   installed build over 14 days old, it takes the newest at once.
+#   Checks the download against the SHA-256 GitHub publishes for it. A build
+#   is known by the start of its SHA-256 (the release's title, with the
+#   commit, can lag behind its files). Its download address must be the
+#   fork's own (curl runs as root: an address from the release data must not
+#   be able to pass it options).
+# - After a rollback, no new build is tried for 7 days while the installed
+#   one answers (no nightly 17 MB download to flash for a build that won't do).
 # - Installs it if it runs on this router (tried as the redlib user, never
 #   as root).
 # - Redlib only answers once Reddit has given it a token, so "not answering"
 #   can be Reddit's doing. The previous version is put back (and the release
 #   remembered as bad) only if the previous version was answering a moment
-#   before: then Reddit was fine and the new release is at fault.
+#   before: then Reddit was fine and the new build is at fault.
 # - Every run makes sure Redlib runs: after a firmware upgrade the service
 #   comes back disabled, and procd gives up after repeated crashes.
 # - Checks that no other user shares the redlib user's number, since the DNS
@@ -21,8 +32,11 @@ BIN=/usr/sbin/redlib
 VERSION=/etc/redlib.version
 REJECTED=/etc/redlib.rejected
 NFT=/etc/nftables.d/30-oneclick-redlib-dns.nft
-API=${REDLIB_RELEASES_API:-'https://api.github.com/repos/redlib-org/redlib/releases?per_page=10'}   # tests: tests/vm.sh
+API=${REDLIB_RELEASES_API:-'https://api.github.com/repos/Nachtalb/redlib/releases/latest'}   # tests: tests/vm.sh
 WAIT_DAYS=3
+STALE_DAYS=14
+PAUSE_DAYS=7   # after a rollback
+DL=${REDLIB_DOWNLOAD_BASE:-https://github.com/Nachtalb/redlib/releases/download/}   # tests: tests/vm.sh
 D=''   # its own folder in /tmp (made below): no fixed names another user could create first
 
 say() { echo "redlib-update: $1"; logger -t redlib-update "$1"; }
@@ -57,6 +71,7 @@ answers() { # SECONDS: does Redlib answer within that time?
 }
 
 lock /var/lock/redlib-update   # the setup's run and the nightly one never overlap
+rm -f $BIN.new   # a download cut short (power cut) by an earlier run
 # Killed between the two renames of an earlier run: the previous version is there.
 [ ! -e $BIN ] && [ -x $BIN.old ] && mv $BIN.old $BIN
 
@@ -70,44 +85,59 @@ if [ -z "$uid" ] || [ "$(awk -F: -v u="$uid" '$3 == u' /etc/passwd | wc -l)" != 
 fi
 
 D=$(mktemp -d /tmp/redlib-update.XXXXXX) || fail "no room in /tmp"
-TGZ=$D/redlib.tgz
 case $(uname -m) in
 	aarch64) T=aarch64-unknown-linux-musl ;;
 	armv7l) T=armv7-unknown-linux-musleabihf ;;
+	armv6l) T=arm-unknown-linux-musleabihf ;;
 	x86_64) T=x86_64-unknown-linux-musl ;;
+	i686) T=i686-unknown-linux-musl ;;
 	*) fail "no Redlib build for this CPU ($(uname -m))" ;;
 esac
 
-fetch "$API" "$D/releases.json" || fail "can't reach GitHub"
-J=$(cat "$D/releases.json")
-cutoff=$(( $(date +%s) - WAIT_DAYS * 86400 ))
-i=0 tag='' url='' sum=''
-while [ $i -lt 10 ]; do
-	t=$(echo "$J" | jsonfilter -e "@[$i].tag_name") || break
-	if grep -qxF "$t" $REJECTED 2>/dev/null; then i=$((i + 1)); continue; fi
-	pub=$(echo "$J" | jsonfilter -e "@[$i].published_at" | tr T ' ' | tr -d Z)
-	if [ "$(echo "$J" | jsonfilter -e "@[$i].draft" -e "@[$i].prerelease" | tr '\n' ' ')" = "false false " ] \
-		&& [ -n "$pub" ] && [ "$(date -u -d "$pub" +%s 2>/dev/null || echo 9999999999)" -le $cutoff ]; then
-		url=$(echo "$J" | jsonfilter -e "@[$i].assets[@.name='redlib-$T.tar.gz'].browser_download_url")
-		sum=$(echo "$J" | jsonfilter -e "@[$i].assets[@.name='redlib-$T.tar.gz'].digest")
-		# Releases without a published SHA-256 are skipped, not trusted.
-		case $sum in sha256:*) tag=$t; sum=${sum#sha256:}; break ;; esac
-	fi
-	i=$((i + 1))
-done
-[ -n "$tag" ] || fail "no release at least $WAIT_DAYS days old with a published SHA-256"
-case $tag in *[!A-Za-z0-9._-]*) fail "unexpected release name" ;; esac
+fetch "$API" "$D/release.json" || fail "can't reach GitHub"
+R=$D/release.json
+url=$(jsonfilter -i "$R" -e "@.assets[@.name='redlib-$T'].browser_download_url")
+[ -n "$url" ] || fail "the fork's release has no build for $T"
+case $url in
+	"$DL"*/redlib-$T) case ${url#"$DL"} in *[!A-Za-z0-9/._-]*|*..*) fail "unexpected download address for $T; not used" ;; esac ;;
+	*) fail "unexpected download address for $T; not used" ;;
+esac
+sum=$(jsonfilter -i "$R" -e "@.assets[@.name='redlib-$T'].digest")
+made=$(jsonfilter -i "$R" -e "@.assets[@.name='redlib-$T'].created_at" | tr T ' ' | tr -d Z)
+# A build without a published SHA-256 is not trusted.
+case $sum in sha256:*) sum=${sum#sha256:} ;; *) fail "the build for $T has no published SHA-256" ;; esac
+# The build's name: the start of its SHA-256; the commit (from the title
+# "Latest build (856c6e0)") only for the log.
+tag=$(echo "$sum" | cut -c1-12)
+case $tag in ????????????) case $tag in *[!0-9a-f]*) fail "unexpected SHA-256" ;; esac ;; *) fail "unexpected SHA-256" ;; esac
+commit=$(jsonfilter -i "$R" -e @.name | sed -n 's/.*(\([0-9a-f]\{7,40\}\)).*/\1/p')
 if [ -x $BIN ] && [ "$(cat $VERSION 2>/dev/null)" = "$tag" ]; then
 	say "$tag is current"; done_; exit 0
 fi
+grep -qxF "$tag" $REJECTED 2>/dev/null && fail "$tag was rolled back before; waiting for a newer build"
+age_ok=''
+[ -n "$made" ] && [ "$(date -u -d "$made" +%s 2>/dev/null || echo 9999999999)" -le $(( $(date +%s) - WAIT_DAYS * 86400 )) ] && age_ok=1
+if [ -z "$age_ok" ]; then
+	# The installed build: from the fork (its SHA-256 start as name) and how old.
+	ours=''; grep -qxE '[0-9a-f]{12}' $VERSION 2>/dev/null && ours=1
+	if [ ! -x $BIN ] || [ -z "$ours" ]; then
+		say "nothing from the fork installed yet: taking $tag although it is under $WAIT_DAYS days old"
+	elif [ -n "$(find $VERSION -mtime +$STALE_DAYS 2>/dev/null)" ]; then
+		say "the installed build is over $STALE_DAYS days old: taking $tag although it is under $WAIT_DAYS days old"
+	else
+		say "$tag is under $WAIT_DAYS days old; the installed one stays"; done_; exit 0
+	fi
+fi
+if [ -x $BIN ] && [ -n "$(find $REJECTED -mtime -$PAUSE_DAYS 2>/dev/null)" ] && answers 1; then
+	say "a build was rolled back less than $PAUSE_DAYS days ago; $tag waits, the installed one stays"; done_; exit 0
+fi
 
-# 11 MB unpacked: make sure the flash has room for it next to the old one.
+# 14-17 MB: make sure the flash has room for it next to the old one (it goes
+# straight there, not through RAM).
 free_kb=$(df -k /overlay 2>/dev/null | awk 'NR == 2 { print $4 }')
-[ "${free_kb:-0}" -gt 16000 ] || fail "not enough flash space (${free_kb:-?} KB free, 16 MB needed)"
-fetch "$url" "$TGZ" || fail "download of $tag failed"
-[ "$(sha256sum "$TGZ" | cut -d' ' -f1)" = "$sum" ] || fail "$tag does not match GitHub's SHA-256; not installed"
-tar -xzOf "$TGZ" redlib > $BIN.new || fail "could not unpack $tag"
-rm -f "$TGZ"
+[ "${free_kb:-0}" -gt 18000 ] || fail "not enough flash space (${free_kb:-?} KB free, 18 MB needed)"
+fetch "$url" $BIN.new || fail "download of $tag failed"
+[ "$(sha256sum $BIN.new | cut -d' ' -f1)" = "$sum" ] || fail "$tag does not match GitHub's SHA-256; not installed"
 chmod 755 $BIN.new
 # Run as the redlib user even for this check: downloaded code never runs as root.
 start-stop-daemon -S -c redlib -x $BIN.new -- --version >/dev/null 2>&1 || fail "$tag does not run on this router; not installed"
@@ -117,10 +147,12 @@ was_up=''; [ -x $BIN ] && answers 1 && was_up=1
 mv $BIN.new $BIN
 /etc/init.d/redlib enable
 /etc/init.d/redlib restart >/dev/null 2>&1
-if answers 30; then
+# The fork only answers once Reddit has given it a token, which can take
+# about a minute when Reddit refuses its first way of asking.
+if answers 120; then
 	rm -f $BIN.old
 	echo "$tag" > $VERSION
-	say "installed $tag"
+	say "installed $tag${commit:+ (commit $commit)}"
 	done_; exit 0
 fi
 if [ -n "$was_up" ] && [ -x $BIN.old ]; then
@@ -129,7 +161,7 @@ if [ -n "$was_up" ] && [ -x $BIN.old ]; then
 	/etc/init.d/redlib restart >/dev/null 2>&1
 	fail "$tag did not answer while the previous version did; put that back and won't try $tag again"
 fi
-# Nothing to compare with: keep the new version, Reddit may be the reason.
+# Nothing to compare with: keep the new build, Reddit may be the reason.
 rm -f $BIN.old
 echo "$tag" > $VERSION
 say "installed $tag; not answering yet (Redlib needs Reddit to answer before it starts)"
