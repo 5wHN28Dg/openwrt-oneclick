@@ -14,7 +14,9 @@
 #   OPENWRT_VERSION     release to test (default 25.12.5; must use apk, so 25.12 or later)
 #   TEST_DNS_UPSTREAM   plain DNS server for dnsproxy inside the VM, for
 #                       networks that block DoH for their own LAN clients
-#                       (the VM is such a client); e.g. 10.0.2.3:53
+#                       (the VM is such a client); e.g. 10.0.2.3:53. Reddit's
+#                       hosts then come from a hosts file (such networks may
+#                       block Reddit): REDDIT_TEST_IP, default 151.101.1.140
 #   VM_SSH_PORT         localhost port for the VM's SSH (default 2222)
 #   SPEED_PORT          localhost port for the stand-in speed test server
 #                       (default 18080)
@@ -83,6 +85,14 @@ if [ -n "${TEST_DNS_UPSTREAM-}" ]; then
 	f=$W/router/files/etc/config/dnsproxy
 	sed -i "/list upstream/d; /list bootstrap/d; /list fallback/d" "$f"
 	sed -i "/config dnsproxy 'servers'/a\\	list upstream '$TEST_DNS_UPSTREAM'\n\tlist bootstrap '$TEST_DNS_UPSTREAM'" "$f"
+	# Such a network may filter Reddit too (a home router with family
+	# filtering): Redlib's lookups, which go to dnsproxy, get Reddit's
+	# address from a hosts file instead (REDDIT_TEST_IP, default Reddit's
+	# Fastly address).
+	sed -i "/config dnsproxy 'hosts'/,/^\$/{s/option enabled '0'/option enabled '1'/; s|list hosts_files ''|list hosts_files '/etc/oneclick-test-reddit.hosts'|}" "$f"
+	for h in reddit.com www.reddit.com oauth.reddit.com accounts.reddit.com gql.reddit.com gql-fed.reddit.com old.reddit.com; do
+		echo "${REDDIT_TEST_IP:-151.101.1.140} $h"
+	done > "$W/router/files/etc/oneclick-test-reddit.hosts"
 fi
 ssh-keygen -q -t ed25519 -N '' -f "$W/key"
 # The VM reaches this computer's localhost as 10.0.2.2.
