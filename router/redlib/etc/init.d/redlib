@@ -4,7 +4,11 @@
 # 8080, so it runs as its own unprivileged user "redlib" instead of root (that
 # user's DNS lookups skip the block lists: /etc/nftables.d/30-oneclick-redlib-dns.nft).
 # If memory runs short, the kernel kills Redlib first (oom_score_adj 1000),
-# never DNS; procd restarts it.
+# never DNS; procd restarts it. Its copy of pages to show while Reddit refuses
+# (the fork's "stale cache", 32 MB by default) is kept at 4 MB.
+# Reddit serves full post pages only to logged-in sessions: with a throwaway
+# account's session in /etc/redlib/sessions (from private/redlib-sessions.txt,
+# readable by the redlib user only), Redlib uses it.
 
 # Read by /etc/rc.common, which runs this file.
 export START=99 USE_PROCD=1
@@ -15,9 +19,11 @@ start_service() {
 	ADDRESS='' SFW=on
 	. /etc/redlib.conf
 	[ -n "$ADDRESS" ] || return 1
+	SESSIONS=''; [ -s /etc/redlib/sessions ] && SESSIONS=/etc/redlib/sessions
 	procd_open_instance
 	procd_set_param command /bin/sh -c "echo 1000 > /proc/self/oom_score_adj; exec $BIN -a $ADDRESS -p 8080"
-	procd_set_param env REDLIB_SFW_ONLY=$SFW REDLIB_DEFAULT_SHOW_NSFW=off REDLIB_ROBOTS_DISABLE_INDEXING=on
+	procd_set_param env REDLIB_SFW_ONLY=$SFW REDLIB_DEFAULT_SHOW_NSFW=off REDLIB_ROBOTS_DISABLE_INDEXING=on \
+		REDLIB_STALE_CACHE_MB=4 ${SESSIONS:+REDLIB_REDDIT_COOKIE_FILE=$SESSIONS}
 	procd_set_param user redlib
 	procd_set_param respawn 3600 5 5
 	procd_close_instance
