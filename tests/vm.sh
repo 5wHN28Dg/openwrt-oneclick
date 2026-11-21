@@ -496,13 +496,22 @@ zerotier_checks() {
 }
 
 # Tailscale: running in its own group, whose DNS lookups go past the block
-# lists (the rule's counter rose: Tailscale also has built-in fallback
-# addresses, so reaching its servers alone wouldn't show it), its own zone forwarding only into the VPN, its files kept across
+# lists (tailscale_dns_used, right after the setup run), its own zone forwarding only into the VPN, its files kept across
 # upgrades. Then a stand-in for the tailscale0 device (a veth with a "phone"
 # behind it, 100.100.100.2): Telegram goes into the VPN (a counter on that
 # forwarding rises), other addresses are refused, and with pbr stopped Telegram is
 # refused too (it would leave through the WAN). Then telegram-ranges hands a
 # changed list to Tailscale.
+# The DNS rule's counter rose during the setup run: Tailscale's lookups went
+# through it (it also has built-in fallback addresses, so reaching its
+# servers alone wouldn't show it). Read right after the run: firewall
+# reloads in later checks reset counters, and once connected Tailscale
+# looks nothing up again.
+tailscale_dns_used() {
+	vm_ssh 'nft list chain inet fw4 oneclick_tailscale_dns' 2>&1 | grep -q "counter packets [1-9]" \
+		&& ok "Tailscale's DNS lookups went through its own rule (past the block lists)" \
+		|| bad "Tailscale's DNS rule counted nothing: $(vm_ssh 'nft list chain inet fw4 oneclick_tailscale_dns' 2>&1 | grep counter)"
+}
 tailscale_checks() {
 	r=$(vm_ssh 'p=$(pidof tailscaled); [ -n "$p" ] && echo running
 		[ "$(awk "/^Gid:/ { print \$2 }" /proc/$p/status)" = "$(sed -n "s/^tailscale:[^:]*:\([0-9]*\):.*/\1/p" /etc/group)" ] && echo own-group
@@ -512,9 +521,8 @@ tailscale_checks() {
 		echo zone=$(uci -q get firewall.$z.device)/$(uci -q get firewall.$z.input)/$(uci -q get firewall.$z.forward)
 		uci show firewall | grep -c "src=.tailscale."
 		nft list chain inet fw4 forward_tailscale | grep -c "jump accept_to_testvpn"
-		nft list chain inet fw4 oneclick_tailscale_dns | grep -q "skgid.*redirect to :5354" && echo dns-rule
-		nft list chain inet fw4 oneclick_tailscale_dns | grep -q "counter packets [1-9]" && echo dns-used' 2>&1 | tr '\n' ' ')
-	want="running own-group enabled drwx------ zone=tailscale0/ACCEPT/REJECT 1 1 dns-rule dns-used "
+		nft list chain inet fw4 oneclick_tailscale_dns | grep -q "skgid.*redirect to :5354" && echo dns-rule' 2>&1 | tr '\n' ' ')
+	want="running own-group enabled drwx------ zone=tailscale0/ACCEPT/REJECT 1 1 dns-rule "
 	[ "$r" = "$want" ] && ok "Tailscale: runs in its own group, own zone that forwards only into the VPN, state readable by root only" \
 		|| bad "Tailscale on the router (want '$want'): $r"
 	if [ -n "${TS_TEST_AUTHKEY_FILE-}" ]; then
@@ -559,6 +567,7 @@ scenario_full() {
 	start_vm; P=$W/p-full; make_private "$P" full
 	shape_line
 	run_setup "$P" "$W/full.log"
+	tailscale_dns_used
 	abl_check
 	zerotier_checks
 	# SQM: 8 streams at 2.5 Mbit/s each = 20 Mbit/s down, shaped at 90%; the
